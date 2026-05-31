@@ -1,16 +1,21 @@
 # yolo
 
-`yolo` launches Codex through the local app-server with YOLO permissions and
-web search enabled.
+`yolo` launches Codex through a yolo-managed Codex app-server with YOLO
+permissions and web search enabled.
 
-It runs:
+The default client runs:
 
 ```sh
-codex --remote unix:// --search --dangerously-bypass-approvals-and-sandbox "$@"
+codex --remote unix://$XDG_RUNTIME_DIR/yolo/codex-app-server.sock \
+  --search \
+  --dangerously-bypass-approvals-and-sandbox \
+  "$@"
 ```
 
-Before launching Codex, it best-effort starts the user systemd service
-`codex-app-server.service`.
+`yolo server` starts `codex app-server` as a child process and exposes a small
+local HTTP-over-UNIX-socket API. `yolo` / `yolo client` starts Codex as a child
+process with stdio passed through to the terminal, then reports client process
+state, model, service tier, and fast-mode state to the server while it runs.
 
 ## Install
 
@@ -23,10 +28,29 @@ cargo install --path .
 ```sh
 yolo --cd /home/vagrant/websh
 yolo resume --last
+yolo server --daemon
+yolo status
+yolo stop
 ```
+
+## API
+
+```sh
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" http://yolo/clients
+```
+
+The `/clients` response includes:
+
+- yolo client PID and Codex child PID
+- cwd and Codex arguments
+- model
+- service tier
+- fast flag
+- lifecycle status and timestamps
 
 ## Environment
 
 - `YOLO_CODEX`: Codex executable to run. Defaults to `codex`.
-- `YOLO_REMOTE`: app-server endpoint. Defaults to `unix://`.
-- `YOLO_NO_SERVICE_START`: if set, skips starting the systemd user service.
+- `YOLO_REMOTE`: override app-server endpoint for the client.
+- `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
+  `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
