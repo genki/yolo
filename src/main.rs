@@ -21,6 +21,9 @@ const API_SOCKET_NAME: &str = "api.sock";
 const APP_SERVER_SOCKET_NAME: &str = "codex-app-server.sock";
 const PID_FILE_NAME: &str = "server.pid";
 const MANAGED_CODEX_DIR_NAME: &str = "codex-npm";
+const THREAD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
+const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -48,6 +51,12 @@ struct ClientInfo {
     ended_at: Option<u64>,
     exit_code: Option<i32>,
     status: String,
+    #[serde(default)]
+    codex_status: Option<String>,
+    #[serde(default)]
+    codex_active_flags: Vec<String>,
+    #[serde(default)]
+    codex_status_updated_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +76,14 @@ struct ServerState {
     app_server_pid: Option<u32>,
     resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct AppThreadSnapshot {
+    id: String,
+    cwd: String,
+    status: String,
+    active_flags: Vec<String>,
 }
 
 fn main() {
@@ -141,6 +158,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         clients: BTreeMap::new(),
     }));
     let app_server_pid = spawn_tracked_app_server(Arc::clone(&state), paths.clone())?;
+    spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
 
     let listener = UnixListener::bind(&paths.api_socket)
         .map_err(|err| format!("bind {}: {err}", paths.api_socket.display()))?;
@@ -306,6 +324,9 @@ fn run_client(args: Vec<OsString>) {
         ended_at: None,
         exit_code: None,
         status: "running".to_string(),
+        codex_status: None,
+        codex_active_flags: Vec::new(),
+        codex_status_updated_at: None,
     };
 
     let heartbeat_id = client_id.clone();
@@ -703,7 +724,8 @@ fn handle_api_connection(
             Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
         },
         ("POST", "/upgrade-resume-all") => {
-            let result = upgrade_codex_cli()
+            let result = wait_for_clients_idle(Arc::clone(&state), &paths)
+                .and_then(|_| upgrade_codex_cli())
                 .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
                 .and_then(|app_server_pid| {
                     if let Ok(mut state) = state.lock() {
@@ -741,6 +763,114 @@ fn handle_api_connection(
     let _ = stream.write_all(response.as_bytes());
 }
 
+fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+    thread::spawn(move || {
+        loop {
+            if let Ok(snapshot) = app_server_thread_snapshot(&paths) {
+                apply_thread_snapshot(&state, &snapshot);
+            }
+            thread::sleep(THREAD_MONITOR_INTERVAL);
+        }
+    });
+}
+
+fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadSnapshot]) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+
+    for client in state.clients.values_mut() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+
+        let matches = snapshot
+            .iter()
+            .filter(|thread| thread.cwd == client.cwd)
+            .collect::<Vec<_>>();
+
+        if matches.is_empty() {
+            client.codex_status = None;
+            client.codex_active_flags.clear();
+            client.codex_status_updated_at = Some(now);
+            continue;
+        }
+
+        let active = matches
+            .iter()
+            .find(|thread| thread.status == "active")
+            .copied()
+            .or_else(|| matches.first().copied());
+
+        if let Some(thread) = active {
+            client.thread_id = Some(thread.id.clone());
+            client.codex_status = Some(thread.status.clone());
+            client.codex_active_flags = thread.active_flags.clone();
+            client.codex_status_updated_at = Some(now);
+        }
+    }
+}
+
+fn wait_for_clients_idle(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+) -> Result<(), String> {
+    let timeout = upgrade_idle_wait_timeout();
+    let start = SystemTime::now();
+    loop {
+        let snapshot = app_server_thread_snapshot(paths)?;
+        apply_thread_snapshot(&state, &snapshot);
+        let working_clients = working_clients_for_snapshot(&state, &snapshot);
+        if working_clients.is_empty() {
+            return Ok(());
+        }
+        if start.elapsed().unwrap_or_default() >= timeout {
+            return Err(format!(
+                "timed out waiting for Codex clients to become idle: {}",
+                working_clients.join(", ")
+            ));
+        }
+        eprintln!(
+            "yolo: waiting for Codex clients to become idle before upgrade/resume: {}",
+            working_clients.join(", ")
+        );
+        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+    }
+}
+
+fn working_clients_for_snapshot(
+    state: &Arc<Mutex<ServerState>>,
+    snapshot: &[AppThreadSnapshot],
+) -> Vec<String> {
+    let Ok(state) = state.lock() else {
+        return Vec::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter_map(|client| {
+            let is_active = snapshot
+                .iter()
+                .any(|thread| thread.cwd == client.cwd && thread.status == "active");
+            if is_active {
+                Some(format!("{} cwd={}", client.id, client.cwd))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn upgrade_idle_wait_timeout() -> Duration {
+    env::var("YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT)
+}
+
 fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerInfo {
     let state = state.lock().expect("server state poisoned");
     let _started_at = state.started_at;
@@ -753,6 +883,285 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         app_server_socket: paths.app_server_socket.display().to_string(),
         clients: state.clients.values().cloned().collect(),
     }
+}
+
+fn app_server_thread_snapshot(paths: &RuntimePaths) -> Result<Vec<AppThreadSnapshot>, String> {
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.initialize()?;
+    let loaded = client.request(
+        "thread/loaded/list",
+        json!({
+            "limit": 200
+        }),
+    )?;
+    let thread_ids = loaded
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("thread/loaded/list missing data: {loaded}"))?;
+
+    let mut threads = Vec::new();
+    for thread_id in thread_ids {
+        let Some(thread_id) = thread_id.as_str() else {
+            continue;
+        };
+        let response = client.request(
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+                "includeTurns": false
+            }),
+        )?;
+        if let Some(thread) = response.get("thread") {
+            if let Some(snapshot) = parse_app_thread_snapshot(thread) {
+                threads.push(snapshot);
+            }
+        }
+    }
+    Ok(threads)
+}
+
+fn parse_app_thread_snapshot(thread: &Value) -> Option<AppThreadSnapshot> {
+    let id = thread.get("id")?.as_str()?.to_string();
+    let cwd = thread.get("cwd")?.as_str()?.to_string();
+    let status_value = thread.get("status")?;
+    let status = status_value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active_flags = status_value
+        .get("activeFlags")
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(AppThreadSnapshot {
+        id,
+        cwd,
+        status,
+        active_flags,
+    })
+}
+
+struct AppServerRpcClient {
+    stream: UnixStream,
+    next_id: u64,
+}
+
+impl AppServerRpcClient {
+    fn connect(socket: &Path) -> Result<Self, String> {
+        let mut stream =
+            UnixStream::connect(socket).map_err(|err| format!("connect app-server: {err}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|err| format!("set app-server read timeout: {err}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|err| format!("set app-server write timeout: {err}"))?;
+
+        let request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: yolo\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| format!("write websocket handshake: {err}"))?;
+        let headers = read_http_headers(&mut stream)?;
+        if !headers.starts_with("HTTP/1.1 101") && !headers.starts_with("HTTP/1.0 101") {
+            return Err(format!(
+                "app-server websocket handshake failed: {}",
+                headers.lines().next().unwrap_or_default()
+            ));
+        }
+
+        Ok(Self { stream, next_id: 1 })
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        let id = self.send_request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "yolo",
+                    "title": "yolo",
+                    "version": VERSION
+                }
+            }),
+        )?;
+        self.read_response_for(id)?;
+        self.send_notification("initialized", json!({}))
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.send_request(method, params)?;
+        self.read_response_for(id)
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        websocket_send_text(
+            &mut self.stream,
+            &json!({
+                "id": id,
+                "method": method,
+                "params": params
+            })
+            .to_string(),
+        )?;
+        Ok(id)
+    }
+
+    fn send_notification(&mut self, method: &str, params: Value) -> Result<(), String> {
+        websocket_send_text(
+            &mut self.stream,
+            &json!({
+                "method": method,
+                "params": params
+            })
+            .to_string(),
+        )
+    }
+
+    fn read_response_for(&mut self, id: u64) -> Result<Value, String> {
+        loop {
+            let message = websocket_read_text(&mut self.stream)?;
+            let value: Value = serde_json::from_str(&message)
+                .map_err(|err| format!("decode app-server message: {err}: {message}"))?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                return Err(format!("app-server request {id} failed: {error}"));
+            }
+            return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+        }
+    }
+}
+
+fn read_http_headers(stream: &mut UnixStream) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        stream
+            .read_exact(&mut byte)
+            .map_err(|err| format!("read websocket handshake: {err}"))?;
+        buf.push(byte[0]);
+        if buf.len() > 16 * 1024 {
+            return Err("websocket handshake headers too large".to_string());
+        }
+    }
+    String::from_utf8(buf).map_err(|err| format!("decode websocket handshake: {err}"))
+}
+
+fn websocket_send_text(stream: &mut UnixStream, text: &str) -> Result<(), String> {
+    let payload = text.as_bytes();
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x81);
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    let mask = [0x79, 0x6f, 0x6c, 0x6f];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(idx, byte)| byte ^ mask[idx % 4]),
+    );
+    stream
+        .write_all(&frame)
+        .map_err(|err| format!("write websocket frame: {err}"))
+}
+
+fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
+    loop {
+        let mut header = [0u8; 2];
+        stream
+            .read_exact(&mut header)
+            .map_err(|err| format!("read websocket frame header: {err}"))?;
+        let opcode = header[0] & 0x0f;
+        let masked = (header[1] & 0x80) != 0;
+        let mut len = (header[1] & 0x7f) as u64;
+        if len == 126 {
+            let mut buf = [0u8; 2];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|err| format!("read websocket frame length: {err}"))?;
+            len = u16::from_be_bytes(buf) as u64;
+        } else if len == 127 {
+            let mut buf = [0u8; 8];
+            stream
+                .read_exact(&mut buf)
+                .map_err(|err| format!("read websocket frame length: {err}"))?;
+            len = u64::from_be_bytes(buf);
+        }
+        if len > 16 * 1024 * 1024 {
+            return Err("websocket frame too large".to_string());
+        }
+        let mask = if masked {
+            let mut mask = [0u8; 4];
+            stream
+                .read_exact(&mut mask)
+                .map_err(|err| format!("read websocket frame mask: {err}"))?;
+            Some(mask)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; len as usize];
+        stream
+            .read_exact(&mut payload)
+            .map_err(|err| format!("read websocket frame payload: {err}"))?;
+        if let Some(mask) = mask {
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[idx % 4];
+            }
+        }
+
+        match opcode {
+            0x1 => {
+                return String::from_utf8(payload)
+                    .map_err(|err| format!("decode websocket text: {err}"));
+            }
+            0x8 => return Err("app-server websocket closed".to_string()),
+            0x9 => websocket_send_pong(stream, &payload)?,
+            0xA => {}
+            _ => {}
+        }
+    }
+}
+
+fn websocket_send_pong(stream: &mut UnixStream, payload: &[u8]) -> Result<(), String> {
+    let mut frame = Vec::with_capacity(payload.len() + 6);
+    frame.push(0x8A);
+    frame.push(0x80 | payload.len() as u8);
+    let mask = [0x70, 0x6f, 0x6e, 0x67];
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(idx, byte)| byte ^ mask[idx % 4]),
+    );
+    stream
+        .write_all(&frame)
+        .map_err(|err| format!("write websocket pong: {err}"))
 }
 
 fn api_get_json(path: &str) -> Result<Value, String> {
@@ -961,15 +1370,17 @@ Default client command:
   codex --remote unix://$YOLO_RUNTIME_DIR/codex-app-server.sock --search --dangerously-bypass-approvals-and-sandbox [CODEX_ARGS...]
 
 The client keeps Codex stdio attached to the terminal and reports its process,
-model, service_tier, and fast state to the yolo server API.
+model, service_tier, fast state, and app-server thread status to the yolo
+server API.
 
 upgrade-resume installs the latest Codex CLI into a yolo-managed
 user-writable npm prefix, restarts the yolo app-server, then launches
 `codex resume` through yolo. With no arguments it resumes `--last`.
 
 upgrade-resume-all asks the running yolo server to install the latest Codex
-CLI, restart its app-server child, and request every live yolo client wrapper
-to restart its Codex child as `codex resume` on the same terminal.
+CLI, wait for active app-server threads to become idle, restart its app-server
+child, and request every live yolo client wrapper to restart its Codex child as
+`codex resume` on the same terminal.
 
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
@@ -982,6 +1393,8 @@ Environment:
   YOLO_CODEX_PREFIX Managed Codex npm prefix
   YOLO_REMOTE       Override app-server endpoint for the client
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
+  YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS
+                    Max seconds to wait for working clients before upgrade
 "
     );
 }
