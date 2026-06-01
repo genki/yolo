@@ -96,6 +96,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("upgrade-resume") | Some("resume-upgrade") | Some("upgrade-and-resume") => {
+            args.remove(0);
+            run_upgrade_resume(args);
+        }
         Some("client") => {
             args.remove(0);
             run_client(args);
@@ -312,6 +316,68 @@ fn run_client(mut args: Vec<OsString>) {
         &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
     );
     std::process::exit(info.exit_code.unwrap_or(1));
+}
+
+fn run_upgrade_resume(mut args: Vec<OsString>) {
+    if args.is_empty() {
+        args.push(OsString::from("--last"));
+    }
+    if let Err(err) = upgrade_codex_cli() {
+        eprintln!("yolo upgrade-resume: {err}");
+        std::process::exit(1);
+    }
+    if let Err(err) = restart_server_for_upgrade() {
+        eprintln!("yolo upgrade-resume: failed to restart yolo server: {err}");
+        std::process::exit(1);
+    }
+    let mut client_args = Vec::with_capacity(args.len() + 1);
+    client_args.push(OsString::from("resume"));
+    client_args.extend(args);
+    run_client(client_args);
+}
+
+fn upgrade_codex_cli() -> Result<(), String> {
+    let command = env::var("YOLO_CODEX_UPGRADE_COMMAND")
+        .unwrap_or_else(|_| "npm install -g @openai/codex@latest".to_string());
+    eprintln!("yolo: upgrading Codex CLI with: {command}");
+    let status = Command::new("sh")
+        .arg("-lc")
+        .arg(&command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| format!("spawn upgrade command: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "upgrade command exited with {}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ));
+    }
+    Ok(())
+}
+
+fn restart_server_for_upgrade() -> Result<(), String> {
+    if api_get_json("/status").is_ok() {
+        eprintln!("yolo: restarting yolo server so app-server uses upgraded Codex");
+        let _ = api_post_json("/shutdown", &json!({}));
+        wait_for_server_stopped(Duration::from_secs(5))?;
+    }
+    ensure_server()
+}
+
+fn wait_for_server_stopped(timeout: Duration) -> Result<(), String> {
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < timeout {
+        if api_get_json("/status").is_err() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("server did not stop after shutdown request".to_string())
 }
 
 fn ensure_server() -> Result<(), String> {
@@ -626,6 +692,7 @@ Launch Codex through a yolo-managed app-server in YOLO mode with web search enab
 Usage:
   yolo [CODEX_ARGS...]
   yolo client [CODEX_ARGS...]
+  yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
   yolo server [--daemon|--foreground]
   yolo status
   yolo stop
@@ -636,11 +703,17 @@ Default client command:
 The client keeps Codex stdio attached to the terminal and reports its process,
 model, service_tier, and fast state to the yolo server API.
 
+upgrade-resume runs the Codex CLI upgrade command, restarts the yolo
+app-server, then launches `codex resume` through yolo. With no arguments it
+resumes `--last`.
+
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
 
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
+  YOLO_CODEX_UPGRADE_COMMAND
+                    Upgrade command (default: npm install -g @openai/codex@latest)
   YOLO_REMOTE       Override app-server endpoint for the client
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
 "

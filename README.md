@@ -28,10 +28,15 @@ cargo install --path .
 ```sh
 yolo --cd /home/vagrant/websh
 yolo resume --last
+yolo upgrade-resume --last
 yolo server --daemon
 yolo status
 yolo stop
 ```
+
+`yolo upgrade-resume [RESUME_ARGS...]` upgrades the Codex CLI, restarts the
+yolo-managed app-server so it uses the upgraded Codex binary, then launches
+`codex resume` through yolo. With no arguments it resumes `--last`.
 
 ## API
 
@@ -51,6 +56,8 @@ The `/clients` response includes:
 ## Environment
 
 - `YOLO_CODEX`: Codex executable to run. Defaults to `codex`.
+- `YOLO_CODEX_UPGRADE_COMMAND`: command used by `upgrade-resume`. Defaults to
+  `npm install -g @openai/codex@latest`.
 - `YOLO_REMOTE`: override app-server endpoint for the client.
 - `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
   `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
