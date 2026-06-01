@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,6 +55,7 @@ struct ServerInfo {
     version: String,
     pid: u32,
     app_server_pid: Option<u32>,
+    resume_generation: u64,
     api_socket: String,
     app_server_socket: String,
     clients: Vec<ClientInfo>,
@@ -63,6 +65,7 @@ struct ServerInfo {
 struct ServerState {
     started_at: u64,
     app_server_pid: Option<u32>,
+    resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
 }
 
@@ -102,6 +105,13 @@ fn main() {
             args.remove(0);
             run_upgrade_resume(args);
         }
+        Some("upgrade-resume-all") | Some("resume-all-upgrade") => {
+            args.remove(0);
+            if let Err(err) = run_upgrade_resume_all() {
+                eprintln!("yolo upgrade-resume-all: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("client") => {
             args.remove(0);
             run_client(args);
@@ -124,12 +134,13 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     fs::write(&paths.pid_file, std::process::id().to_string())
         .map_err(|err| format!("write pid file: {err}"))?;
 
-    let mut app_server = spawn_app_server(&paths)?;
     let state = Arc::new(Mutex::new(ServerState {
         started_at: now_secs(),
-        app_server_pid: Some(app_server.id()),
+        app_server_pid: None,
+        resume_generation: 0,
         clients: BTreeMap::new(),
     }));
+    let app_server_pid = spawn_tracked_app_server(Arc::clone(&state), paths.clone())?;
 
     let listener = UnixListener::bind(&paths.api_socket)
         .map_err(|err| format!("bind {}: {err}", paths.api_socket.display()))?;
@@ -140,24 +151,9 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     );
     eprintln!(
         "codex app-server child pid {:?} listening on unix://{}",
-        app_server.id(),
+        app_server_pid,
         paths.app_server_socket.display()
     );
-
-    let monitor_state = Arc::clone(&state);
-    thread::spawn(move || {
-        let status = app_server.wait().ok();
-        if let Ok(mut state) = monitor_state.lock() {
-            state.app_server_pid = None;
-            for client in state.clients.values_mut() {
-                if client.status == "running" {
-                    client.status = "app-server-exited".to_string();
-                    client.updated_at = now_secs();
-                }
-            }
-        }
-        eprintln!("yolo server: codex app-server exited: {status:?}");
-    });
 
     for stream in listener.incoming() {
         match stream {
@@ -219,7 +215,53 @@ fn spawn_app_server(paths: &RuntimePaths) -> Result<Child, String> {
         .map_err(|err| format!("spawn codex app-server: {err}"))
 }
 
-fn run_client(mut args: Vec<OsString>) {
+fn spawn_tracked_app_server(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) -> Result<u32, String> {
+    remove_socket_if_present(&paths.app_server_socket)?;
+    let mut app_server = spawn_app_server(&paths)?;
+    let pid = app_server.id();
+    if let Ok(mut state) = state.lock() {
+        state.app_server_pid = Some(pid);
+    }
+
+    let monitor_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let status = app_server.wait().ok();
+        if let Ok(mut state) = monitor_state.lock()
+            && state.app_server_pid == Some(pid)
+        {
+            state.app_server_pid = None;
+            for client in state.clients.values_mut() {
+                if client.status == "running" {
+                    client.status = "app-server-exited".to_string();
+                    client.updated_at = now_secs();
+                }
+            }
+        }
+        eprintln!("yolo server: codex app-server pid {pid} exited: {status:?}");
+    });
+
+    Ok(pid)
+}
+
+fn restart_tracked_app_server(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) -> Result<u32, String> {
+    let old_pid = state.lock().ok().and_then(|state| state.app_server_pid);
+    if let Some(pid) = old_pid {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        wait_for_pid_exit(pid, Duration::from_secs(5));
+    }
+    spawn_tracked_app_server(state, paths)
+}
+
+fn run_client(args: Vec<OsString>) {
     if let Err(err) = ensure_server() {
         eprintln!("yolo: failed to start server: {err}");
         std::process::exit(1);
@@ -232,7 +274,6 @@ fn run_client(mut args: Vec<OsString>) {
             std::process::exit(1);
         }
     };
-    let codex = codex_executable();
     let remote = env::var("YOLO_REMOTE")
         .unwrap_or_else(|_| format!("unix://{}", paths.app_server_socket.display()));
 
@@ -241,39 +282,21 @@ fn run_client(mut args: Vec<OsString>) {
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
         .to_string();
-    let string_args = args
+    let original_args = args.clone();
+    let mut launch_args = args;
+    let string_args = original_args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
-
-    let mut command = Command::new(codex);
-    command
-        .arg("--remote")
-        .arg(&remote)
-        .arg("--search")
-        .arg("--dangerously-bypass-approvals-and-sandbox");
-    command.args(args.drain(..));
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            eprintln!("yolo: failed to spawn codex: {err}");
-            std::process::exit(127);
-        }
-    };
 
     let initial_config = read_codex_config();
     let mut info = ClientInfo {
         id: client_id.clone(),
         yolo_pid: std::process::id(),
-        codex_pid: Some(child.id()),
+        codex_pid: None,
         cwd,
         args: string_args,
-        remote,
+        remote: remote.clone(),
         model: initial_config.model,
         service_tier: initial_config.service_tier.clone(),
         fast: is_fast_tier(initial_config.service_tier.as_deref()),
@@ -284,12 +307,12 @@ fn run_client(mut args: Vec<OsString>) {
         exit_code: None,
         status: "running".to_string(),
     };
-    let _ = api_post_json(
-        "/clients/register",
-        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-    );
 
     let heartbeat_id = client_id.clone();
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let heartbeat_restart_requested = Arc::clone(&restart_requested);
+    let seen_resume_generation = Arc::new(AtomicU64::new(current_resume_generation()));
+    let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(2));
@@ -302,22 +325,91 @@ fn run_client(mut args: Vec<OsString>) {
                 "status": "running",
                 "updated_at": now_secs(),
             });
-            if api_post_json("/clients/heartbeat", &body).is_err() {
-                break;
+            match api_post_json("/clients/heartbeat", &body) {
+                Ok(value) => {
+                    if let Some(generation) = value.get("resume_generation").and_then(Value::as_u64)
+                    {
+                        let seen = heartbeat_seen_generation.load(Ordering::SeqCst);
+                        if generation > seen {
+                            heartbeat_seen_generation.store(generation, Ordering::SeqCst);
+                            heartbeat_restart_requested.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Err(_) => continue,
             }
         }
     });
 
-    let status = child.wait();
-    info.updated_at = now_secs();
-    info.ended_at = Some(now_secs());
-    info.status = "exited".to_string();
-    info.exit_code = status.ok().and_then(|status| status.code());
-    let _ = api_post_json(
-        "/clients/finish",
-        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-    );
-    std::process::exit(info.exit_code.unwrap_or(1));
+    loop {
+        let codex = codex_executable();
+        let mut command = Command::new(codex);
+        command
+            .arg("--remote")
+            .arg(&remote)
+            .arg("--search")
+            .arg("--dangerously-bypass-approvals-and-sandbox")
+            .args(&launch_args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                eprintln!("yolo: failed to spawn codex: {err}");
+                std::process::exit(127);
+            }
+        };
+
+        info.codex_pid = Some(child.id());
+        info.updated_at = now_secs();
+        info.ended_at = None;
+        info.exit_code = None;
+        info.status = "running".to_string();
+        let _ = api_post_json(
+            "/clients/register",
+            &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+        );
+
+        loop {
+            if restart_requested.swap(false, Ordering::SeqCst) {
+                terminate_child(&mut child);
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    info.updated_at = now_secs();
+                    info.ended_at = Some(now_secs());
+                    info.status = "exited".to_string();
+                    info.exit_code = status.code();
+                    let _ = api_post_json(
+                        "/clients/finish",
+                        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                    );
+                    std::process::exit(info.exit_code.unwrap_or(1));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(200)),
+                Err(err) => {
+                    eprintln!("yolo: failed to wait for codex: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        launch_args = resume_args_for(&original_args);
+        info.args = launch_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        info.status = "restarting".to_string();
+        info.updated_at = now_secs();
+        let _ = api_post_json(
+            "/clients/register",
+            &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
 }
 
 fn run_upgrade_resume(mut args: Vec<OsString>) {
@@ -336,6 +428,16 @@ fn run_upgrade_resume(mut args: Vec<OsString>) {
     client_args.push(OsString::from("resume"));
     client_args.extend(args);
     run_client(client_args);
+}
+
+fn run_upgrade_resume_all() -> Result<(), String> {
+    ensure_server()?;
+    let value = api_post_json("/upgrade-resume-all", &json!({}))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
 }
 
 fn upgrade_codex_cli() -> Result<(), String> {
@@ -415,6 +517,58 @@ fn wait_for_server_stopped(timeout: Duration) -> Result<(), String> {
         thread::sleep(Duration::from_millis(100));
     }
     Err("server did not stop after shutdown request".to_string())
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) {
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < timeout {
+        let alive = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+}
+
+fn terminate_child(child: &mut Child) {
+    let pid = child.id();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < Duration::from_secs(5) {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(_) => return,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
+    if matches!(args.first().and_then(|arg| arg.to_str()), Some("resume")) {
+        return args.to_vec();
+    }
+    vec![OsString::from("resume"), OsString::from("--last")]
+}
+
+fn current_resume_generation() -> u64 {
+    api_get_json("/status")
+        .ok()
+        .and_then(|value| value.get("resume_generation").and_then(Value::as_u64))
+        .unwrap_or(0)
 }
 
 fn ensure_server() -> Result<(), String> {
@@ -502,33 +656,39 @@ fn handle_api_connection(
             let parsed = serde_json::from_str::<Value>(body);
             match parsed {
                 Ok(value) => {
+                    let mut resume_generation = 0;
                     if let Some(id) = value.get("id").and_then(Value::as_str)
                         && let Ok(mut state) = state.lock()
-                        && let Some(client) = state.clients.get_mut(id)
                     {
-                        client.updated_at = value
-                            .get("updated_at")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_else(now_secs);
-                        client.model = value
-                            .get("model")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string);
-                        client.service_tier = value
-                            .get("service_tier")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string);
-                        client.fast = value
-                            .get("fast")
-                            .and_then(Value::as_bool)
-                            .unwrap_or_else(|| is_fast_tier(client.service_tier.as_deref()));
-                        client.status = value
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("running")
-                            .to_string();
+                        resume_generation = state.resume_generation;
+                        if let Some(client) = state.clients.get_mut(id) {
+                            client.updated_at = value
+                                .get("updated_at")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_else(now_secs);
+                            client.model = value
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            client.service_tier = value
+                                .get("service_tier")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            client.fast = value
+                                .get("fast")
+                                .and_then(Value::as_bool)
+                                .unwrap_or_else(|| is_fast_tier(client.service_tier.as_deref()));
+                            client.status = value
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("running")
+                                .to_string();
+                        }
                     }
-                    json_response(200, &json!({"ok": true}))
+                    json_response(
+                        200,
+                        &json!({"ok": true, "resume_generation": resume_generation}),
+                    )
                 }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
             }
@@ -542,6 +702,30 @@ fn handle_api_connection(
             }
             Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
         },
+        ("POST", "/upgrade-resume-all") => {
+            let result = upgrade_codex_cli()
+                .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
+                .and_then(|app_server_pid| {
+                    if let Ok(mut state) = state.lock() {
+                        state.resume_generation = state.resume_generation.saturating_add(1);
+                        let generation = state.resume_generation;
+                        return Ok((app_server_pid, generation, state.clients.len()));
+                    }
+                    Err("server state lock poisoned".to_string())
+                });
+            match result {
+                Ok((app_server_pid, resume_generation, clients)) => json_response(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "app_server_pid": app_server_pid,
+                        "resume_generation": resume_generation,
+                        "clients": clients
+                    }),
+                ),
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+            }
+        }
         ("POST", "/shutdown") => {
             if let Ok(state) = state.lock()
                 && let Some(pid) = state.app_server_pid
@@ -564,6 +748,7 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         version: VERSION.to_string(),
         pid: std::process::id(),
         app_server_pid: state.app_server_pid,
+        resume_generation: state.resume_generation,
         api_socket: paths.api_socket.display().to_string(),
         app_server_socket: paths.app_server_socket.display().to_string(),
         clients: state.clients.values().cloned().collect(),
@@ -614,6 +799,7 @@ fn json_response<T: Serialize>(status: u16, body: &T) -> String {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "Error",
     };
     format!(
@@ -766,6 +952,7 @@ Usage:
   yolo [CODEX_ARGS...]
   yolo client [CODEX_ARGS...]
   yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
+  yolo upgrade-resume-all
   yolo server [--daemon|--foreground]
   yolo status
   yolo stop
@@ -780,8 +967,13 @@ upgrade-resume installs the latest Codex CLI into a yolo-managed
 user-writable npm prefix, restarts the yolo app-server, then launches
 `codex resume` through yolo. With no arguments it resumes `--last`.
 
+upgrade-resume-all asks the running yolo server to install the latest Codex
+CLI, restart its app-server child, and request every live yolo client wrapper
+to restart its Codex child as `codex resume` on the same terminal.
+
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
+  curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-all
 
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
