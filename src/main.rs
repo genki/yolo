@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CODEX: &str = "codex";
+const CODEX_PACKAGE: &str = "@openai/codex@latest";
 const RUNTIME_DIR_NAME: &str = "yolo";
 const API_SOCKET_NAME: &str = "api.sock";
 const APP_SERVER_SOCKET_NAME: &str = "codex-app-server.sock";
 const PID_FILE_NAME: &str = "server.pid";
+const MANAGED_CODEX_DIR_NAME: &str = "codex-npm";
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -197,7 +199,7 @@ fn spawn_server_daemon() -> Result<(), String> {
 }
 
 fn spawn_app_server(paths: &RuntimePaths) -> Result<Child, String> {
-    let codex = env::var_os("YOLO_CODEX").unwrap_or_else(|| OsString::from(DEFAULT_CODEX));
+    let codex = codex_executable();
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -230,7 +232,7 @@ fn run_client(mut args: Vec<OsString>) {
             std::process::exit(1);
         }
     };
-    let codex = env::var_os("YOLO_CODEX").unwrap_or_else(|| OsString::from(DEFAULT_CODEX));
+    let codex = codex_executable();
     let remote = env::var("YOLO_REMOTE")
         .unwrap_or_else(|_| format!("unix://{}", paths.app_server_socket.display()));
 
@@ -337,27 +339,62 @@ fn run_upgrade_resume(mut args: Vec<OsString>) {
 }
 
 fn upgrade_codex_cli() -> Result<(), String> {
-    let command = env::var("YOLO_CODEX_UPGRADE_COMMAND")
-        .unwrap_or_else(|_| "npm install -g @openai/codex@latest".to_string());
-    eprintln!("yolo: upgrading Codex CLI with: {command}");
-    let status = Command::new("sh")
-        .arg("-lc")
-        .arg(&command)
+    if let Ok(command) = env::var("YOLO_CODEX_UPGRADE_COMMAND") {
+        eprintln!("yolo: upgrading Codex CLI with override command: {command}");
+        let status = Command::new("sh")
+            .arg("-lc")
+            .arg(&command)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|err| format!("spawn upgrade command: {err}"))?;
+        if !status.success() {
+            return Err(format_exit_status("upgrade command", status));
+        }
+        return Ok(());
+    }
+
+    let prefix = managed_codex_prefix();
+    fs::create_dir_all(&prefix)
+        .map_err(|err| format!("create managed Codex prefix {}: {err}", prefix.display()))?;
+    eprintln!(
+        "yolo: upgrading Codex CLI into user-writable prefix {}",
+        prefix.display()
+    );
+    let status = Command::new("npm")
+        .arg("install")
+        .arg("--global")
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg(CODEX_PACKAGE)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|err| format!("spawn upgrade command: {err}"))?;
+        .map_err(|err| format!("spawn npm: {err}"))?;
     if !status.success() {
+        return Err(format_exit_status("npm managed install", status));
+    }
+    let bin = managed_codex_bin();
+    if !bin.exists() {
         return Err(format!(
-            "upgrade command exited with {}",
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string())
+            "managed Codex install completed but {} was not found",
+            bin.display()
         ));
     }
+    eprintln!("yolo: managed Codex CLI is {}", bin.display());
     Ok(())
+}
+
+fn format_exit_status(label: &str, status: std::process::ExitStatus) -> String {
+    format!(
+        "{label} exited with {}",
+        status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    )
 }
 
 fn restart_server_for_upgrade() -> Result<(), String> {
@@ -641,6 +678,42 @@ fn codex_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+fn codex_executable() -> OsString {
+    if let Some(codex) = env::var_os("YOLO_CODEX") {
+        return codex;
+    }
+    let managed = managed_codex_bin();
+    if managed.exists() {
+        return managed.into_os_string();
+    }
+    OsString::from(DEFAULT_CODEX)
+}
+
+fn managed_codex_prefix() -> PathBuf {
+    let base = env::var_os("YOLO_CODEX_PREFIX")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_DATA_HOME").map(|dir| PathBuf::from(dir).join(RUNTIME_DIR_NAME))
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".local/share")
+                    .join(RUNTIME_DIR_NAME)
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(RUNTIME_DIR_NAME));
+    if env::var_os("YOLO_CODEX_PREFIX").is_some() {
+        base
+    } else {
+        base.join(MANAGED_CODEX_DIR_NAME)
+    }
+}
+
+fn managed_codex_bin() -> PathBuf {
+    managed_codex_prefix().join("bin").join("codex")
+}
+
 fn runtime_paths() -> Result<RuntimePaths, String> {
     let base = env::var_os("YOLO_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -703,9 +776,9 @@ Default client command:
 The client keeps Codex stdio attached to the terminal and reports its process,
 model, service_tier, and fast state to the yolo server API.
 
-upgrade-resume runs the Codex CLI upgrade command, restarts the yolo
-app-server, then launches `codex resume` through yolo. With no arguments it
-resumes `--last`.
+upgrade-resume installs the latest Codex CLI into a yolo-managed
+user-writable npm prefix, restarts the yolo app-server, then launches
+`codex resume` through yolo. With no arguments it resumes `--last`.
 
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
@@ -713,7 +786,8 @@ API:
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
   YOLO_CODEX_UPGRADE_COMMAND
-                    Upgrade command (default: npm install -g @openai/codex@latest)
+                    Override upgrade command
+  YOLO_CODEX_PREFIX Managed Codex npm prefix
   YOLO_REMOTE       Override app-server endpoint for the client
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
 "
