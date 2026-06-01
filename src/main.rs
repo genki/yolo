@@ -318,7 +318,7 @@ fn run_client(args: Vec<OsString>) {
         model: initial_config.model,
         service_tier: initial_config.service_tier.clone(),
         fast: is_fast_tier(initial_config.service_tier.as_deref()),
-        thread_id: None,
+        thread_id: thread_id_from_args(&original_args),
         started_at: now_secs(),
         updated_at: now_secs(),
         ended_at: None,
@@ -423,6 +423,7 @@ fn run_client(args: Vec<OsString>) {
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
+        info.thread_id = thread_id_from_args(&launch_args);
         info.status = "restarting".to_string();
         info.updated_at = now_secs();
         let _ = api_post_json(
@@ -583,6 +584,17 @@ fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
         return args.to_vec();
     }
     vec![OsString::from("resume"), OsString::from("--last")]
+}
+
+fn thread_id_from_args(args: &[OsString]) -> Option<String> {
+    if !matches!(args.first().and_then(|arg| arg.to_str()), Some("resume")) {
+        return None;
+    }
+    args.iter()
+        .skip(1)
+        .filter_map(|arg| arg.to_str())
+        .find(|arg| !arg.starts_with('-'))
+        .map(ToString::to_string)
 }
 
 fn current_resume_generation() -> u64 {
@@ -785,30 +797,25 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
             continue;
         }
 
-        let matches = snapshot
-            .iter()
-            .filter(|thread| thread.cwd == client.cwd)
-            .collect::<Vec<_>>();
+        let matched = match client.thread_id.as_deref() {
+            Some(thread_id) => snapshot.iter().find(|thread| thread.id == thread_id),
+            None => snapshot
+                .iter()
+                .find(|thread| thread.cwd == client.cwd && thread.status == "active")
+                .or_else(|| snapshot.iter().find(|thread| thread.cwd == client.cwd)),
+        };
 
-        if matches.is_empty() {
+        let Some(thread) = matched else {
             client.codex_status = None;
             client.codex_active_flags.clear();
             client.codex_status_updated_at = Some(now);
             continue;
-        }
+        };
 
-        let active = matches
-            .iter()
-            .find(|thread| thread.status == "active")
-            .copied()
-            .or_else(|| matches.first().copied());
-
-        if let Some(thread) = active {
-            client.thread_id = Some(thread.id.clone());
-            client.codex_status = Some(thread.status.clone());
-            client.codex_active_flags = thread.active_flags.clone();
-            client.codex_status_updated_at = Some(now);
-        }
+        client.thread_id = Some(thread.id.clone());
+        client.codex_status = Some(thread.status.clone());
+        client.codex_active_flags = thread.active_flags.clone();
+        client.codex_status_updated_at = Some(now);
     }
 }
 
@@ -851,9 +858,14 @@ fn working_clients_for_snapshot(
         .values()
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
         .filter_map(|client| {
-            let is_active = snapshot
-                .iter()
-                .any(|thread| thread.cwd == client.cwd && thread.status == "active");
+            let is_active = match client.thread_id.as_deref() {
+                Some(thread_id) => snapshot
+                    .iter()
+                    .any(|thread| thread.id == thread_id && thread.status == "active"),
+                None => snapshot
+                    .iter()
+                    .any(|thread| thread.cwd == client.cwd && thread.status == "active"),
+            };
             if is_active {
                 Some(format!("{} cwd={}", client.id, client.cwd))
             } else {
