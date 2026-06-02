@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -86,6 +86,29 @@ struct AppThreadSnapshot {
     cwd: String,
     status: String,
     active_flags: Vec<String>,
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigureClientsRequest {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    fast: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 fn main() {
@@ -128,6 +151,13 @@ fn main() {
             args.remove(0);
             if let Err(err) = run_upgrade_resume_all() {
                 eprintln!("yolo upgrade-resume-all: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("set") | Some("configure") => {
+            args.remove(0);
+            if let Err(err) = run_configure(args) {
+                eprintln!("yolo set: {err}");
                 std::process::exit(1);
             }
         }
@@ -310,14 +340,8 @@ fn run_client(args: Vec<OsString>) {
         .collect::<Vec<_>>();
 
     let initial_config = read_codex_config();
-    let initial_runtime = read_codex_runtime_status();
-    let initial_service_tier = initial_runtime
-        .service_tier
-        .clone()
-        .or(initial_config.service_tier.clone());
-    let initial_fast = initial_runtime
-        .fast
-        .unwrap_or_else(|| is_fast_tier(initial_service_tier.as_deref()));
+    let initial_service_tier = initial_config.service_tier.clone();
+    let initial_fast = is_fast_tier(initial_service_tier.as_deref());
     let mut info = ClientInfo {
         id: client_id.clone(),
         yolo_pid: std::process::id(),
@@ -325,9 +349,9 @@ fn run_client(args: Vec<OsString>) {
         cwd,
         args: string_args,
         remote: remote.clone(),
-        model: initial_runtime.model.or(initial_config.model),
+        model: initial_config.model,
         service_tier: initial_service_tier,
-        reasoning_effort: initial_runtime.reasoning_effort,
+        reasoning_effort: None,
         fast: initial_fast,
         thread_id: thread_id_from_args(&original_args),
         started_at: now_secs(),
@@ -348,18 +372,8 @@ fn run_client(args: Vec<OsString>) {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(2));
-            let cfg = read_codex_config();
-            let runtime = read_codex_runtime_status();
-            let service_tier = runtime.service_tier.or(cfg.service_tier);
-            let fast = runtime
-                .fast
-                .unwrap_or_else(|| is_fast_tier(service_tier.as_deref()));
             let body = json!({
                 "id": heartbeat_id,
-                "model": runtime.model.or(cfg.model),
-                "service_tier": service_tier,
-                "reasoning_effort": runtime.reasoning_effort,
-                "fast": fast,
                 "status": "running",
                 "updated_at": now_secs(),
             });
@@ -477,6 +491,82 @@ fn run_upgrade_resume_all() -> Result<(), String> {
         serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
     );
     Ok(())
+}
+
+fn run_configure(args: Vec<OsString>) -> Result<(), String> {
+    ensure_server()?;
+    let request = parse_configure_args(args)?;
+    let value = api_post_json(
+        "/clients/configure",
+        &serde_json::to_value(&request).map_err(|err| err.to_string())?,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn parse_configure_args(args: Vec<OsString>) -> Result<ConfigureClientsRequest, String> {
+    let mut request = ConfigureClientsRequest {
+        client_id: None,
+        thread_id: None,
+        cwd: None,
+        all: false,
+        model: None,
+        fast: None,
+        reasoning_effort: None,
+        timeout_secs: None,
+    };
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy().to_string();
+        let mut value_for = |name: &str| -> Result<String, String> {
+            iter.next()
+                .map(|value| value.to_string_lossy().to_string())
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+        match arg.as_str() {
+            "--all" => request.all = true,
+            "--client" | "--client-id" => request.client_id = Some(value_for(&arg)?),
+            "--thread" | "--thread-id" => request.thread_id = Some(value_for(&arg)?),
+            "--cwd" => request.cwd = Some(value_for(&arg)?),
+            "--model" => request.model = Some(value_for(&arg)?),
+            "--effort" | "--reasoning-effort" => {
+                request.reasoning_effort = Some(value_for(&arg)?);
+            }
+            "--fast" => request.fast = Some(parse_boolish(&value_for(&arg)?)?),
+            "--fast-on" => request.fast = Some(true),
+            "--fast-off" => request.fast = Some(false),
+            "--timeout-secs" => {
+                request.timeout_secs = Some(
+                    value_for(&arg)?
+                        .parse::<u64>()
+                        .map_err(|err| format!("invalid --timeout-secs: {err}"))?,
+                );
+            }
+            _ => return Err(format!("unknown set argument: {arg}")),
+        }
+    }
+    if request.model.is_none() && request.fast.is_none() && request.reasoning_effort.is_none() {
+        return Err("set requires --model, --fast, or --effort".to_string());
+    }
+    if !request.all
+        && request.client_id.is_none()
+        && request.thread_id.is_none()
+        && request.cwd.is_none()
+    {
+        return Err("set requires --all, --client, --thread, or --cwd".to_string());
+    }
+    Ok(request)
+}
+
+fn parse_boolish(value: &str) -> Result<bool, String> {
+    match value {
+        "1" | "true" | "on" | "yes" | "fast" | "priority" => Ok(true),
+        "0" | "false" | "off" | "no" | "default" => Ok(false),
+        _ => Err(format!("invalid boolean value: {value}")),
+    }
 }
 
 fn upgrade_codex_cli() -> Result<(), String> {
@@ -716,22 +806,23 @@ fn handle_api_connection(
                                 .get("updated_at")
                                 .and_then(Value::as_u64)
                                 .unwrap_or_else(now_secs);
-                            client.model = value
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string);
-                            client.service_tier = value
-                                .get("service_tier")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string);
-                            client.reasoning_effort = value
-                                .get("reasoning_effort")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string);
-                            client.fast = value
-                                .get("fast")
-                                .and_then(Value::as_bool)
-                                .unwrap_or_else(|| is_fast_tier(client.service_tier.as_deref()));
+                            if let Some(model) = value.get("model").and_then(Value::as_str) {
+                                client.model = Some(model.to_string());
+                            }
+                            if let Some(service_tier) =
+                                value.get("service_tier").and_then(Value::as_str)
+                            {
+                                client.service_tier = Some(service_tier.to_string());
+                                client.fast = is_fast_tier(client.service_tier.as_deref());
+                            }
+                            if let Some(reasoning_effort) =
+                                value.get("reasoning_effort").and_then(Value::as_str)
+                            {
+                                client.reasoning_effort = Some(reasoning_effort.to_string());
+                            }
+                            if let Some(fast) = value.get("fast").and_then(Value::as_bool) {
+                                client.fast = fast;
+                            }
                             client.status = value
                                 .get("status")
                                 .and_then(Value::as_str)
@@ -756,6 +847,17 @@ fn handle_api_connection(
             }
             Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
         },
+        ("POST", "/clients/configure") => {
+            match serde_json::from_str::<ConfigureClientsRequest>(body) {
+                Ok(request) => {
+                    match configure_clients_when_idle(Arc::clone(&state), &paths, request) {
+                        Ok(value) => json_response(200, &value),
+                        Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+                    }
+                }
+                Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
+        }
         ("POST", "/upgrade-resume-all") => {
             let result = wait_for_clients_idle(Arc::clone(&state), &paths)
                 .and_then(|_| upgrade_codex_cli())
@@ -837,6 +939,16 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         client.codex_status = Some(thread.status.clone());
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
+        if let Some(model) = thread.model.as_ref() {
+            client.model = Some(model.clone());
+        }
+        if let Some(service_tier) = thread.service_tier.as_ref() {
+            client.service_tier = Some(service_tier.clone());
+            client.fast = is_fast_tier(client.service_tier.as_deref());
+        }
+        if let Some(reasoning_effort) = thread.reasoning_effort.as_ref() {
+            client.reasoning_effort = Some(reasoning_effort.clone());
+        }
     }
 }
 
@@ -877,6 +989,155 @@ fn working_clients_for_snapshot(
     state
         .clients
         .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter_map(|client| {
+            let is_active = match client.thread_id.as_deref() {
+                Some(thread_id) => snapshot
+                    .iter()
+                    .any(|thread| thread.id == thread_id && thread.status == "active"),
+                None => snapshot
+                    .iter()
+                    .any(|thread| thread.cwd == client.cwd && thread.status == "active"),
+            };
+            if is_active {
+                Some(format!("{} cwd={}", client.id, client.cwd))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn configure_clients_when_idle(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    request: ConfigureClientsRequest,
+) -> Result<Value, String> {
+    let timeout = request
+        .timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or_else(upgrade_idle_wait_timeout);
+    let selected_ids = select_configure_clients(&state, &request)?;
+    if selected_ids.is_empty() {
+        return Err("no matching yolo clients".to_string());
+    }
+
+    let start = SystemTime::now();
+    loop {
+        let snapshot = app_server_thread_snapshot(paths)?;
+        apply_thread_snapshot(&state, &snapshot);
+        let working = working_selected_clients_for_snapshot(&state, &snapshot, &selected_ids);
+        if working.is_empty() {
+            break;
+        }
+        if start.elapsed().unwrap_or_default() >= timeout {
+            return Err(format!(
+                "timed out waiting for selected Codex clients to become idle: {}",
+                working.join(", ")
+            ));
+        }
+        eprintln!(
+            "yolo: waiting for selected Codex clients to become idle before settings update: {}",
+            working.join(", ")
+        );
+        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+    }
+
+    let clients = selected_clients_with_threads(&state, &selected_ids)?;
+    let mut rpc = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    rpc.initialize()?;
+    let mut updated = Vec::new();
+    for (client_id, thread_id) in clients {
+        let mut params = serde_json::Map::new();
+        params.insert("threadId".to_string(), Value::String(thread_id.clone()));
+        if let Some(model) = request.model.as_ref() {
+            params.insert("model".to_string(), Value::String(model.clone()));
+        }
+        if let Some(fast) = request.fast {
+            params.insert(
+                "serviceTier".to_string(),
+                Value::String(if fast { "priority" } else { "default" }.to_string()),
+            );
+        }
+        if let Some(effort) = request.reasoning_effort.as_ref() {
+            params.insert("effort".to_string(), Value::String(effort.clone()));
+        }
+        rpc.request("thread/settings/update", Value::Object(params))?;
+        updated.push(json!({
+            "client_id": client_id,
+            "thread_id": thread_id,
+        }));
+    }
+
+    let snapshot = app_server_thread_snapshot(paths)?;
+    apply_thread_snapshot(&state, &snapshot);
+    Ok(json!({
+        "ok": true,
+        "updated": updated,
+        "model": request.model,
+        "fast": request.fast,
+        "reasoning_effort": request.reasoning_effort,
+    }))
+}
+
+fn select_configure_clients(
+    state: &Arc<Mutex<ServerState>>,
+    request: &ConfigureClientsRequest,
+) -> Result<BTreeSet<String>, String> {
+    let state = state
+        .lock()
+        .map_err(|_| "server state lock poisoned".to_string())?;
+    let mut ids = BTreeSet::new();
+    for client in state.clients.values() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        let matched = request.all
+            || request.client_id.as_deref() == Some(client.id.as_str())
+            || request.thread_id.as_deref() == client.thread_id.as_deref()
+            || request.cwd.as_deref() == Some(client.cwd.as_str());
+        if matched {
+            ids.insert(client.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn selected_clients_with_threads(
+    state: &Arc<Mutex<ServerState>>,
+    selected_ids: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let state = state
+        .lock()
+        .map_err(|_| "server state lock poisoned".to_string())?;
+    selected_ids
+        .iter()
+        .map(|id| {
+            let client = state
+                .clients
+                .get(id)
+                .ok_or_else(|| format!("selected client disappeared: {id}"))?;
+            let thread_id = client
+                .thread_id
+                .clone()
+                .ok_or_else(|| format!("client {id} has no app-server thread id yet"))?;
+            Ok((id.clone(), thread_id))
+        })
+        .collect()
+}
+
+fn working_selected_clients_for_snapshot(
+    state: &Arc<Mutex<ServerState>>,
+    snapshot: &[AppThreadSnapshot],
+    selected_ids: &BTreeSet<String>,
+) -> Vec<String> {
+    let Ok(state) = state.lock() else {
+        return Vec::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| selected_ids.contains(&client.id))
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
         .filter_map(|client| {
             let is_active = match client.thread_id.as_deref() {
@@ -937,20 +1198,42 @@ fn app_server_thread_snapshot(paths: &RuntimePaths) -> Result<Vec<AppThreadSnaps
         let Some(thread_id) = thread_id.as_str() else {
             continue;
         };
-        let response = client.request(
-            "thread/read",
+        let response = match client.request(
+            "thread/resume",
             json!({
                 "threadId": thread_id,
-                "includeTurns": false
+                "excludeTurns": true
             }),
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(_) => client.request(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": false
+                }),
+            )?,
+        };
         if let Some(thread) = response.get("thread") {
-            if let Some(snapshot) = parse_app_thread_snapshot(thread) {
+            if let Some(mut snapshot) = parse_app_thread_snapshot(thread) {
+                apply_app_thread_settings(&mut snapshot, &response);
                 threads.push(snapshot);
             }
         }
     }
     Ok(threads)
+}
+
+fn apply_app_thread_settings(snapshot: &mut AppThreadSnapshot, response: &Value) {
+    if let Some(model) = response.get("model").and_then(Value::as_str) {
+        snapshot.model = Some(model.to_string());
+    }
+    if let Some(service_tier) = response.get("serviceTier").and_then(Value::as_str) {
+        snapshot.service_tier = Some(normalize_service_tier(service_tier.to_string()));
+    }
+    if let Some(reasoning_effort) = response.get("reasoningEffort").and_then(Value::as_str) {
+        snapshot.reasoning_effort = Some(reasoning_effort.to_string());
+    }
 }
 
 fn parse_app_thread_snapshot(thread: &Value) -> Option<AppThreadSnapshot> {
@@ -978,6 +1261,9 @@ fn parse_app_thread_snapshot(thread: &Value) -> Option<AppThreadSnapshot> {
         cwd,
         status,
         active_flags,
+        model: None,
+        service_tier: None,
+        reasoning_effort: None,
     })
 }
 
@@ -1257,14 +1543,6 @@ struct CodexConfig {
     service_tier: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct CodexRuntimeStatus {
-    model: Option<String>,
-    service_tier: Option<String>,
-    reasoning_effort: Option<String>,
-    fast: Option<bool>,
-}
-
 fn read_codex_config() -> CodexConfig {
     let path = codex_config_path();
     let contents = fs::read_to_string(path).unwrap_or_default();
@@ -1292,84 +1570,6 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn read_codex_runtime_status() -> CodexRuntimeStatus {
-    let Some(tmux_pane) = env::var_os("TMUX_PANE") else {
-        return CodexRuntimeStatus::default();
-    };
-    let Some(tmux_socket) = tmux_socket_from_env() else {
-        return CodexRuntimeStatus::default();
-    };
-    let output = Command::new("tmux")
-        .arg("-S")
-        .arg(tmux_socket)
-        .arg("capture-pane")
-        .arg("-p")
-        .arg("-J")
-        .arg("-t")
-        .arg(tmux_pane)
-        .arg("-S")
-        .arg("-8")
-        .output();
-    let Ok(output) = output else {
-        return CodexRuntimeStatus::default();
-    };
-    if !output.status.success() {
-        return CodexRuntimeStatus::default();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .rev()
-        .filter_map(parse_codex_statusline)
-        .next()
-        .unwrap_or_default()
-}
-
-fn tmux_socket_from_env() -> Option<OsString> {
-    let tmux = env::var_os("TMUX")?;
-    let tmux = tmux.to_string_lossy();
-    let socket = tmux.split(',').next()?.trim();
-    if socket.is_empty() {
-        None
-    } else {
-        Some(OsString::from(socket))
-    }
-}
-
-fn parse_codex_statusline(line: &str) -> Option<CodexRuntimeStatus> {
-    let mut left = line.split('·').next()?.trim();
-    if left.is_empty() || !left.contains("gpt-") {
-        return None;
-    }
-    if let Some(idx) = left.rfind('›') {
-        left = left[idx + '›'.len_utf8()..].trim();
-    }
-    let tokens = left.split_whitespace().collect::<Vec<_>>();
-    let model_idx = tokens.iter().position(|token| token.starts_with("gpt-"))?;
-    let model = tokens.get(model_idx)?.to_string();
-    let mut status = CodexRuntimeStatus {
-        model: Some(model),
-        ..CodexRuntimeStatus::default()
-    };
-    for token in tokens.iter().skip(model_idx + 1) {
-        let normalized = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
-        match normalized {
-            "fast" => {
-                status.fast = Some(true);
-                status.service_tier = Some("priority".to_string());
-            }
-            "default" => {
-                status.fast = Some(false);
-                status.service_tier = Some("default".to_string());
-            }
-            "low" | "medium" | "high" | "xhigh" => {
-                status.reasoning_effort = Some(normalized.to_string());
-            }
-            _ => {}
-        }
-    }
-    Some(status)
 }
 
 fn normalize_service_tier(service_tier: String) -> String {
