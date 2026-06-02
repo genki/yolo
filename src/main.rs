@@ -179,7 +179,6 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
     remove_socket_if_present(&paths.api_socket)?;
-    remove_socket_if_present(&paths.app_server_socket)?;
     fs::write(&paths.pid_file, std::process::id().to_string())
         .map_err(|err| format!("write pid file: {err}"))?;
 
@@ -189,7 +188,8 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         resume_generation: 0,
         clients: BTreeMap::new(),
     }));
-    let app_server_pid = spawn_tracked_app_server(Arc::clone(&state), paths.clone())?;
+    let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
+    scan_existing_yolo_clients(&state);
     spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
 
     let listener = UnixListener::bind(&paths.api_socket)
@@ -294,6 +294,27 @@ fn spawn_tracked_app_server(
     });
 
     Ok(pid)
+}
+
+fn ensure_tracked_app_server(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) -> Result<Option<u32>, String> {
+    if paths.app_server_socket.exists()
+        && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
+    {
+        let pid = find_app_server_pid(&paths);
+        if let Ok(mut state) = state.lock() {
+            state.app_server_pid = pid;
+        }
+        eprintln!(
+            "yolo server: adopted existing codex app-server at unix://{} pid {:?}",
+            paths.app_server_socket.display(),
+            pid
+        );
+        return Ok(pid);
+    }
+    spawn_tracked_app_server(state, paths).map(Some)
 }
 
 fn restart_tracked_app_server(
@@ -704,6 +725,14 @@ fn thread_id_from_args(args: &[OsString]) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn thread_id_from_args_strs(args: &[String]) -> Option<String> {
+    let resume_idx = args.iter().position(|arg| arg == "resume")?;
+    args.iter()
+        .skip(resume_idx + 1)
+        .find(|arg| !arg.starts_with('-'))
+        .cloned()
+}
+
 fn current_resume_generation() -> u64 {
     api_get_json("/status")
         .ok()
@@ -901,12 +930,153 @@ fn handle_api_connection(
 fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
     thread::spawn(move || {
         loop {
+            scan_existing_yolo_clients(&state);
             if let Ok(snapshot) = app_server_thread_snapshot(&paths) {
                 apply_thread_snapshot(&state, &snapshot);
             }
             thread::sleep(THREAD_MONITOR_INTERVAL);
         }
     });
+}
+
+fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
+    let Ok(processes) = read_process_table() else {
+        return;
+    };
+    let now = now_secs();
+    let current_pid = std::process::id();
+    let mut child_codex_by_parent: BTreeMap<u32, u32> = BTreeMap::new();
+    for process in &processes {
+        if process.cmdline.iter().any(|arg| arg.contains("codex"))
+            && process
+                .cmdline
+                .iter()
+                .any(|arg| arg.contains("--remote") || arg.contains("codex-app-server.sock"))
+        {
+            child_codex_by_parent.insert(process.ppid, process.pid);
+        }
+    }
+
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    for process in processes {
+        if process.pid == current_pid || !is_yolo_process(&process) {
+            continue;
+        }
+        let args = process.cmdline.iter().skip(1).cloned().collect::<Vec<_>>();
+        if args.first().map(String::as_str) == Some("server") {
+            continue;
+        }
+        let id = format!("{}-scanned", process.pid);
+        if state
+            .clients
+            .values()
+            .any(|client| client.yolo_pid == process.pid && client.status == "running")
+        {
+            continue;
+        }
+        let cfg = read_codex_config();
+        let service_tier = cfg.service_tier.clone();
+        state.clients.insert(
+            id.clone(),
+            ClientInfo {
+                id,
+                yolo_pid: process.pid,
+                codex_pid: child_codex_by_parent.get(&process.pid).copied(),
+                cwd: process.cwd.unwrap_or_else(|| String::from("")),
+                args: args.clone(),
+                remote: String::new(),
+                model: cfg.model,
+                service_tier: service_tier.clone(),
+                reasoning_effort: None,
+                fast: is_fast_tier(service_tier.as_deref()),
+                thread_id: thread_id_from_args_strs(&args),
+                started_at: now,
+                updated_at: now,
+                ended_at: None,
+                exit_code: None,
+                status: "running".to_string(),
+                codex_status: None,
+                codex_active_flags: Vec::new(),
+                codex_status_updated_at: None,
+            },
+        );
+    }
+}
+
+#[derive(Debug)]
+struct ProcInfo {
+    pid: u32,
+    ppid: u32,
+    comm: String,
+    cmdline: Vec<String>,
+    cwd: Option<String>,
+}
+
+fn read_process_table() -> Result<Vec<ProcInfo>, String> {
+    let mut out = Vec::new();
+    let entries = fs::read_dir("/proc").map_err(|err| format!("read /proc: {err}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let dir = entry.path();
+        let cmdline = read_proc_cmdline(dir.join("cmdline"));
+        let comm = fs::read_to_string(dir.join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let ppid = read_proc_ppid(dir.join("stat")).unwrap_or(0);
+        let cwd = fs::read_link(dir.join("cwd"))
+            .ok()
+            .map(|path| path.display().to_string());
+        out.push(ProcInfo {
+            pid,
+            ppid,
+            comm,
+            cmdline,
+            cwd,
+        });
+    }
+    Ok(out)
+}
+
+fn read_proc_cmdline(path: PathBuf) -> Vec<String> {
+    fs::read(path)
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).to_string())
+        .collect()
+}
+
+fn read_proc_ppid(path: PathBuf) -> Option<u32> {
+    let stat = fs::read_to_string(path).ok()?;
+    let right = stat.rsplit_once(')')?.1.trim();
+    right.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn is_yolo_process(process: &ProcInfo) -> bool {
+    if process.comm == "yolo" {
+        return true;
+    }
+    process
+        .cmdline
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .and_then(|name| name.to_str())
+        == Some("yolo")
+}
+
+fn find_app_server_pid(paths: &RuntimePaths) -> Option<u32> {
+    let needle = paths.app_server_socket.display().to_string();
+    read_process_table().ok()?.into_iter().find_map(|process| {
+        let is_app_server = process.cmdline.iter().any(|arg| arg == "app-server")
+            && process.cmdline.iter().any(|arg| arg.contains(&needle));
+        is_app_server.then_some(process.pid)
+    })
 }
 
 fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadSnapshot]) {
