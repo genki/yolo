@@ -44,6 +44,8 @@ struct ClientInfo {
     remote: String,
     model: Option<String>,
     service_tier: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     fast: bool,
     thread_id: Option<String>,
     started_at: u64,
@@ -308,6 +310,14 @@ fn run_client(args: Vec<OsString>) {
         .collect::<Vec<_>>();
 
     let initial_config = read_codex_config();
+    let initial_runtime = read_codex_runtime_status();
+    let initial_service_tier = initial_runtime
+        .service_tier
+        .clone()
+        .or(initial_config.service_tier.clone());
+    let initial_fast = initial_runtime
+        .fast
+        .unwrap_or_else(|| is_fast_tier(initial_service_tier.as_deref()));
     let mut info = ClientInfo {
         id: client_id.clone(),
         yolo_pid: std::process::id(),
@@ -315,9 +325,10 @@ fn run_client(args: Vec<OsString>) {
         cwd,
         args: string_args,
         remote: remote.clone(),
-        model: initial_config.model,
-        service_tier: initial_config.service_tier.clone(),
-        fast: is_fast_tier(initial_config.service_tier.as_deref()),
+        model: initial_runtime.model.or(initial_config.model),
+        service_tier: initial_service_tier,
+        reasoning_effort: initial_runtime.reasoning_effort,
+        fast: initial_fast,
         thread_id: thread_id_from_args(&original_args),
         started_at: now_secs(),
         updated_at: now_secs(),
@@ -338,11 +349,17 @@ fn run_client(args: Vec<OsString>) {
         loop {
             thread::sleep(Duration::from_secs(2));
             let cfg = read_codex_config();
+            let runtime = read_codex_runtime_status();
+            let service_tier = runtime.service_tier.or(cfg.service_tier);
+            let fast = runtime
+                .fast
+                .unwrap_or_else(|| is_fast_tier(service_tier.as_deref()));
             let body = json!({
                 "id": heartbeat_id,
-                "model": cfg.model,
-                "service_tier": cfg.service_tier,
-                "fast": is_fast_tier(cfg.service_tier.as_deref()),
+                "model": runtime.model.or(cfg.model),
+                "service_tier": service_tier,
+                "reasoning_effort": runtime.reasoning_effort,
+                "fast": fast,
                 "status": "running",
                 "updated_at": now_secs(),
             });
@@ -705,6 +722,10 @@ fn handle_api_connection(
                                 .map(ToString::to_string);
                             client.service_tier = value
                                 .get("service_tier")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            client.reasoning_effort = value
+                                .get("reasoning_effort")
                                 .and_then(Value::as_str)
                                 .map(ToString::to_string);
                             client.fast = value
@@ -1236,6 +1257,14 @@ struct CodexConfig {
     service_tier: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct CodexRuntimeStatus {
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+    fast: Option<bool>,
+}
+
 fn read_codex_config() -> CodexConfig {
     let path = codex_config_path();
     let contents = fs::read_to_string(path).unwrap_or_default();
@@ -1263,6 +1292,84 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn read_codex_runtime_status() -> CodexRuntimeStatus {
+    let Some(tmux_pane) = env::var_os("TMUX_PANE") else {
+        return CodexRuntimeStatus::default();
+    };
+    let Some(tmux_socket) = tmux_socket_from_env() else {
+        return CodexRuntimeStatus::default();
+    };
+    let output = Command::new("tmux")
+        .arg("-S")
+        .arg(tmux_socket)
+        .arg("capture-pane")
+        .arg("-p")
+        .arg("-J")
+        .arg("-t")
+        .arg(tmux_pane)
+        .arg("-S")
+        .arg("-8")
+        .output();
+    let Ok(output) = output else {
+        return CodexRuntimeStatus::default();
+    };
+    if !output.status.success() {
+        return CodexRuntimeStatus::default();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .rev()
+        .filter_map(parse_codex_statusline)
+        .next()
+        .unwrap_or_default()
+}
+
+fn tmux_socket_from_env() -> Option<OsString> {
+    let tmux = env::var_os("TMUX")?;
+    let tmux = tmux.to_string_lossy();
+    let socket = tmux.split(',').next()?.trim();
+    if socket.is_empty() {
+        None
+    } else {
+        Some(OsString::from(socket))
+    }
+}
+
+fn parse_codex_statusline(line: &str) -> Option<CodexRuntimeStatus> {
+    let mut left = line.split('·').next()?.trim();
+    if left.is_empty() || !left.contains("gpt-") {
+        return None;
+    }
+    if let Some(idx) = left.rfind('›') {
+        left = left[idx + '›'.len_utf8()..].trim();
+    }
+    let tokens = left.split_whitespace().collect::<Vec<_>>();
+    let model_idx = tokens.iter().position(|token| token.starts_with("gpt-"))?;
+    let model = tokens.get(model_idx)?.to_string();
+    let mut status = CodexRuntimeStatus {
+        model: Some(model),
+        ..CodexRuntimeStatus::default()
+    };
+    for token in tokens.iter().skip(model_idx + 1) {
+        let normalized = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
+        match normalized {
+            "fast" => {
+                status.fast = Some(true);
+                status.service_tier = Some("priority".to_string());
+            }
+            "default" => {
+                status.fast = Some(false);
+                status.service_tier = Some("default".to_string());
+            }
+            "low" | "medium" | "high" | "xhigh" => {
+                status.reasoning_effort = Some(normalized.to_string());
+            }
+            _ => {}
+        }
+    }
+    Some(status)
 }
 
 fn normalize_service_tier(service_tier: String) -> String {
