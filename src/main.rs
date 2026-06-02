@@ -91,6 +91,13 @@ struct AppThreadSnapshot {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct CodexLaunchConfig {
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ConfigureClientsRequest {
     #[serde(default)]
@@ -977,7 +984,11 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
             continue;
         }
         let cfg = read_codex_config();
-        let service_tier = cfg.service_tier.clone();
+        let launch_cfg = parse_codex_launch_config(&args);
+        let service_tier = launch_cfg
+            .service_tier
+            .clone()
+            .or_else(|| cfg.service_tier.clone());
         state.clients.insert(
             id.clone(),
             ClientInfo {
@@ -987,9 +998,9 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 cwd: process.cwd.unwrap_or_else(|| String::from("")),
                 args: args.clone(),
                 remote: String::new(),
-                model: cfg.model,
+                model: launch_cfg.model.or(cfg.model),
                 service_tier: service_tier.clone(),
-                reasoning_effort: None,
+                reasoning_effort: launch_cfg.reasoning_effort,
                 fast: is_fast_tier(service_tier.as_deref()),
                 thread_id: thread_id_from_args_strs(&args),
                 started_at: now,
@@ -1109,15 +1120,22 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         client.codex_status = Some(thread.status.clone());
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
-        if let Some(model) = thread.model.as_ref() {
-            client.model = Some(model.clone());
+        let launch_cfg = parse_codex_launch_config(&client.args);
+        if let Some(model) = launch_cfg.model.or_else(|| thread.model.clone()) {
+            client.model = Some(model);
         }
-        if let Some(service_tier) = thread.service_tier.as_ref() {
-            client.service_tier = Some(service_tier.clone());
+        if let Some(service_tier) = launch_cfg
+            .service_tier
+            .or_else(|| thread.service_tier.clone())
+        {
+            client.service_tier = Some(service_tier);
             client.fast = is_fast_tier(client.service_tier.as_deref());
         }
-        if let Some(reasoning_effort) = thread.reasoning_effort.as_ref() {
-            client.reasoning_effort = Some(reasoning_effort.clone());
+        if let Some(reasoning_effort) = launch_cfg
+            .reasoning_effort
+            .or_else(|| thread.reasoning_effort.clone())
+        {
+            client.reasoning_effort = Some(reasoning_effort);
         }
     }
 }
@@ -1740,6 +1758,47 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn parse_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
+    let mut config = CodexLaunchConfig::default();
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let item = if arg == "-c" || arg == "--config" {
+            iter.next().map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            Some(value)
+        } else {
+            None
+        };
+        let Some(item) = item else {
+            continue;
+        };
+        let Some((key, raw_value)) = item.split_once('=') else {
+            continue;
+        };
+        let value = unquote_config_value(raw_value.trim());
+        match key.trim() {
+            "model" => config.model = Some(value),
+            "service_tier" => config.service_tier = Some(normalize_service_tier(value)),
+            "model_reasoning_effort" => config.reasoning_effort = Some(value),
+            _ => {}
+        }
+    }
+    config
+}
+
+fn unquote_config_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
+        {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn normalize_service_tier(service_tier: String) -> String {
