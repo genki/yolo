@@ -597,18 +597,18 @@ fn terminate_child(child: &mut Child) {
 }
 
 fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
-    if matches!(args.first().and_then(|arg| arg.to_str()), Some("resume")) {
+    if thread_id_from_args(args).is_some() {
         return args.to_vec();
     }
     vec![OsString::from("resume"), OsString::from("--last")]
 }
 
 fn thread_id_from_args(args: &[OsString]) -> Option<String> {
-    if !matches!(args.first().and_then(|arg| arg.to_str()), Some("resume")) {
-        return None;
-    }
+    let resume_idx = args
+        .iter()
+        .position(|arg| matches!(arg.to_str(), Some("resume")))?;
     args.iter()
-        .skip(1)
+        .skip(resume_idx + 1)
         .filter_map(|arg| arg.to_str())
         .find(|arg| !arg.starts_with('-'))
         .map(ToString::to_string)
