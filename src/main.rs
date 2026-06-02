@@ -59,6 +59,8 @@ struct ClientInfo {
     codex_active_flags: Vec<String>,
     #[serde(default)]
     codex_status_updated_at: Option<u64>,
+    #[serde(default)]
+    settings_updated_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -390,6 +392,7 @@ fn run_client(args: Vec<OsString>) {
         codex_status: None,
         codex_active_flags: Vec::new(),
         codex_status_updated_at: None,
+        settings_updated_at: None,
     };
 
     let heartbeat_id = client_id.clone();
@@ -972,7 +975,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
             continue;
         }
         let args = process.cmdline.iter().skip(1).cloned().collect::<Vec<_>>();
-        if args.first().map(String::as_str) == Some("server") {
+        if !is_yolo_client_args(&args) {
             continue;
         }
         let id = format!("{}-scanned", process.pid);
@@ -1011,6 +1014,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 codex_status: None,
                 codex_active_flags: Vec::new(),
                 codex_status_updated_at: None,
+                settings_updated_at: None,
             },
         );
     }
@@ -1081,6 +1085,18 @@ fn is_yolo_process(process: &ProcInfo) -> bool {
         == Some("yolo")
 }
 
+fn is_yolo_client_args(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        None => true,
+        Some("client") | Some("resume") => true,
+        Some("server" | "status" | "clients" | "stop" | "set" | "configure") => false,
+        Some("upgrade-resume" | "resume-upgrade" | "upgrade-and-resume") => false,
+        Some("upgrade-resume-all" | "resume-all-upgrade") => false,
+        Some(arg) if arg.starts_with('-') => true,
+        Some(_) => true,
+    }
+}
+
 fn find_app_server_pid(paths: &RuntimePaths) -> Option<u32> {
     let needle = paths.app_server_socket.display().to_string();
     read_process_table().ok()?.into_iter().find_map(|process| {
@@ -1120,7 +1136,11 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         client.codex_status = Some(thread.status.clone());
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
-        let launch_cfg = parse_codex_launch_config(&client.args);
+        let launch_cfg = if client.settings_updated_at.is_some() {
+            CodexLaunchConfig::default()
+        } else {
+            parse_codex_launch_config(&client.args)
+        };
         if let Some(model) = launch_cfg.model.or_else(|| thread.model.clone()) {
             client.model = Some(model);
         }
@@ -1251,6 +1271,13 @@ fn configure_clients_when_idle(
             params.insert("effort".to_string(), Value::String(effort.clone()));
         }
         rpc.request("thread/settings/update", Value::Object(params))?;
+        note_client_settings_update(
+            &state,
+            &client_id,
+            request.model.clone(),
+            request.fast,
+            request.reasoning_effort.clone(),
+        );
         updated.push(json!({
             "client_id": client_id,
             "thread_id": thread_id,
@@ -1266,6 +1293,34 @@ fn configure_clients_when_idle(
         "fast": request.fast,
         "reasoning_effort": request.reasoning_effort,
     }))
+}
+
+fn note_client_settings_update(
+    state: &Arc<Mutex<ServerState>>,
+    client_id: &str,
+    model: Option<String>,
+    fast: Option<bool>,
+    reasoning_effort: Option<String>,
+) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let Some(client) = state.clients.get_mut(client_id) else {
+        return;
+    };
+    if let Some(model) = model {
+        client.model = Some(model);
+    }
+    if let Some(fast) = fast {
+        client.fast = fast;
+        client.service_tier = Some(if fast { "priority" } else { "default" }.to_string());
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        client.reasoning_effort = Some(reasoning_effort);
+    }
+    client.settings_updated_at = Some(now);
+    client.updated_at = now;
 }
 
 fn select_configure_clients(
@@ -1502,6 +1557,9 @@ impl AppServerRpcClient {
                     "name": "yolo",
                     "title": "yolo",
                     "version": VERSION
+                },
+                "capabilities": {
+                    "experimentalApi": true
                 }
             }),
         )?;
