@@ -183,6 +183,18 @@ struct ConfigureClientsRequest {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct UpgradeResumeAllRequest {
+    #[serde(default)]
+    codex_version: Option<String>,
+    #[serde(default)]
+    ignore_client_id: Option<String>,
+    #[serde(default)]
+    ignore_thread_id: Option<String>,
+    #[serde(default)]
+    ignore_cwd: Option<String>,
+}
+
 fn main() {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
 
@@ -584,7 +596,18 @@ fn run_upgrade_resume(mut args: Vec<OsString>) {
 
 fn run_upgrade_resume_all() -> Result<(), String> {
     ensure_server()?;
-    let value = api_post_json("/upgrade-resume-all", &json!({}))?;
+    let mut request = serde_json::Map::new();
+    if let Ok(thread_id) = env::var("CODEX_THREAD_ID")
+        && !thread_id.trim().is_empty()
+    {
+        request.insert("ignore_thread_id".to_string(), Value::String(thread_id));
+    } else if let Ok(cwd) = env::current_dir() {
+        request.insert(
+            "ignore_cwd".to_string(),
+            Value::String(cwd.to_string_lossy().to_string()),
+        );
+    }
+    let value = api_post_json("/upgrade-resume-all", &Value::Object(request))?;
     println!(
         "{}",
         serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
@@ -973,9 +996,10 @@ fn handle_federation_request(
             json_response(200, &json!({"ok": true, "command": record}))
         }
         ("POST", "/federation/local/upgrade-resume-all") => {
-            let request = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
-            let version = request.get("codex_version").and_then(Value::as_str);
-            match run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version) {
+            let request = serde_json::from_str::<UpgradeResumeAllRequest>(body).unwrap_or_default();
+            let version = request.codex_version.as_deref();
+            match run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version, &request)
+            {
                 Ok(value) => json_response(200, &value),
                 Err(err) => json_response(500, &json!({"ok": false, "error": err})),
             }
@@ -1150,8 +1174,16 @@ fn execute_slave_command(
 ) -> Value {
     match command.action.as_str() {
         "codex-upgrade-resume" | "upgrade-codex" | "upgrade-resume-all" => {
-            match run_codex_upgrade_resume_all_local(state, paths, command.codex_version.as_deref())
-            {
+            let request = UpgradeResumeAllRequest {
+                codex_version: command.codex_version.clone(),
+                ..UpgradeResumeAllRequest::default()
+            };
+            match run_codex_upgrade_resume_all_local(
+                state,
+                paths,
+                command.codex_version.as_deref(),
+                &request,
+            ) {
                 Ok(value) => value,
                 Err(err) => json!({"ok": false, "error": err}),
             }
@@ -1185,8 +1217,9 @@ fn run_codex_upgrade_resume_all_local(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
     codex_version: Option<&str>,
+    request: &UpgradeResumeAllRequest,
 ) -> Result<Value, String> {
-    wait_for_clients_idle(Arc::clone(&state), paths)
+    wait_for_clients_idle(Arc::clone(&state), paths, request)
         .and_then(|_| upgrade_codex_cli_version(codex_version))
         .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
         .and_then(|app_server_pid| {
@@ -1361,9 +1394,10 @@ fn handle_api_connection(
             }
         }
         ("POST", "/upgrade-resume-all") => {
-            let request = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
-            let version = request.get("codex_version").and_then(Value::as_str);
-            let result = run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version);
+            let request = serde_json::from_str::<UpgradeResumeAllRequest>(body).unwrap_or_default();
+            let version = request.codex_version.as_deref();
+            let result =
+                run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version, &request);
             match result {
                 Ok(value) => json_response(200, &value),
                 Err(err) => json_response(500, &json!({"ok": false, "error": err})),
@@ -1610,13 +1644,14 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
 fn wait_for_clients_idle(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
+    request: &UpgradeResumeAllRequest,
 ) -> Result<(), String> {
     let timeout = upgrade_idle_wait_timeout();
     let start = SystemTime::now();
     loop {
         let snapshot = app_server_thread_snapshot(paths)?;
         apply_thread_snapshot(&state, &snapshot);
-        let working_clients = working_clients_for_snapshot(&state, &snapshot);
+        let working_clients = working_clients_for_snapshot(&state, &snapshot, request);
         if working_clients.is_empty() {
             return Ok(());
         }
@@ -1637,6 +1672,7 @@ fn wait_for_clients_idle(
 fn working_clients_for_snapshot(
     state: &Arc<Mutex<ServerState>>,
     snapshot: &[AppThreadSnapshot],
+    request: &UpgradeResumeAllRequest,
 ) -> Vec<String> {
     let Ok(state) = state.lock() else {
         return Vec::new();
@@ -1645,6 +1681,7 @@ fn working_clients_for_snapshot(
         .clients
         .values()
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| !should_ignore_upgrade_wait_client(client, request))
         .filter_map(|client| {
             let is_active = match client.thread_id.as_deref() {
                 Some(thread_id) => snapshot
@@ -1661,6 +1698,21 @@ fn working_clients_for_snapshot(
             }
         })
         .collect()
+}
+
+fn should_ignore_upgrade_wait_client(
+    client: &ClientInfo,
+    request: &UpgradeResumeAllRequest,
+) -> bool {
+    if request.ignore_client_id.as_deref() == Some(client.id.as_str()) {
+        return true;
+    }
+    if let Some(thread_id) = request.ignore_thread_id.as_deref()
+        && client.thread_id.as_deref() == Some(thread_id)
+    {
+        return true;
+    }
+    request.ignore_cwd.as_deref() == Some(client.cwd.as_str())
 }
 
 fn configure_clients_when_idle(
@@ -2558,6 +2610,10 @@ upgrade-resume-all asks the running yolo server to install the latest Codex
 CLI, wait for active app-server threads to become idle, restart its app-server
 child, and request every live yolo client wrapper to restart its Codex child as
 `codex resume` on the same terminal.
+
+When run from inside Codex, upgrade-resume-all uses Phoenix mode: it excludes
+the caller's CODEX_THREAD_ID from the idle wait, then lets the final resume
+generation revive that same session.
 
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients

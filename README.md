@@ -29,6 +29,7 @@ cargo install --path .
 yolo --cd /home/vagrant/websh
 yolo resume --last
 yolo upgrade-resume --last
+yolo upgrade-resume-all
 yolo server --daemon
 yolo server --daemon --federation-listen 127.0.0.1:47040
 yolo status
@@ -39,6 +40,12 @@ yolo stop
 yolo-managed user-writable npm prefix, restarts the yolo-managed app-server so
 it uses the upgraded Codex binary, then launches `codex resume` through yolo.
 With no arguments it resumes `--last`.
+
+`yolo upgrade-resume-all` waits for active app-server threads to become idle,
+updates the yolo-managed Codex CLI, restarts the app-server, then asks live
+yolo clients to resume. When run from inside Codex it uses Phoenix mode: the
+caller thread is excluded from the idle wait and revived by the final resume
+generation.
 
 ## API
 
