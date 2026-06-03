@@ -886,9 +886,6 @@ fn spawn_federation_listener(
     paths: RuntimePaths,
     addr: String,
 ) -> Result<(), String> {
-    if federation_admin_token().is_none() {
-        return Err("YOLO_FEDERATION_ADMIN_TOKEN is required for federation listener".to_string());
-    }
     let listener = TcpListener::bind(&addr).map_err(|err| format!("bind {addr}: {err}"))?;
     eprintln!("yolo federation API listening on http://{addr}");
     thread::spawn(move || {
@@ -923,16 +920,13 @@ fn handle_federation_connection(
 fn handle_federation_request(
     method: &str,
     path: &str,
-    headers: &BTreeMap<String, String>,
+    _headers: &BTreeMap<String, String>,
     body: &str,
     state: Arc<Mutex<ServerState>>,
     paths: RuntimePaths,
 ) -> String {
     match (method, path) {
         ("GET", "/federation/slaves") => {
-            if !is_admin_request(headers) {
-                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
-            }
             let slaves = state
                 .lock()
                 .map(|state| state.slaves.values().cloned().collect::<Vec<_>>())
@@ -946,9 +940,6 @@ fn handle_federation_request(
                     return json_response(400, &json!({"ok": false, "error": err.to_string()}));
                 }
             };
-            if !is_slave_request(headers, &request.slave_id) {
-                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
-            }
             let command = poll_slave_command(&state, request);
             json_response(200, &json!({"ok": true, "command": command}))
         }
@@ -959,18 +950,12 @@ fn handle_federation_request(
                     return json_response(400, &json!({"ok": false, "error": err.to_string()}));
                 }
             };
-            if !is_slave_request(headers, &request.slave_id) {
-                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
-            }
             record_slave_result(&state, request);
             json_response(200, &json!({"ok": true}))
         }
         ("POST", path)
             if path.starts_with("/federation/slaves/") && path.ends_with("/commands") =>
         {
-            if !is_admin_request(headers) {
-                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
-            }
             let slave_id = path
                 .trim_start_matches("/federation/slaves/")
                 .trim_end_matches("/commands")
@@ -988,9 +973,6 @@ fn handle_federation_request(
             json_response(200, &json!({"ok": true, "command": record}))
         }
         ("POST", "/federation/local/upgrade-resume-all") => {
-            if !is_admin_request(headers) {
-                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
-            }
             let request = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
             let version = request.get("codex_version").and_then(Value::as_str);
             match run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version) {
@@ -1096,10 +1078,10 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
         eprintln!("yolo slave connector disabled: YOLO_SLAVE_ID is missing");
         return;
     };
-    let Ok(token) = env::var("YOLO_SLAVE_TOKEN") else {
-        eprintln!("yolo slave connector disabled: YOLO_SLAVE_TOKEN is missing");
-        return;
-    };
+    let bearer_token = env::var("YOLO_MASTER_BEARER_TOKEN")
+        .ok()
+        .or_else(|| env::var("YOLO_AGENT_GATE_TOKEN").ok())
+        .or_else(|| env::var("YOLO_SLAVE_TOKEN").ok());
     thread::spawn(move || {
         let mut pending_result: Option<SlaveResultRequest> = None;
         loop {
@@ -1107,7 +1089,7 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
                 let _ = federation_post_json(
                     &master_url,
                     "/federation/slaves/result",
-                    &token,
+                    bearer_token.as_deref(),
                     &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
                 );
             }
@@ -1121,7 +1103,7 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
             match federation_post_json(
                 &master_url,
                 "/federation/slaves/poll",
-                &token,
+                bearer_token.as_deref(),
                 &serde_json::to_value(&poll).unwrap_or_else(|_| json!({})),
             ) {
                 Ok(value) => {
@@ -1134,7 +1116,7 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
                                     Arc::clone(&state),
                                     &paths,
                                     &master_url,
-                                    &token,
+                                    bearer_token.as_deref(),
                                     &slave_id,
                                     &command,
                                 );
@@ -1162,7 +1144,7 @@ fn execute_slave_command(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
     master_url: &str,
-    token: &str,
+    bearer_token: Option<&str>,
     slave_id: &str,
     command: &SlaveCommand,
 ) -> Value {
@@ -1185,7 +1167,7 @@ fn execute_slave_command(
                 let _ = federation_post_json(
                     master_url,
                     "/federation/slaves/result",
-                    token,
+                    bearer_token,
                     &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
                 );
                 schedule_yolo_server_restart();
@@ -2236,7 +2218,7 @@ fn api_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, 
 fn federation_post_json(
     base_url: &str,
     path: &str,
-    token: &str,
+    bearer_token: Option<&str>,
     body: &Value,
 ) -> Result<Value, String> {
     let url = format!(
@@ -2249,14 +2231,19 @@ fn federation_post_json(
         }
     );
     let body_text = serde_json::to_string(body).map_err(|err| err.to_string())?;
-    let output = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .arg("-fsS")
         .arg("-X")
         .arg("POST")
         .arg("-H")
-        .arg("Content-Type: application/json")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {token}"))
+        .arg("Content-Type: application/json");
+    if let Some(token) = bearer_token.filter(|token| !token.trim().is_empty()) {
+        command
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {}", token.trim()));
+    }
+    let output = command
         .arg("--data-binary")
         .arg(body_text)
         .arg(url)
@@ -2334,48 +2321,6 @@ fn read_http_request<R: Read>(
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn is_admin_request(headers: &BTreeMap<String, String>) -> bool {
-    let Some(token) = federation_admin_token() else {
-        return false;
-    };
-    bearer_token(headers).as_deref() == Some(token.as_str())
-}
-
-fn is_slave_request(headers: &BTreeMap<String, String>, slave_id: &str) -> bool {
-    let Some(token) = bearer_token(headers) else {
-        return false;
-    };
-    federation_slave_tokens().get(slave_id) == Some(&token)
-}
-
-fn bearer_token(headers: &BTreeMap<String, String>) -> Option<String> {
-    headers
-        .get("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(ToString::to_string)
-}
-
-fn federation_admin_token() -> Option<String> {
-    env::var("YOLO_FEDERATION_ADMIN_TOKEN")
-        .ok()
-        .or_else(|| env::var("YOLO_MASTER_TOKEN").ok())
-}
-
-fn federation_slave_tokens() -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    if let Ok(value) = env::var("YOLO_FEDERATION_SLAVE_TOKENS") {
-        for item in value.split(',') {
-            if let Some((id, token)) = item.split_once(':')
-                && !id.trim().is_empty()
-                && !token.trim().is_empty()
-            {
-                out.insert(id.trim().to_string(), token.trim().to_string());
-            }
-        }
-    }
-    out
 }
 
 fn json_response<T: Serialize>(status: u16, body: &T) -> String {
@@ -2619,10 +2564,13 @@ API:
   curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-all
 
 Federation:
-  YOLO_FEDERATION_ADMIN_TOKEN=... YOLO_FEDERATION_SLAVE_TOKENS=slave:token \
-    yolo server --daemon --federation-listen 127.0.0.1:47040
+  yolo server --daemon --federation-listen 127.0.0.1:47040
   YOLO_MASTER_URL=https://agent-gate/.../@localhost:47040 \
-    YOLO_SLAVE_ID=slave YOLO_SLAVE_TOKEN=token yolo server --daemon
+    YOLO_SLAVE_ID=slave YOLO_MASTER_BEARER_TOKEN=agt_... yolo server --daemon
+
+Federation authentication and HTTPS are delegated to agent-gate fine grained
+tokens. yolo only serves localhost HTTP and sends the optional Bearer token to
+the configured master URL.
 
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
@@ -2633,14 +2581,12 @@ Environment:
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
   YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS
                     Max seconds to wait for working clients before upgrade
-  YOLO_FEDERATION_ADMIN_TOKEN
-                    Bearer token for master admin API
-  YOLO_FEDERATION_SLAVE_TOKENS
-                    Comma-separated slave-id:token map
   YOLO_FEDERATION_LISTEN
                     Default master federation listen address
-  YOLO_MASTER_URL, YOLO_SLAVE_ID, YOLO_SLAVE_TOKEN
+  YOLO_MASTER_URL, YOLO_SLAVE_ID
                     Slave connector settings
+  YOLO_MASTER_BEARER_TOKEN
+                    Optional Bearer token sent to master URL
   YOLO_SELF_UPGRADE_COMMAND
                     Override remote yolo-upgrade command
 "

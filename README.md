@@ -59,13 +59,12 @@ The `/clients` response includes:
 
 `yolo server` can expose a master API for other yolo servers. Bind the API to a
 local TCP port and publish that port through agent-gate with a fine grained
-token.
+token. yolo does not implement its own federation authentication; HTTPS and
+authorization are the responsibility of agent-gate.
 
 Master:
 
 ```sh
-YOLO_FEDERATION_ADMIN_TOKEN=<admin-token> \
-YOLO_FEDERATION_SLAVE_TOKENS=kagura:<slave-token>,codex:<slave-token> \
 yolo server --daemon --federation-listen 127.0.0.1:47040
 ```
 
@@ -74,7 +73,7 @@ Slave:
 ```sh
 YOLO_MASTER_URL=https://agent-gate.example/<token>/@localhost:47040 \
 YOLO_SLAVE_ID=kagura \
-YOLO_SLAVE_TOKEN=<slave-token> \
+YOLO_MASTER_BEARER_TOKEN=<agent-gate-fine-grained-token> \
 yolo server --daemon
 ```
 
@@ -85,15 +84,15 @@ started.
 Master API:
 
 ```sh
-curl -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+curl -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   http://127.0.0.1:47040/federation/slaves
 
-curl -X POST -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"action":"codex-upgrade-resume","codex_version":"0.136.0"}' \
   http://127.0.0.1:47040/federation/slaves/kagura/commands
 
-curl -X POST -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"action":"yolo-upgrade","yolo_version":"0.5.0"}' \
   http://127.0.0.1:47040/federation/slaves/kagura/commands
@@ -118,9 +117,9 @@ installer.
 - `YOLO_REMOTE`: override app-server endpoint for the client.
 - `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
   `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
-- `YOLO_FEDERATION_ADMIN_TOKEN`: bearer token for master admin API.
-- `YOLO_FEDERATION_SLAVE_TOKENS`: comma-separated `slave-id:token` map.
 - `YOLO_FEDERATION_LISTEN`: default master listen address.
-- `YOLO_MASTER_URL`, `YOLO_SLAVE_ID`, `YOLO_SLAVE_TOKEN`: slave connector
-  settings.
+- `YOLO_MASTER_URL`, `YOLO_SLAVE_ID`: slave connector settings.
+- `YOLO_MASTER_BEARER_TOKEN`: optional Bearer token sent to the master URL.
+  Use the agent-gate fine grained token when the master is exposed through
+  agent-gate.
 - `YOLO_SELF_UPGRADE_COMMAND`: override command used by remote `yolo-upgrade`.
