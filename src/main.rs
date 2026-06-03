@@ -1227,7 +1227,6 @@ fn execute_slave_command(
                     bearer_token,
                     &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
                 );
-                schedule_yolo_server_restart();
                 value
             }
             Err(err) => json!({"ok": false, "error": err}),
@@ -1292,25 +1291,11 @@ fn upgrade_yolo(command: &SlaveCommand) -> Result<Value, String> {
     }
     Ok(json!({
         "ok": true,
-        "restart_scheduled": true,
+        "restart_scheduled": false,
+        "restart_required": true,
+        "restart_policy": "deferred_to_avoid_resetting_active_codex_clients",
         "yolo_version": command.yolo_version,
     }))
-}
-
-fn schedule_yolo_server_restart() {
-    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("yolo"));
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(3));
-        let _ = Command::new(exe)
-            .arg("server")
-            .arg("--daemon")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        thread::sleep(Duration::from_secs(1));
-        std::process::exit(0);
-    });
 }
 
 fn handle_api_connection(
