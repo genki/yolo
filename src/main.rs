@@ -5,6 +5,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -24,6 +25,7 @@ const MANAGED_CODEX_DIR_NAME: &str = "codex-npm";
 const THREAD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -72,6 +74,8 @@ struct ServerInfo {
     api_socket: String,
     app_server_socket: String,
     clients: Vec<ClientInfo>,
+    #[serde(default)]
+    slaves: Vec<SlaveInfo>,
 }
 
 #[derive(Debug)]
@@ -80,6 +84,65 @@ struct ServerState {
     app_server_pid: Option<u32>,
     resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
+    slaves: BTreeMap<String, SlaveInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlaveInfo {
+    id: String,
+    #[serde(default)]
+    host: Option<String>,
+    version: String,
+    pid: u32,
+    last_seen_at: u64,
+    status: String,
+    #[serde(default)]
+    commands: Vec<SlaveCommandRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlavePollRequest {
+    slave_id: String,
+    version: String,
+    pid: u32,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlaveResultRequest {
+    slave_id: String,
+    command_id: String,
+    ok: bool,
+    result: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlaveCommand {
+    #[serde(default)]
+    id: String,
+    action: String,
+    #[serde(default)]
+    codex_version: Option<String>,
+    #[serde(default)]
+    yolo_version: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SlaveCommandRecord {
+    command: SlaveCommand,
+    status: String,
+    created_at: u64,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    result: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,10 +259,15 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         app_server_pid: None,
         resume_generation: 0,
         clients: BTreeMap::new(),
+        slaves: BTreeMap::new(),
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
     scan_existing_yolo_clients(&state);
     spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
+    if let Some(addr) = federation_listen_addr(&args) {
+        spawn_federation_listener(Arc::clone(&state), paths.clone(), addr)?;
+    }
+    spawn_slave_connector_if_configured(Arc::clone(&state), paths.clone());
 
     let listener = UnixListener::bind(&paths.api_socket)
         .map_err(|err| format!("bind {}: {err}", paths.api_socket.display()))?;
@@ -601,6 +669,10 @@ fn parse_boolish(value: &str) -> Result<bool, String> {
 }
 
 fn upgrade_codex_cli() -> Result<(), String> {
+    upgrade_codex_cli_version(None)
+}
+
+fn upgrade_codex_cli_version(version: Option<&str>) -> Result<(), String> {
     if let Ok(command) = env::var("YOLO_CODEX_UPGRADE_COMMAND") {
         eprintln!("yolo: upgrading Codex CLI with override command: {command}");
         let status = Command::new("sh")
@@ -618,10 +690,14 @@ fn upgrade_codex_cli() -> Result<(), String> {
     }
 
     let prefix = managed_codex_prefix();
+    let package = version
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("@openai/codex@{}", value.trim()))
+        .unwrap_or_else(|| CODEX_PACKAGE.to_string());
     fs::create_dir_all(&prefix)
         .map_err(|err| format!("create managed Codex prefix {}: {err}", prefix.display()))?;
     eprintln!(
-        "yolo: upgrading Codex CLI into user-writable prefix {}",
+        "yolo: upgrading Codex CLI package {package} into user-writable prefix {}",
         prefix.display()
     );
     let status = Command::new("npm")
@@ -629,7 +705,7 @@ fn upgrade_codex_cli() -> Result<(), String> {
         .arg("--global")
         .arg("--prefix")
         .arg(&prefix)
-        .arg(CODEX_PACKAGE)
+        .arg(package)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -792,6 +868,411 @@ fn stop_server() -> Result<(), String> {
     Ok(())
 }
 
+fn federation_listen_addr(args: &[OsString]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--federation-listen" || arg == "--master-listen" {
+            return iter.next().map(|value| value.to_string_lossy().to_string());
+        }
+        if let Some(value) = arg.to_string_lossy().strip_prefix("--federation-listen=") {
+            return Some(value.to_string());
+        }
+    }
+    env::var("YOLO_FEDERATION_LISTEN").ok()
+}
+
+fn spawn_federation_listener(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    addr: String,
+) -> Result<(), String> {
+    if federation_admin_token().is_none() {
+        return Err("YOLO_FEDERATION_ADMIN_TOKEN is required for federation listener".to_string());
+    }
+    let listener = TcpListener::bind(&addr).map_err(|err| format!("bind {addr}: {err}"))?;
+    eprintln!("yolo federation API listening on http://{addr}");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let state = Arc::clone(&state);
+                    let paths = paths.clone();
+                    thread::spawn(move || handle_federation_connection(stream, state, paths));
+                }
+                Err(err) => eprintln!("yolo federation: accept failed: {err}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+fn handle_federation_connection(
+    mut stream: TcpStream,
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) {
+    let response = match read_http_request(&mut stream) {
+        Ok((method, path, headers, body)) => {
+            handle_federation_request(&method, &path, &headers, &body, state, paths)
+        }
+        Err(err) => json_response(400, &json!({"ok": false, "error": err})),
+    };
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn handle_federation_request(
+    method: &str,
+    path: &str,
+    headers: &BTreeMap<String, String>,
+    body: &str,
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) -> String {
+    match (method, path) {
+        ("GET", "/federation/slaves") => {
+            if !is_admin_request(headers) {
+                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
+            }
+            let slaves = state
+                .lock()
+                .map(|state| state.slaves.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            json_response(200, &json!({"ok": true, "slaves": slaves}))
+        }
+        ("POST", "/federation/slaves/poll") => {
+            let request = match serde_json::from_str::<SlavePollRequest>(body) {
+                Ok(request) => request,
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            if !is_slave_request(headers, &request.slave_id) {
+                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
+            }
+            let command = poll_slave_command(&state, request);
+            json_response(200, &json!({"ok": true, "command": command}))
+        }
+        ("POST", "/federation/slaves/result") => {
+            let request = match serde_json::from_str::<SlaveResultRequest>(body) {
+                Ok(request) => request,
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            if !is_slave_request(headers, &request.slave_id) {
+                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
+            }
+            record_slave_result(&state, request);
+            json_response(200, &json!({"ok": true}))
+        }
+        ("POST", path)
+            if path.starts_with("/federation/slaves/") && path.ends_with("/commands") =>
+        {
+            if !is_admin_request(headers) {
+                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
+            }
+            let slave_id = path
+                .trim_start_matches("/federation/slaves/")
+                .trim_end_matches("/commands")
+                .trim_matches('/');
+            let mut command = match serde_json::from_str::<SlaveCommand>(body) {
+                Ok(command) => command,
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            if command.id.trim().is_empty() {
+                command.id = format!("cmd-{}", now_millis());
+            }
+            let record = enqueue_slave_command(&state, slave_id, command);
+            json_response(200, &json!({"ok": true, "command": record}))
+        }
+        ("POST", "/federation/local/upgrade-resume-all") => {
+            if !is_admin_request(headers) {
+                return json_response(401, &json!({"ok": false, "error": "unauthorized"}));
+            }
+            let request = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+            let version = request.get("codex_version").and_then(Value::as_str);
+            match run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version) {
+                Ok(value) => json_response(200, &value),
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+            }
+        }
+        _ => json_response(404, &json!({"ok": false, "error": "not found"})),
+    }
+}
+
+fn poll_slave_command(
+    state: &Arc<Mutex<ServerState>>,
+    request: SlavePollRequest,
+) -> Option<SlaveCommand> {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return None;
+    };
+    let slave = state
+        .slaves
+        .entry(request.slave_id.clone())
+        .or_insert_with(|| SlaveInfo {
+            id: request.slave_id.clone(),
+            host: request.host.clone(),
+            version: request.version.clone(),
+            pid: request.pid,
+            last_seen_at: now,
+            status: "online".to_string(),
+            commands: Vec::new(),
+        });
+    slave.host = request.host;
+    slave.version = request.version;
+    slave.pid = request.pid;
+    slave.last_seen_at = now;
+    slave.status = request.status.unwrap_or_else(|| "online".to_string());
+    for record in &mut slave.commands {
+        if record.status == "pending" {
+            record.status = "running".to_string();
+            record.started_at = Some(now);
+            return Some(record.command.clone());
+        }
+    }
+    None
+}
+
+fn enqueue_slave_command(
+    state: &Arc<Mutex<ServerState>>,
+    slave_id: &str,
+    command: SlaveCommand,
+) -> SlaveCommandRecord {
+    let now = now_secs();
+    let record = SlaveCommandRecord {
+        command,
+        status: "pending".to_string(),
+        created_at: now,
+        started_at: None,
+        finished_at: None,
+        result: None,
+    };
+    if let Ok(mut state) = state.lock() {
+        let slave = state
+            .slaves
+            .entry(slave_id.to_string())
+            .or_insert_with(|| SlaveInfo {
+                id: slave_id.to_string(),
+                host: None,
+                version: String::new(),
+                pid: 0,
+                last_seen_at: 0,
+                status: "unknown".to_string(),
+                commands: Vec::new(),
+            });
+        slave.commands.push(record.clone());
+    }
+    record
+}
+
+fn record_slave_result(state: &Arc<Mutex<ServerState>>, request: SlaveResultRequest) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let Some(slave) = state.slaves.get_mut(&request.slave_id) else {
+        return;
+    };
+    slave.last_seen_at = now;
+    for record in &mut slave.commands {
+        if record.command.id == request.command_id {
+            record.status = if request.ok { "done" } else { "failed" }.to_string();
+            record.finished_at = Some(now);
+            record.result = Some(request.result);
+            return;
+        }
+    }
+}
+
+fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+    let Ok(master_url) = env::var("YOLO_MASTER_URL") else {
+        return;
+    };
+    let Ok(slave_id) = env::var("YOLO_SLAVE_ID") else {
+        eprintln!("yolo slave connector disabled: YOLO_SLAVE_ID is missing");
+        return;
+    };
+    let Ok(token) = env::var("YOLO_SLAVE_TOKEN") else {
+        eprintln!("yolo slave connector disabled: YOLO_SLAVE_TOKEN is missing");
+        return;
+    };
+    thread::spawn(move || {
+        let mut pending_result: Option<SlaveResultRequest> = None;
+        loop {
+            if let Some(result) = pending_result.take() {
+                let _ = federation_post_json(
+                    &master_url,
+                    "/federation/slaves/result",
+                    &token,
+                    &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                );
+            }
+            let poll = SlavePollRequest {
+                slave_id: slave_id.clone(),
+                version: VERSION.to_string(),
+                pid: std::process::id(),
+                host: hostname(),
+                status: Some("online".to_string()),
+            };
+            match federation_post_json(
+                &master_url,
+                "/federation/slaves/poll",
+                &token,
+                &serde_json::to_value(&poll).unwrap_or_else(|_| json!({})),
+            ) {
+                Ok(value) => {
+                    if let Some(command) = value.get("command")
+                        && !command.is_null()
+                    {
+                        match serde_json::from_value::<SlaveCommand>(command.clone()) {
+                            Ok(command) => {
+                                let result = execute_slave_command(
+                                    Arc::clone(&state),
+                                    &paths,
+                                    &master_url,
+                                    &token,
+                                    &slave_id,
+                                    &command,
+                                );
+                                pending_result = Some(SlaveResultRequest {
+                                    slave_id: slave_id.clone(),
+                                    command_id: command.id,
+                                    ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                                    result,
+                                });
+                            }
+                            Err(err) => {
+                                eprintln!("yolo slave connector: invalid command: {err}");
+                            }
+                        }
+                    }
+                }
+                Err(err) => eprintln!("yolo slave connector: poll failed: {err}"),
+            }
+            thread::sleep(FEDERATION_POLL_INTERVAL);
+        }
+    });
+}
+
+fn execute_slave_command(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    master_url: &str,
+    token: &str,
+    slave_id: &str,
+    command: &SlaveCommand,
+) -> Value {
+    match command.action.as_str() {
+        "codex-upgrade-resume" | "upgrade-codex" | "upgrade-resume-all" => {
+            match run_codex_upgrade_resume_all_local(state, paths, command.codex_version.as_deref())
+            {
+                Ok(value) => value,
+                Err(err) => json!({"ok": false, "error": err}),
+            }
+        }
+        "yolo-upgrade" | "upgrade-yolo" => match upgrade_yolo(command) {
+            Ok(value) => {
+                let result = SlaveResultRequest {
+                    slave_id: slave_id.to_string(),
+                    command_id: command.id.clone(),
+                    ok: true,
+                    result: value.clone(),
+                };
+                let _ = federation_post_json(
+                    master_url,
+                    "/federation/slaves/result",
+                    token,
+                    &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                );
+                schedule_yolo_server_restart();
+                value
+            }
+            Err(err) => json!({"ok": false, "error": err}),
+        },
+        _ => {
+            json!({"ok": false, "error": format!("unknown slave command action: {}", command.action)})
+        }
+    }
+}
+
+fn run_codex_upgrade_resume_all_local(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    codex_version: Option<&str>,
+) -> Result<Value, String> {
+    wait_for_clients_idle(Arc::clone(&state), paths)
+        .and_then(|_| upgrade_codex_cli_version(codex_version))
+        .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
+        .and_then(|app_server_pid| {
+            if let Ok(mut state) = state.lock() {
+                state.resume_generation = state.resume_generation.saturating_add(1);
+                let generation = state.resume_generation;
+                return Ok(json!({
+                    "ok": true,
+                    "app_server_pid": app_server_pid,
+                    "resume_generation": generation,
+                    "codex_version": codex_version,
+                    "clients": state.clients.len()
+                }));
+            }
+            Err("server state lock poisoned".to_string())
+        })
+}
+
+fn upgrade_yolo(command: &SlaveCommand) -> Result<Value, String> {
+    let shell_command = if let Some(command) = command.command.as_ref() {
+        command.clone()
+    } else if let Ok(command) = env::var("YOLO_SELF_UPGRADE_COMMAND") {
+        command
+    } else if let Some(version) = command.yolo_version.as_ref() {
+        let tag = if version.starts_with('v') {
+            version.clone()
+        } else {
+            format!("v{version}")
+        };
+        format!("cargo install --git https://github.com/genki/yolo --tag {tag} --force")
+    } else {
+        "cargo install --git https://github.com/genki/yolo --branch main --force".to_string()
+    };
+    eprintln!("yolo: self-upgrade command: {shell_command}");
+    let status = Command::new("sh")
+        .arg("-lc")
+        .arg(&shell_command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| format!("spawn yolo self-upgrade command: {err}"))?;
+    if !status.success() {
+        return Err(format_exit_status("yolo self-upgrade command", status));
+    }
+    Ok(json!({
+        "ok": true,
+        "restart_scheduled": true,
+        "yolo_version": command.yolo_version,
+    }))
+}
+
+fn schedule_yolo_server_restart() {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("yolo"));
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        let _ = Command::new(exe)
+            .arg("server")
+            .arg("--daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        thread::sleep(Duration::from_secs(1));
+        std::process::exit(0);
+    });
+}
+
 fn handle_api_connection(
     mut stream: UnixStream,
     state: Arc<Mutex<ServerState>>,
@@ -898,27 +1379,11 @@ fn handle_api_connection(
             }
         }
         ("POST", "/upgrade-resume-all") => {
-            let result = wait_for_clients_idle(Arc::clone(&state), &paths)
-                .and_then(|_| upgrade_codex_cli())
-                .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
-                .and_then(|app_server_pid| {
-                    if let Ok(mut state) = state.lock() {
-                        state.resume_generation = state.resume_generation.saturating_add(1);
-                        let generation = state.resume_generation;
-                        return Ok((app_server_pid, generation, state.clients.len()));
-                    }
-                    Err("server state lock poisoned".to_string())
-                });
+            let request = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+            let version = request.get("codex_version").and_then(Value::as_str);
+            let result = run_codex_upgrade_resume_all_local(Arc::clone(&state), &paths, version);
             match result {
-                Ok((app_server_pid, resume_generation, clients)) => json_response(
-                    200,
-                    &json!({
-                        "ok": true,
-                        "app_server_pid": app_server_pid,
-                        "resume_generation": resume_generation,
-                        "clients": clients
-                    }),
-                ),
+                Ok(value) => json_response(200, &value),
                 Err(err) => json_response(500, &json!({"ok": false, "error": err})),
             }
         }
@@ -1419,6 +1884,7 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         api_socket: paths.api_socket.display().to_string(),
         app_server_socket: paths.app_server_socket.display().to_string(),
         clients: state.clients.values().cloned().collect(),
+        slaves: state.slaves.values().cloned().collect(),
     }
 }
 
@@ -1767,6 +2233,151 @@ fn api_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, 
     serde_json::from_str(body).map_err(|err| format!("decode api response: {err}: {body}"))
 }
 
+fn federation_post_json(
+    base_url: &str,
+    path: &str,
+    token: &str,
+    body: &Value,
+) -> Result<Value, String> {
+    let url = format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        }
+    );
+    let body_text = serde_json::to_string(body).map_err(|err| err.to_string())?;
+    let output = Command::new("curl")
+        .arg("-fsS")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {token}"))
+        .arg("--data-binary")
+        .arg(body_text)
+        .arg(url)
+        .output()
+        .map_err(|err| format!("spawn curl: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl exited with {}: {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&text).map_err(|err| format!("decode federation response: {err}: {text}"))
+}
+
+fn read_http_request<R: Read>(
+    stream: &mut R,
+) -> Result<(String, String, BTreeMap<String, String>, String), String> {
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 4096];
+    let header_end = loop {
+        let n = stream
+            .read(&mut tmp)
+            .map_err(|err| format!("read request: {err}"))?;
+        if n == 0 {
+            return Err("connection closed before headers".to_string());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&buf) {
+            break pos;
+        }
+        if buf.len() > 1024 * 1024 {
+            return Err("request headers too large".to_string());
+        }
+    };
+    let headers_bytes = &buf[..header_end];
+    let mut body_bytes = buf[header_end + 4..].to_vec();
+    let headers_text = String::from_utf8(headers_bytes.to_vec())
+        .map_err(|err| format!("decode headers: {err}"))?;
+    let mut lines = headers_text.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    while body_bytes.len() < content_length {
+        let n = stream
+            .read(&mut tmp)
+            .map_err(|err| format!("read request body: {err}"))?;
+        if n == 0 {
+            break;
+        }
+        body_bytes.extend_from_slice(&tmp[..n]);
+    }
+    body_bytes.truncate(content_length);
+    let body = String::from_utf8(body_bytes).map_err(|err| format!("decode body: {err}"))?;
+    Ok((method, path, headers, body))
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn is_admin_request(headers: &BTreeMap<String, String>) -> bool {
+    let Some(token) = federation_admin_token() else {
+        return false;
+    };
+    bearer_token(headers).as_deref() == Some(token.as_str())
+}
+
+fn is_slave_request(headers: &BTreeMap<String, String>, slave_id: &str) -> bool {
+    let Some(token) = bearer_token(headers) else {
+        return false;
+    };
+    federation_slave_tokens().get(slave_id) == Some(&token)
+}
+
+fn bearer_token(headers: &BTreeMap<String, String>) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(ToString::to_string)
+}
+
+fn federation_admin_token() -> Option<String> {
+    env::var("YOLO_FEDERATION_ADMIN_TOKEN")
+        .ok()
+        .or_else(|| env::var("YOLO_MASTER_TOKEN").ok())
+}
+
+fn federation_slave_tokens() -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Ok(value) = env::var("YOLO_FEDERATION_SLAVE_TOKENS") {
+        for item in value.split(',') {
+            if let Some((id, token)) = item.split_once(':')
+                && !id.trim().is_empty()
+                && !token.trim().is_empty()
+            {
+                out.insert(id.trim().to_string(), token.trim().to_string());
+            }
+        }
+    }
+    out
+}
+
 fn json_response<T: Serialize>(status: u16, body: &T) -> String {
     let body = serde_json::to_string(body).unwrap_or_else(|_| "{\"ok\":false}".to_string());
     let reason = match status {
@@ -1942,6 +2553,21 @@ fn remove_socket_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
+fn hostname() -> Option<String> {
+    fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1968,7 +2594,7 @@ Usage:
   yolo client [CODEX_ARGS...]
   yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
   yolo upgrade-resume-all
-  yolo server [--daemon|--foreground]
+  yolo server [--daemon|--foreground] [--federation-listen ADDR]
   yolo status
   yolo stop
 
@@ -1992,6 +2618,12 @@ API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
   curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-all
 
+Federation:
+  YOLO_FEDERATION_ADMIN_TOKEN=... YOLO_FEDERATION_SLAVE_TOKENS=slave:token \
+    yolo server --daemon --federation-listen 127.0.0.1:47040
+  YOLO_MASTER_URL=https://agent-gate/.../@localhost:47040 \
+    YOLO_SLAVE_ID=slave YOLO_SLAVE_TOKEN=token yolo server --daemon
+
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
   YOLO_CODEX_UPGRADE_COMMAND
@@ -2001,6 +2633,16 @@ Environment:
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
   YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS
                     Max seconds to wait for working clients before upgrade
+  YOLO_FEDERATION_ADMIN_TOKEN
+                    Bearer token for master admin API
+  YOLO_FEDERATION_SLAVE_TOKENS
+                    Comma-separated slave-id:token map
+  YOLO_FEDERATION_LISTEN
+                    Default master federation listen address
+  YOLO_MASTER_URL, YOLO_SLAVE_ID, YOLO_SLAVE_TOKEN
+                    Slave connector settings
+  YOLO_SELF_UPGRADE_COMMAND
+                    Override remote yolo-upgrade command
 "
     );
 }

@@ -30,6 +30,7 @@ yolo --cd /home/vagrant/websh
 yolo resume --last
 yolo upgrade-resume --last
 yolo server --daemon
+yolo server --daemon --federation-listen 127.0.0.1:47040
 yolo status
 yolo stop
 ```
@@ -54,6 +55,59 @@ The `/clients` response includes:
 - fast flag
 - lifecycle status and timestamps
 
+## Master/slave federation
+
+`yolo server` can expose a master API for other yolo servers. Bind the API to a
+local TCP port and publish that port through agent-gate with a fine grained
+token.
+
+Master:
+
+```sh
+YOLO_FEDERATION_ADMIN_TOKEN=<admin-token> \
+YOLO_FEDERATION_SLAVE_TOKENS=kagura:<slave-token>,codex:<slave-token> \
+yolo server --daemon --federation-listen 127.0.0.1:47040
+```
+
+Slave:
+
+```sh
+YOLO_MASTER_URL=https://agent-gate.example/<token>/@localhost:47040 \
+YOLO_SLAVE_ID=kagura \
+YOLO_SLAVE_TOKEN=<slave-token> \
+yolo server --daemon
+```
+
+Slave servers poll the master and reconnect automatically after host or yolo
+server restarts as long as the same environment is provided when the server is
+started.
+
+Master API:
+
+```sh
+curl -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+  http://127.0.0.1:47040/federation/slaves
+
+curl -X POST -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"action":"codex-upgrade-resume","codex_version":"0.136.0"}' \
+  http://127.0.0.1:47040/federation/slaves/kagura/commands
+
+curl -X POST -H "Authorization: Bearer $YOLO_FEDERATION_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"action":"yolo-upgrade","yolo_version":"0.5.0"}' \
+  http://127.0.0.1:47040/federation/slaves/kagura/commands
+```
+
+`codex-upgrade-resume` waits until slave Codex clients become idle, installs the
+requested `@openai/codex` version into yolo's managed user-writable npm prefix,
+restarts the slave app-server, and asks running yolo clients to resume.
+
+`yolo-upgrade` runs `cargo install --git https://github.com/genki/yolo` by
+default, then restarts the yolo server. Override it with
+`YOLO_SELF_UPGRADE_COMMAND` when the slave needs a local package or different
+installer.
+
 ## Environment
 
 - `YOLO_CODEX`: Codex executable to run. Defaults to yolo's managed Codex when
@@ -64,3 +118,9 @@ The `/clients` response includes:
 - `YOLO_REMOTE`: override app-server endpoint for the client.
 - `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
   `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
+- `YOLO_FEDERATION_ADMIN_TOKEN`: bearer token for master admin API.
+- `YOLO_FEDERATION_SLAVE_TOKENS`: comma-separated `slave-id:token` map.
+- `YOLO_FEDERATION_LISTEN`: default master listen address.
+- `YOLO_MASTER_URL`, `YOLO_SLAVE_ID`, `YOLO_SLAVE_TOKEN`: slave connector
+  settings.
+- `YOLO_SELF_UPGRADE_COMMAND`: override command used by remote `yolo-upgrade`.
