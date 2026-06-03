@@ -24,6 +24,7 @@ const PID_FILE_NAME: &str = "server.pid";
 const MANAGED_CODEX_DIR_NAME: &str = "codex-npm";
 const THREAD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RESUME_GENERATION_GRACE: Duration = Duration::from_secs(20);
 const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -542,6 +543,11 @@ fn run_client(args: Vec<OsString>) {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    if !status.success()
+                        && wait_for_resume_generation_advance(&seen_resume_generation)
+                    {
+                        break;
+                    }
                     info.updated_at = now_secs();
                     info.ended_at = Some(now_secs());
                     info.status = "exited".to_string();
@@ -574,6 +580,25 @@ fn run_client(args: Vec<OsString>) {
         );
         thread::sleep(Duration::from_millis(300));
     }
+}
+
+fn wait_for_resume_generation_advance(seen_resume_generation: &AtomicU64) -> bool {
+    let seen = seen_resume_generation.load(Ordering::SeqCst);
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < RESUME_GENERATION_GRACE {
+        if let Ok(value) = api_get_json("/status")
+            && let Some(generation) = value.get("resume_generation").and_then(Value::as_u64)
+            && generation > seen
+        {
+            seen_resume_generation.store(generation, Ordering::SeqCst);
+            eprintln!(
+                "yolo: Codex child exited during app-server restart; resuming via Phoenix mode"
+            );
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 fn run_upgrade_resume(mut args: Vec<OsString>) {
