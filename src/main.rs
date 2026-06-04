@@ -461,6 +461,15 @@ fn run_client(args: Vec<OsString>) {
     let initial_config = read_codex_config();
     let initial_service_tier = initial_config.service_tier.clone();
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
+    let thread_id = thread_id_from_args(&original_args);
+    if let Some(thread_id) = thread_id.as_deref()
+        && let Some(existing) = running_duplicate_thread_client(thread_id, std::process::id())
+    {
+        eprintln!(
+            "yolo: refusing duplicate resume for thread {thread_id}; already running in {existing}"
+        );
+        std::process::exit(2);
+    }
     let mut info = ClientInfo {
         id: client_id.clone(),
         yolo_pid: std::process::id(),
@@ -472,7 +481,7 @@ fn run_client(args: Vec<OsString>) {
         service_tier: initial_service_tier,
         reasoning_effort: None,
         fast: initial_fast,
-        thread_id: thread_id_from_args(&original_args),
+        thread_id,
         started_at: now_secs(),
         updated_at: now_secs(),
         ended_at: None,
@@ -590,6 +599,31 @@ fn wait_for_resume_generation_advance(seen_resume_generation: &AtomicU64) -> boo
         thread::sleep(Duration::from_millis(200));
     }
     false
+}
+
+fn running_duplicate_thread_client(thread_id: &str, current_pid: u32) -> Option<String> {
+    let value = api_get_json("/clients").ok()?;
+    let clients = value.get("clients")?.as_array()?;
+    for client in clients {
+        let client_thread_id = client.get("thread_id").and_then(Value::as_str);
+        if client_thread_id != Some(thread_id) {
+            continue;
+        }
+        if client.get("status").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        let yolo_pid = client.get("yolo_pid").and_then(Value::as_u64)? as u32;
+        if yolo_pid == current_pid || !pid_is_alive(yolo_pid) {
+            continue;
+        }
+        let id = client
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let cwd = client.get("cwd").and_then(Value::as_str).unwrap_or("");
+        return Some(format!("{id} pid={yolo_pid} cwd={cwd}"));
+    }
+    None
 }
 
 fn run_upgrade_resume(mut args: Vec<OsString>) {
@@ -1771,6 +1805,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
     let now = now_secs();
     let current_pid = std::process::id();
     let mut child_codex_by_parent: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut live_client_pids: BTreeSet<u32> = BTreeSet::new();
     for process in &processes {
         if process.cmdline.iter().any(|arg| arg.contains("codex"))
             && process
@@ -1780,11 +1815,24 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         {
             child_codex_by_parent.insert(process.ppid, process.pid);
         }
+        if process.pid != current_pid
+            && is_yolo_process(process)
+            && is_yolo_client_args(&process.cmdline.iter().skip(1).cloned().collect::<Vec<_>>())
+        {
+            live_client_pids.insert(process.pid);
+        }
     }
 
     let Ok(mut state) = state.lock() else {
         return;
     };
+    for client in state.clients.values_mut() {
+        if client.status == "running" && !live_client_pids.contains(&client.yolo_pid) {
+            client.status = "exited".to_string();
+            client.ended_at = Some(now);
+            client.updated_at = now;
+        }
+    }
     for process in processes {
         if process.pid == current_pid || !is_yolo_process(&process) {
             continue;
