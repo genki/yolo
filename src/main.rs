@@ -1810,12 +1810,12 @@ fn run_thread_status_event_listener(
 ) -> Result<(), String> {
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
-    client.set_read_timeout(Some(Duration::from_secs(1)))?;
 
     let mut subscribed_thread_ids = BTreeSet::new();
     loop {
         scan_existing_yolo_clients(state);
         subscribe_running_client_threads(state, &mut client, &mut subscribed_thread_ids)?;
+        client.set_read_timeout(Some(Duration::from_secs(1)))?;
         match client.read_message_value() {
             Ok(value) => {
                 if let Some(update) = parse_app_server_status_notification(&value) {
@@ -1838,6 +1838,7 @@ fn subscribe_running_client_threads(
         if subscribed_thread_ids.contains(&thread_id) {
             continue;
         }
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
         let response = client.request(
             "thread/resume",
             json!({
