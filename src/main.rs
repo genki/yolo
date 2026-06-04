@@ -1838,7 +1838,7 @@ fn subscribe_running_client_threads(
         if subscribed_thread_ids.contains(&thread_id) {
             continue;
         }
-        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        client.set_read_timeout(Some(Duration::from_secs(60)))?;
         let response = client.request(
             "thread/resume",
             json!({
