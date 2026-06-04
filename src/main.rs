@@ -1819,7 +1819,7 @@ fn run_thread_status_event_listener(
         match client.read_message_value() {
             Ok(value) => {
                 if let Some(snapshot) = parse_app_server_thread_response(&value) {
-                    apply_thread_snapshot(state, &[snapshot]);
+                    apply_single_thread_snapshot(state, &snapshot);
                 } else if let Some(update) = parse_app_server_status_notification(&value) {
                     apply_thread_status_update(state, &update);
                 }
@@ -2076,6 +2076,54 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         client.codex_status = Some(thread.status.clone());
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
+        let launch_cfg = if client.settings_updated_at.is_some() {
+            CodexLaunchConfig::default()
+        } else {
+            parse_codex_launch_config(&client.args)
+        };
+        if let Some(model) = launch_cfg.model.or_else(|| thread.model.clone()) {
+            client.model = Some(model);
+        }
+        if let Some(service_tier) = launch_cfg
+            .service_tier
+            .or_else(|| thread.service_tier.clone())
+        {
+            client.service_tier = Some(service_tier);
+            client.fast = is_fast_tier(client.service_tier.as_deref());
+        }
+        if let Some(reasoning_effort) = launch_cfg
+            .reasoning_effort
+            .or_else(|| thread.reasoning_effort.clone())
+        {
+            client.reasoning_effort = Some(reasoning_effort);
+        }
+    }
+}
+
+fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThreadSnapshot) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+
+    for client in state.clients.values_mut() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+
+        let matched = match client.thread_id.as_deref() {
+            Some(thread_id) => thread.id == thread_id,
+            None => thread.cwd == client.cwd && thread.status == "active",
+        };
+        if !matched {
+            continue;
+        }
+
+        client.thread_id = Some(thread.id.clone());
+        client.codex_status = Some(thread.status.clone());
+        client.codex_active_flags = thread.active_flags.clone();
+        client.codex_status_updated_at = Some(now);
+        client.updated_at = now;
         let launch_cfg = if client.settings_updated_at.is_some() {
             CodexLaunchConfig::default()
         } else {
