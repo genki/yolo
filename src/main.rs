@@ -1696,6 +1696,11 @@ fn handle_api_connection(
         ("POST", "/clients/register") => match serde_json::from_str::<ClientInfo>(body) {
             Ok(client) => {
                 if let Ok(mut state) = state.lock() {
+                    let client_id = client.id.clone();
+                    let yolo_pid = client.yolo_pid;
+                    state
+                        .clients
+                        .retain(|id, existing| id == &client_id || existing.yolo_pid != yolo_pid);
                     state.clients.insert(client.id.clone(), client);
                 }
                 json_response(200, &json!({"ok": true}))
