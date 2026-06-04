@@ -30,6 +30,7 @@ yolo --cd /home/vagrant/websh
 yolo resume --last
 yolo upgrade-resume --last
 yolo upgrade-resume-all
+yolo external-codex-upgrade-resume --codex-version 0.137.0 --system
 yolo server --daemon
 yolo server --daemon --federation-listen 127.0.0.1:47040
 yolo status
@@ -48,6 +49,13 @@ flow; after stopping their Codex child they re-exec the yolo client process in
 place, preserving the pre-upgrade parent/TTY/process-tree shape. When run from
 inside Codex it uses Phoenix mode: the caller thread is excluded from the idle
 wait and revived by the final resume generation.
+
+`yolo external-codex-upgrade-resume` is for legacy tmux panes that were launched
+with `codex` directly instead of through yolo. It updates the user npm prefix
+used by `~/.npm-global/bin/codex`, optionally updates `/usr/local/bin/codex`
+with `--system`, detects non-yolo Codex panes, skips panes that appear busy, and
+opens a new tmux window in the same session with `yolo resume <thread-id>`.
+Use `--include-busy` only when duplicating active panes is intentional.
 
 ## API
 

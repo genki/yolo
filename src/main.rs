@@ -240,6 +240,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("external-codex-upgrade-resume") | Some("upgrade-external-codex") => {
+            args.remove(0);
+            if let Err(err) = run_external_codex_upgrade_resume(args) {
+                eprintln!("yolo external-codex-upgrade-resume: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("set") | Some("configure") => {
             args.remove(0);
             if let Err(err) = run_configure(args) {
@@ -624,6 +631,238 @@ fn run_upgrade_resume_all() -> Result<(), String> {
     Ok(())
 }
 
+fn run_external_codex_upgrade_resume(args: Vec<OsString>) -> Result<(), String> {
+    let mut codex_version: Option<String> = None;
+    let mut include_busy = false;
+    let mut update_system = false;
+    let mut dry_run = false;
+    let mut defer_busy = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy().to_string();
+        match arg.as_str() {
+            "--codex-version" | "--version" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a value"))?
+                    .to_string_lossy()
+                    .to_string();
+                codex_version = Some(value);
+            }
+            "--include-busy" => include_busy = true,
+            "--system" => update_system = true,
+            "--dry-run" => dry_run = true,
+            "--defer-busy" => defer_busy = true,
+            _ => {
+                return Err(format!(
+                    "unknown external-codex-upgrade-resume argument: {arg}"
+                ));
+            }
+        }
+    }
+    let package = codex_version
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("@openai/codex@{}", value.trim()))
+        .unwrap_or_else(|| CODEX_PACKAGE.to_string());
+    let script = r###"
+import json, os, re, shlex, subprocess, sys
+from pathlib import Path
+
+package = os.environ["YOLO_EXTERNAL_CODEX_PACKAGE"]
+include_busy = os.environ.get("YOLO_EXTERNAL_INCLUDE_BUSY") == "1"
+defer_busy = os.environ.get("YOLO_EXTERNAL_DEFER_BUSY") == "1"
+update_system = os.environ.get("YOLO_EXTERNAL_UPDATE_SYSTEM") == "1"
+dry_run = os.environ.get("YOLO_EXTERNAL_DRY_RUN") == "1"
+home = Path.home()
+
+def run(cmd, *, check=True):
+    print("+", " ".join(shlex.quote(str(x)) for x in cmd), flush=True)
+    if dry_run:
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    return subprocess.run(cmd, check=check, text=True)
+
+run(["npm", "install", "--global", "--prefix", str(home / ".npm-global"), package])
+if update_system:
+    run(["sudo", "npm", "install", "--global", "--prefix", "/usr/local", package])
+
+def output(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True, check=False).stdout
+
+def session_ids_by_cwd():
+    found = {}
+    root = home / ".codex" / "sessions"
+    if not root.exists():
+        return found
+    rows = []
+    for path in root.rglob("*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        match = re.search(r"(019e[0-9a-fA-F-]+)", path.name)
+        if not match:
+            continue
+        cwd_value = None
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                head = "".join([next(handle, "") for _ in range(120)])
+        except OSError:
+            continue
+        for pattern in [r'"cwd"\s*:\s*"([^"]+)"', r'"workdir"\s*:\s*"([^"]+)"', r'"directory"\s*:\s*"([^"]+)"']:
+            cwd_match = re.search(pattern, head)
+            if cwd_match:
+                cwd_value = cwd_match.group(1)
+                break
+        if cwd_value:
+            rows.append((stat.st_mtime, cwd_value, match.group(1)))
+    by_cwd = {}
+    for mtime, cwd_value, thread_id in sorted(rows, reverse=True):
+        by_cwd.setdefault(cwd_value, []).append(thread_id)
+    for cwd_value, thread_ids in by_cwd.items():
+        uniq = []
+        for thread_id in thread_ids:
+            if thread_id not in uniq:
+                uniq.append(thread_id)
+        if len(uniq) == 1:
+            found[cwd_value] = uniq[0]
+    return found
+
+pane_raw = output([
+    "tmux", "list-panes", "-a", "-F",
+    "#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_tty}\t#{pane_current_path}"
+])
+targets = []
+deferred = []
+cwd_thread_ids = session_ids_by_cwd()
+for line in pane_raw.splitlines():
+    parts = line.split("\t")
+    if len(parts) != 8:
+        continue
+    key, session_name, window_name, pane_id, pane_pid, pane_cmd, pane_tty, cwd = parts
+    if not pane_tty:
+        continue
+    tty_name = pane_tty[5:] if pane_tty.startswith("/dev/") else pane_tty
+    ps = output(["ps", "-t", tty_name, "-o", "pid=,ppid=,comm=,args="])
+    if re.search(r"\byolo\b", ps):
+        continue
+    if "codex" not in ps:
+        continue
+    node_lines = [raw.strip() for raw in ps.splitlines() if " codex " in f" {raw} " or "/codex" in raw]
+    if not node_lines:
+        continue
+    capture = output(["tmux", "capture-pane", "-p", "-t", key, "-S", "-80"])
+    thread_id = None
+    for raw in node_lines:
+        tokens = shlex.split(raw, posix=True)
+        for idx, token in enumerate(tokens):
+            if token == "resume":
+                for value in tokens[idx + 1:]:
+                    if not value.startswith("-"):
+                        thread_id = value
+                        break
+            if thread_id:
+                break
+        if thread_id:
+            break
+    if not thread_id:
+        match = re.search(r"Session:\s+([0-9a-fA-F-]{20,})", capture)
+        if match:
+            thread_id = match.group(1)
+    if not thread_id:
+        thread_id = cwd_thread_ids.get(cwd)
+    if not thread_id:
+        print(json.dumps({"pane": key, "action": "skip", "reason": "thread_id_missing", "cwd": cwd}), flush=True)
+        continue
+    tail_capture = "\n".join(capture.splitlines()[-12:])
+    busy = any(marker in tail_capture for marker in [
+        "Working (", "Waiting for background terminal", "\u25e6 Waiting", "\u2022 Running", "background terminals running"
+    ])
+    if busy and not include_busy:
+        if defer_busy:
+            deferred.append({"pane": key, "session": session_name, "window_name": window_name, "thread_id": thread_id, "cwd": cwd})
+            print(json.dumps({"pane": key, "action": "defer", "reason": "busy", "thread_id": thread_id, "cwd": cwd}), flush=True)
+        else:
+            print(json.dumps({"pane": key, "action": "skip", "reason": "busy", "thread_id": thread_id, "cwd": cwd}), flush=True)
+        continue
+    targets.append({"pane": key, "session": session_name, "window_name": window_name, "thread_id": thread_id, "cwd": cwd})
+
+for target in targets:
+    cwd = target["cwd"] or str(home)
+    thread_id = target["thread_id"]
+    command = "export PATH=\"$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH\"; yolo resume " + shlex.quote(thread_id) + "; exec \"$SHELL\" -l"
+    window_name = "yolo-" + (target.get("window_name") or "codex")
+    print(json.dumps({"pane": target["pane"], "action": "new-window", "thread_id": thread_id, "cwd": cwd}), flush=True)
+    run(["tmux", "new-window", "-d", "-t", target["session"], "-n", window_name, "-c", cwd, os.environ.get("SHELL", "/bin/sh") + " -lc " + shlex.quote(command)])
+
+for target in deferred:
+    wait_script = r'''
+import os, shlex, subprocess, time
+pane = os.environ["YOLO_DEFER_PANE"]
+session = os.environ["YOLO_DEFER_SESSION"]
+window_name = os.environ["YOLO_DEFER_WINDOW_NAME"]
+cwd = os.environ["YOLO_DEFER_CWD"]
+thread_id = os.environ["YOLO_DEFER_THREAD_ID"]
+shell = os.environ.get("SHELL", "/bin/sh")
+markers = ["Working (", "Waiting for background terminal", "\u25e6 Waiting", "\u2022 Running", "background terminals running"]
+def output(cmd):
+    return subprocess.run(cmd, text=True, capture_output=True, check=False).stdout
+deadline = time.time() + 6 * 60 * 60
+while time.time() < deadline:
+    capture = output(["tmux", "capture-pane", "-p", "-t", pane, "-S", "-20"])
+    tail = "\n".join(capture.splitlines()[-12:])
+    if not any(marker in tail for marker in markers):
+        command = "export PATH=\"$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH\"; yolo resume " + shlex.quote(thread_id) + "; exec \"$SHELL\" -l"
+        subprocess.run(["tmux", "new-window", "-d", "-t", session, "-n", "yolo-" + window_name, "-c", cwd, shell + " -lc " + shlex.quote(command)], check=False)
+        raise SystemExit(0)
+    time.sleep(10)
+raise SystemExit(2)
+'''
+    env = os.environ.copy()
+    env.update({
+        "YOLO_DEFER_PANE": target["pane"],
+        "YOLO_DEFER_SESSION": target["session"],
+        "YOLO_DEFER_WINDOW_NAME": target.get("window_name") or "codex",
+        "YOLO_DEFER_CWD": target["cwd"] or str(home),
+        "YOLO_DEFER_THREAD_ID": target["thread_id"],
+    })
+    if dry_run:
+        print("+ defer", target["pane"], target["thread_id"], flush=True)
+    else:
+        subprocess.Popen(["python3", "-c", wait_script], env=env, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+print(json.dumps({"ok": True, "targets": targets, "deferred": deferred, "count": len(targets)}), flush=True)
+"###;
+    let mut command = Command::new("python3");
+    command
+        .arg("-c")
+        .arg(script)
+        .env("YOLO_EXTERNAL_CODEX_PACKAGE", package)
+        .env(
+            "YOLO_EXTERNAL_INCLUDE_BUSY",
+            if include_busy { "1" } else { "0" },
+        )
+        .env(
+            "YOLO_EXTERNAL_DEFER_BUSY",
+            if defer_busy { "1" } else { "0" },
+        )
+        .env(
+            "YOLO_EXTERNAL_UPDATE_SYSTEM",
+            if update_system { "1" } else { "0" },
+        )
+        .env("YOLO_EXTERNAL_DRY_RUN", if dry_run { "1" } else { "0" })
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command
+        .status()
+        .map_err(|err| format!("spawn external codex upgrade helper: {err}"))?;
+    if !status.success() {
+        return Err(format_exit_status("external codex upgrade helper", status));
+    }
+    Ok(())
+}
+
 fn run_configure(args: Vec<OsString>) -> Result<(), String> {
     ensure_server()?;
     let request = parse_configure_args(args)?;
@@ -790,13 +1029,7 @@ fn wait_for_server_stopped(timeout: Duration) -> Result<(), String> {
 fn wait_for_pid_exit(pid: u32, timeout: Duration) {
     let start = SystemTime::now();
     while start.elapsed().unwrap_or_default() < timeout {
-        let alive = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !alive {
+        if !pid_is_alive(pid) {
             return;
         }
         thread::sleep(Duration::from_millis(100));
@@ -805,6 +1038,60 @@ fn wait_for_pid_exit(pid: u32, timeout: Duration) {
         .arg("-KILL")
         .arg(pid.to_string())
         .status();
+}
+
+fn terminate_pid_tree(pid: u32, timeout: Duration) {
+    let mut pids = child_pids_recursive(pid);
+    pids.push(pid);
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in pids.iter().rev() {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < timeout {
+        if !pids.iter().any(|pid| pid_is_alive(*pid)) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    for pid in pids.iter().rev() {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+fn child_pids_recursive(pid: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    let output = Command::new("pgrep")
+        .arg("-P")
+        .arg(pid.to_string())
+        .output();
+    let Ok(output) = output else {
+        return result;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(child_pid) = line.trim().parse::<u32>() else {
+            continue;
+        };
+        result.extend(child_pids_recursive(child_pid));
+        result.push(child_pid);
+    }
+    result
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn terminate_child(child: &mut Child) {
@@ -1454,7 +1741,7 @@ fn handle_api_connection(
             if let Ok(state) = state.lock()
                 && let Some(pid) = state.app_server_pid
             {
-                let _ = Command::new("kill").arg(pid.to_string()).status();
+                terminate_pid_tree(pid, Duration::from_secs(5));
             }
             let _ = stream.write_all(json_response(200, &json!({"ok": true})).as_bytes());
             std::process::exit(0);
@@ -1620,6 +1907,7 @@ fn is_yolo_client_args(args: &[String]) -> bool {
         Some("server" | "status" | "clients" | "stop" | "set" | "configure") => false,
         Some("upgrade-resume" | "resume-upgrade" | "upgrade-and-resume") => false,
         Some("upgrade-resume-all" | "resume-all-upgrade") => false,
+        Some("external-codex-upgrade-resume" | "upgrade-external-codex") => false,
         Some(arg) if arg.starts_with('-') => true,
         Some(_) => true,
     }
