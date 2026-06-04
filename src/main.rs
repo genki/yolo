@@ -158,6 +158,13 @@ struct AppThreadSnapshot {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct AppThreadStatusUpdate {
+    thread_id: String,
+    status: String,
+    active_flags: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct CodexLaunchConfig {
     model: Option<String>,
@@ -1789,38 +1796,86 @@ fn handle_api_connection(
 fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
     thread::spawn(move || {
         loop {
-            scan_existing_yolo_clients(&state);
-            let target_thread_ids = running_client_thread_ids(&state);
-            if let Ok(snapshot) = app_server_thread_snapshot(&paths, target_thread_ids.as_ref()) {
-                apply_thread_snapshot(&state, &snapshot);
+            if let Err(err) = run_thread_status_event_listener(&state, &paths) {
+                eprintln!("yolo server: Codex app-server status listener stopped: {err}");
+                thread::sleep(THREAD_MONITOR_INTERVAL);
             }
-            thread::sleep(THREAD_MONITOR_INTERVAL);
         }
     });
 }
 
-fn running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> Option<BTreeSet<String>> {
-    let Ok(state) = state.lock() else {
-        return None;
-    };
-    let mut ids = BTreeSet::new();
-    let mut has_running_without_thread = false;
-    for client in state.clients.values() {
-        if !matches!(client.status.as_str(), "running" | "restarting") {
+fn run_thread_status_event_listener(
+    state: &Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+) -> Result<(), String> {
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.initialize()?;
+    client.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+    let mut subscribed_thread_ids = BTreeSet::new();
+    loop {
+        scan_existing_yolo_clients(state);
+        subscribe_running_client_threads(state, &mut client, &mut subscribed_thread_ids)?;
+        match client.read_message_value() {
+            Ok(value) => {
+                if let Some(update) = parse_app_server_status_notification(&value) {
+                    apply_thread_status_update(state, &update);
+                }
+            }
+            Err(err) if is_app_server_read_timeout(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn subscribe_running_client_threads(
+    state: &Arc<Mutex<ServerState>>,
+    client: &mut AppServerRpcClient,
+    subscribed_thread_ids: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let target_thread_ids = known_running_client_thread_ids(state);
+    for thread_id in target_thread_ids {
+        if subscribed_thread_ids.contains(&thread_id) {
             continue;
         }
-        if let Some(thread_id) = client.thread_id.as_deref() {
-            if !thread_id.trim().is_empty() {
-                ids.insert(thread_id.to_string());
-            }
-        } else {
-            has_running_without_thread = true;
+        let response = client.request(
+            "thread/resume",
+            json!({
+                "threadId": thread_id,
+                "excludeTurns": true
+            }),
+        )?;
+        subscribed_thread_ids.insert(thread_id);
+        if let Some(thread) = response.get("thread")
+            && let Some(mut snapshot) = parse_app_thread_snapshot(thread)
+        {
+            apply_app_thread_settings(&mut snapshot, &response);
+            apply_thread_snapshot(state, &[snapshot]);
         }
     }
-    if has_running_without_thread {
-        return None;
-    }
-    Some(ids)
+    Ok(())
+}
+
+fn known_running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<String> {
+    let Ok(state) = state.lock() else {
+        return BTreeSet::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter_map(|client| client.thread_id.as_deref())
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn is_app_server_read_timeout(err: &str) -> bool {
+    err.contains("WouldBlock")
+        || err.contains("TimedOut")
+        || err.contains("timed out")
+        || err.contains("Resource temporarily unavailable")
 }
 
 fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
@@ -2047,6 +2102,77 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
             client.reasoning_effort = Some(reasoning_effort);
         }
     }
+}
+
+fn apply_thread_status_update(state: &Arc<Mutex<ServerState>>, update: &AppThreadStatusUpdate) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    for client in state.clients.values_mut() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        if client.thread_id.as_deref() != Some(update.thread_id.as_str()) {
+            continue;
+        }
+        client.codex_status = Some(update.status.clone());
+        client.codex_active_flags = update.active_flags.clone();
+        client.codex_status_updated_at = Some(now);
+        client.updated_at = now;
+    }
+}
+
+fn parse_app_server_status_notification(value: &Value) -> Option<AppThreadStatusUpdate> {
+    let method = value.get("method")?.as_str()?;
+    let params = value.get("params")?;
+    match method {
+        "thread/status/changed" => {
+            let thread_id = params.get("threadId")?.as_str()?.to_string();
+            let (status, active_flags) = parse_thread_status_value(params.get("status")?)?;
+            Some(AppThreadStatusUpdate {
+                thread_id,
+                status,
+                active_flags,
+            })
+        }
+        "turn/started" => Some(AppThreadStatusUpdate {
+            thread_id: params.get("threadId")?.as_str()?.to_string(),
+            status: "active".to_string(),
+            active_flags: Vec::new(),
+        }),
+        "turn/completed" => Some(AppThreadStatusUpdate {
+            thread_id: params.get("threadId")?.as_str()?.to_string(),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+        }),
+        "thread/closed" => Some(AppThreadStatusUpdate {
+            thread_id: params.get("threadId")?.as_str()?.to_string(),
+            status: "notLoaded".to_string(),
+            active_flags: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_thread_status_value(value: &Value) -> Option<(String, Vec<String>)> {
+    let status = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active_flags = value
+        .get("activeFlags")
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some((status, active_flags))
 }
 
 fn wait_for_clients_idle(
@@ -2544,6 +2670,12 @@ impl AppServerRpcClient {
         self.send_notification("initialized", json!({}))
     }
 
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), String> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(|err| format!("set app-server read timeout: {err}"))
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.send_request(method, params)?;
         self.read_response_for(id)
@@ -2577,9 +2709,7 @@ impl AppServerRpcClient {
 
     fn read_response_for(&mut self, id: u64) -> Result<Value, String> {
         loop {
-            let message = websocket_read_text(&mut self.stream)?;
-            let value: Value = serde_json::from_str(&message)
-                .map_err(|err| format!("decode app-server message: {err}: {message}"))?;
+            let value = self.read_message_value()?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -2588,6 +2718,12 @@ impl AppServerRpcClient {
             }
             return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
         }
+    }
+
+    fn read_message_value(&mut self) -> Result<Value, String> {
+        let message = websocket_read_text(&mut self.stream)?;
+        serde_json::from_str(&message)
+            .map_err(|err| format!("decode app-server message: {err}: {message}"))
     }
 }
 
