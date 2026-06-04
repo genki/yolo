@@ -1818,7 +1818,9 @@ fn run_thread_status_event_listener(
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         match client.read_message_value() {
             Ok(value) => {
-                if let Some(update) = parse_app_server_status_notification(&value) {
+                if let Some(snapshot) = parse_app_server_thread_response(&value) {
+                    apply_thread_snapshot(state, &[snapshot]);
+                } else if let Some(update) = parse_app_server_status_notification(&value) {
                     apply_thread_status_update(state, &update);
                 }
             }
@@ -1838,8 +1840,7 @@ fn subscribe_running_client_threads(
         if subscribed_thread_ids.contains(&thread_id) {
             continue;
         }
-        client.set_read_timeout(Some(Duration::from_secs(60)))?;
-        let response = client.request(
+        client.send_request(
             "thread/resume",
             json!({
                 "threadId": thread_id,
@@ -1847,12 +1848,6 @@ fn subscribe_running_client_threads(
             }),
         )?;
         subscribed_thread_ids.insert(thread_id);
-        if let Some(thread) = response.get("thread")
-            && let Some(mut snapshot) = parse_app_thread_snapshot(thread)
-        {
-            apply_app_thread_settings(&mut snapshot, &response);
-            apply_thread_snapshot(state, &[snapshot]);
-        }
     }
     Ok(())
 }
@@ -2122,6 +2117,14 @@ fn apply_thread_status_update(state: &Arc<Mutex<ServerState>>, update: &AppThrea
         client.codex_status_updated_at = Some(now);
         client.updated_at = now;
     }
+}
+
+fn parse_app_server_thread_response(value: &Value) -> Option<AppThreadSnapshot> {
+    let result = value.get("result")?;
+    let thread = result.get("thread")?;
+    let mut snapshot = parse_app_thread_snapshot(thread)?;
+    apply_app_thread_settings(&mut snapshot, result);
+    Some(snapshot)
 }
 
 fn parse_app_server_status_notification(value: &Value) -> Option<AppThreadStatusUpdate> {
