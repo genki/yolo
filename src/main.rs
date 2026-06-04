@@ -1790,12 +1790,37 @@ fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePat
     thread::spawn(move || {
         loop {
             scan_existing_yolo_clients(&state);
-            if let Ok(snapshot) = app_server_thread_snapshot(&paths) {
+            let target_thread_ids = running_client_thread_ids(&state);
+            if let Ok(snapshot) = app_server_thread_snapshot(&paths, target_thread_ids.as_ref()) {
                 apply_thread_snapshot(&state, &snapshot);
             }
             thread::sleep(THREAD_MONITOR_INTERVAL);
         }
     });
+}
+
+fn running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> Option<BTreeSet<String>> {
+    let Ok(state) = state.lock() else {
+        return None;
+    };
+    let mut ids = BTreeSet::new();
+    let mut has_running_without_thread = false;
+    for client in state.clients.values() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        if let Some(thread_id) = client.thread_id.as_deref() {
+            if !thread_id.trim().is_empty() {
+                ids.insert(thread_id.to_string());
+            }
+        } else {
+            has_running_without_thread = true;
+        }
+    }
+    if has_running_without_thread {
+        return None;
+    }
+    Some(ids)
 }
 
 fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
@@ -2032,7 +2057,8 @@ fn wait_for_clients_idle(
     let timeout = upgrade_idle_wait_timeout();
     let start = SystemTime::now();
     loop {
-        let snapshot = app_server_thread_snapshot(paths)?;
+        let target_thread_ids = upgrade_wait_thread_ids(&state, request);
+        let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
         apply_thread_snapshot(&state, &snapshot);
         let working_clients = working_clients_for_snapshot(&state, &snapshot, request);
         if working_clients.is_empty() {
@@ -2098,6 +2124,36 @@ fn should_ignore_upgrade_wait_client(
     request.ignore_cwd.as_deref() == Some(client.cwd.as_str())
 }
 
+fn upgrade_wait_thread_ids(
+    state: &Arc<Mutex<ServerState>>,
+    request: &UpgradeResumeAllRequest,
+) -> Option<BTreeSet<String>> {
+    let Ok(state) = state.lock() else {
+        return None;
+    };
+    let mut ids = BTreeSet::new();
+    let mut has_running_without_thread = false;
+    for client in state.clients.values() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        if should_ignore_upgrade_wait_client(client, request) {
+            continue;
+        }
+        if let Some(thread_id) = client.thread_id.as_deref() {
+            if !thread_id.trim().is_empty() {
+                ids.insert(thread_id.to_string());
+            }
+        } else {
+            has_running_without_thread = true;
+        }
+    }
+    if has_running_without_thread {
+        return None;
+    }
+    Some(ids)
+}
+
 fn configure_clients_when_idle(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
@@ -2114,7 +2170,8 @@ fn configure_clients_when_idle(
 
     let start = SystemTime::now();
     loop {
-        let snapshot = app_server_thread_snapshot(paths)?;
+        let target_thread_ids = selected_thread_ids_for_snapshot(&state, &selected_ids);
+        let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
         apply_thread_snapshot(&state, &snapshot);
         let working = working_selected_clients_for_snapshot(&state, &snapshot, &selected_ids);
         if working.is_empty() {
@@ -2166,7 +2223,8 @@ fn configure_clients_when_idle(
         }));
     }
 
-    let snapshot = app_server_thread_snapshot(paths)?;
+    let target_thread_ids = selected_thread_ids_for_snapshot(&state, &selected_ids);
+    let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
     apply_thread_snapshot(&state, &snapshot);
     Ok(json!({
         "ok": true,
@@ -2251,6 +2309,33 @@ fn selected_clients_with_threads(
         .collect()
 }
 
+fn selected_thread_ids_for_snapshot(
+    state: &Arc<Mutex<ServerState>>,
+    selected_ids: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let Ok(state) = state.lock() else {
+        return None;
+    };
+    let mut ids = BTreeSet::new();
+    let mut has_selected_without_thread = false;
+    for id in selected_ids {
+        let Some(client) = state.clients.get(id) else {
+            continue;
+        };
+        if let Some(thread_id) = client.thread_id.as_deref() {
+            if !thread_id.trim().is_empty() {
+                ids.insert(thread_id.to_string());
+            }
+        } else {
+            has_selected_without_thread = true;
+        }
+    }
+    if has_selected_without_thread {
+        return None;
+    }
+    Some(ids)
+}
+
 fn working_selected_clients_for_snapshot(
     state: &Arc<Mutex<ServerState>>,
     snapshot: &[AppThreadSnapshot],
@@ -2305,7 +2390,10 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
     }
 }
 
-fn app_server_thread_snapshot(paths: &RuntimePaths) -> Result<Vec<AppThreadSnapshot>, String> {
+fn app_server_thread_snapshot(
+    paths: &RuntimePaths,
+    target_thread_ids: Option<&BTreeSet<String>>,
+) -> Result<Vec<AppThreadSnapshot>, String> {
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
     let loaded = client.request(
@@ -2324,6 +2412,12 @@ fn app_server_thread_snapshot(paths: &RuntimePaths) -> Result<Vec<AppThreadSnaps
         let Some(thread_id) = thread_id.as_str() else {
             continue;
         };
+        if let Some(targets) = target_thread_ids
+            && !targets.is_empty()
+            && !targets.contains(thread_id)
+        {
+            continue;
+        }
         let response = match client.request(
             "thread/resume",
             json!({
