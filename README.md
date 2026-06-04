@@ -50,6 +50,12 @@ place, preserving the pre-upgrade parent/TTY/process-tree shape. When run from
 inside Codex it uses Phoenix mode: the caller thread is excluded from the idle
 wait and revived by the final resume generation.
 
+Phoenix mode only applies to Codex processes launched by the yolo wrapper. A
+legacy pane launched with `codex` directly does not heartbeat to the yolo server,
+so it cannot receive the resume generation signal. Use
+`external-codex-upgrade-resume` to migrate such panes without replacing the
+existing pane.
+
 `yolo external-codex-upgrade-resume` is for legacy tmux panes that were launched
 with `codex` directly instead of through yolo. It updates the user npm prefix
 used by `~/.npm-global/bin/codex`, optionally updates `/usr/local/bin/codex`
@@ -125,6 +131,16 @@ binary itself.
 default, then restarts the yolo server. It upgrades the yolo binary and does not
 imply a Codex CLI package update. Override it with `YOLO_SELF_UPGRADE_COMMAND`
 when the slave needs a local package or different installer.
+
+## Tests
+
+```sh
+./scripts/phoenix-docker-test.sh
+```
+
+The Phoenix test runs inside Docker with `tests/fake_codex.py`, a fake Codex
+app-server/client pair. It does not touch host tmux sessions or real Codex
+processes.
 
 ## Environment
 
