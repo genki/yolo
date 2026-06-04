@@ -41,10 +41,20 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
+for _ in $(seq 1 50); do
+  before_count="$(grep -c "\"kind\": \"client\"" "$FAKE_CODEX_RUN_LOG" || true)"
+  if [ "$before_count" -ge 1 ]; then
+    break
+  fi
+  sleep 0.2
+done
+
 before_count="$(grep -c "\"kind\": \"client\"" "$FAKE_CODEX_RUN_LOG" || true)"
 if [ "$before_count" -ne 1 ]; then
   echo "expected one client launch before upgrade, got $before_count" >&2
   cat "$FAKE_CODEX_RUN_LOG" >&2 || true
+  echo "--- client stderr ---" >&2
+  cat "$tmp/client.err" >&2 || true
   exit 1
 fi
 
