@@ -95,7 +95,7 @@ Slave:
 
 ```sh
 YOLO_MASTER_URL=https://agent-gate.example/<token>/@localhost:47040 \
-YOLO_SLAVE_ID=kagura \
+YOLO_SLAVE_ID=mars \
 YOLO_MASTER_BEARER_TOKEN=<agent-gate-fine-grained-token> \
 yolo server --daemon
 ```
@@ -113,12 +113,12 @@ curl -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
 curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"action":"codex-upgrade-resume","codex_version":"0.136.0"}' \
-  http://127.0.0.1:47040/federation/slaves/kagura/commands
+  http://127.0.0.1:47040/federation/slaves/mars/commands
 
 curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"action":"yolo-upgrade","yolo_version":"0.5.0"}' \
-  http://127.0.0.1:47040/federation/slaves/kagura/commands
+  http://127.0.0.1:47040/federation/slaves/mars/commands
 ```
 
 `codex-upgrade-resume` waits until slave Codex clients become idle, installs the
