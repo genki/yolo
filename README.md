@@ -43,9 +43,11 @@ With no arguments it resumes `--last`.
 
 `yolo upgrade-resume-all` waits for active app-server threads to become idle,
 updates the yolo-managed Codex CLI, restarts the app-server, then asks live
-yolo clients to resume. When run from inside Codex it uses Phoenix mode: the
-caller thread is excluded from the idle wait and revived by the final resume
-generation.
+yolo clients to resume. Live clients do not manipulate tmux panes during this
+flow; after stopping their Codex child they re-exec the yolo client process in
+place, preserving the pre-upgrade parent/TTY/process-tree shape. When run from
+inside Codex it uses Phoenix mode: the caller thread is excluded from the idle
+wait and revived by the final resume generation.
 
 ## API
 
@@ -107,12 +109,14 @@ curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
 
 `codex-upgrade-resume` waits until slave Codex clients become idle, installs the
 requested `@openai/codex` version into yolo's managed user-writable npm prefix,
-restarts the slave app-server, and asks running yolo clients to resume.
+restarts the slave app-server, and asks running yolo clients to resume. This
+updates the Codex CLI used inside yolo; it is distinct from upgrading the yolo
+binary itself.
 
 `yolo-upgrade` runs `cargo install --git https://github.com/genki/yolo` by
-default, then restarts the yolo server. Override it with
-`YOLO_SELF_UPGRADE_COMMAND` when the slave needs a local package or different
-installer.
+default, then restarts the yolo server. It upgrades the yolo binary and does not
+imply a Codex CLI package update. Override it with `YOLO_SELF_UPGRADE_COMMAND`
+when the slave needs a local package or different installer.
 
 ## Environment
 

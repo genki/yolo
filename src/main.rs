@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -444,7 +445,7 @@ fn run_client(args: Vec<OsString>) {
         .display()
         .to_string();
     let original_args = args.clone();
-    let mut launch_args = args;
+    let launch_args = args;
     let string_args = original_args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
@@ -505,80 +506,63 @@ fn run_client(args: Vec<OsString>) {
         }
     });
 
+    let codex = codex_executable();
+    let mut command = Command::new(codex);
+    command
+        .arg("--remote")
+        .arg(&remote)
+        .arg("--search")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .args(&launch_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("yolo: failed to spawn codex: {err}");
+            std::process::exit(127);
+        }
+    };
+
+    info.codex_pid = Some(child.id());
+    info.updated_at = now_secs();
+    info.ended_at = None;
+    info.exit_code = None;
+    info.status = "running".to_string();
+    let _ = api_post_json(
+        "/clients/register",
+        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+    );
+
     loop {
-        let codex = codex_executable();
-        let mut command = Command::new(codex);
-        command
-            .arg("--remote")
-            .arg(&remote)
-            .arg("--search")
-            .arg("--dangerously-bypass-approvals-and-sandbox")
-            .args(&launch_args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        if restart_requested.swap(false, Ordering::SeqCst) {
+            terminate_child(&mut child);
+            reexec_client_for_resume(&original_args);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() && wait_for_resume_generation_advance(&seen_resume_generation)
+                {
+                    reexec_client_for_resume(&original_args);
+                }
+                info.updated_at = now_secs();
+                info.ended_at = Some(now_secs());
+                info.status = "exited".to_string();
+                info.exit_code = status.code();
+                let _ = api_post_json(
+                    "/clients/finish",
+                    &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                );
+                std::process::exit(info.exit_code.unwrap_or(1));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(200)),
             Err(err) => {
-                eprintln!("yolo: failed to spawn codex: {err}");
-                std::process::exit(127);
-            }
-        };
-
-        info.codex_pid = Some(child.id());
-        info.updated_at = now_secs();
-        info.ended_at = None;
-        info.exit_code = None;
-        info.status = "running".to_string();
-        let _ = api_post_json(
-            "/clients/register",
-            &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-        );
-
-        loop {
-            if restart_requested.swap(false, Ordering::SeqCst) {
-                terminate_child(&mut child);
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success()
-                        && wait_for_resume_generation_advance(&seen_resume_generation)
-                    {
-                        break;
-                    }
-                    info.updated_at = now_secs();
-                    info.ended_at = Some(now_secs());
-                    info.status = "exited".to_string();
-                    info.exit_code = status.code();
-                    let _ = api_post_json(
-                        "/clients/finish",
-                        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-                    );
-                    std::process::exit(info.exit_code.unwrap_or(1));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(200)),
-                Err(err) => {
-                    eprintln!("yolo: failed to wait for codex: {err}");
-                    std::process::exit(1);
-                }
+                eprintln!("yolo: failed to wait for codex: {err}");
+                std::process::exit(1);
             }
         }
-
-        launch_args = resume_args_for(&original_args);
-        info.args = launch_args
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect();
-        info.thread_id = thread_id_from_args(&launch_args);
-        info.status = "restarting".to_string();
-        info.updated_at = now_secs();
-        let _ = api_post_json(
-            "/clients/register",
-            &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-        );
-        thread::sleep(Duration::from_millis(300));
     }
 }
 
@@ -846,6 +830,59 @@ fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
         return args.to_vec();
     }
     vec![OsString::from("resume"), OsString::from("--last")]
+}
+
+fn reexec_client_for_resume(original_args: &[OsString]) -> ! {
+    let resume_args = resume_args_for(original_args);
+    eprintln!(
+        "yolo: re-executing client after app-server restart with args: {}",
+        resume_args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut errors = Vec::new();
+    for exe in yolo_reexec_candidates() {
+        let err = Command::new(&exe).args(&resume_args).exec();
+        errors.push(format!("{}: {err}", exe.display()));
+    }
+    eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
+    std::process::exit(127);
+}
+
+fn yolo_reexec_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(value) = env::var("YOLO_REEXEC_BIN")
+        && !value.trim().is_empty()
+    {
+        out.push(PathBuf::from(value));
+    }
+    if let Some(path_exe) = find_executable_in_path("yolo") {
+        out.push(path_exe);
+    }
+    if let Ok(exe) = env::current_exe()
+        && !exe.to_string_lossy().contains("(deleted)")
+    {
+        out.push(exe);
+    }
+    out.push(PathBuf::from("yolo"));
+
+    let mut seen = BTreeSet::new();
+    out.into_iter()
+        .filter(|path| seen.insert(path.display().to_string()))
+        .collect()
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn thread_id_from_args(args: &[OsString]) -> Option<String> {
