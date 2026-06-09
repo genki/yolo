@@ -72,6 +72,8 @@ struct ServerInfo {
     version: String,
     pid: u32,
     app_server_pid: Option<u32>,
+    #[serde(default)]
+    app_server_generation: u64,
     resume_generation: u64,
     api_socket: String,
     app_server_socket: String,
@@ -84,6 +86,7 @@ struct ServerInfo {
 struct ServerState {
     started_at: u64,
     app_server_pid: Option<u32>,
+    app_server_generation: u64,
     resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
     slaves: BTreeMap<String, SlaveInfo>,
@@ -204,6 +207,18 @@ struct UpgradeResumeAllRequest {
     ignore_cwd: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RefreshResumeRequest {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
 fn main() {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
 
@@ -261,6 +276,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("refresh-resume") | Some("resume-refresh") => {
+            args.remove(0);
+            if let Err(err) = run_refresh_resume(args) {
+                eprintln!("yolo refresh-resume: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("client") => {
             args.remove(0);
             run_client(args);
@@ -285,6 +307,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     let state = Arc::new(Mutex::new(ServerState {
         started_at: now_secs(),
         app_server_pid: None,
+        app_server_generation: 0,
         resume_generation: 0,
         clients: BTreeMap::new(),
         slaves: BTreeMap::new(),
@@ -349,7 +372,7 @@ fn spawn_server_daemon() -> Result<(), String> {
     wait_for_server_ready(&paths, Duration::from_secs(10))
 }
 
-fn spawn_app_server(paths: &RuntimePaths) -> Result<Child, String> {
+fn spawn_app_server(paths: &RuntimePaths, cwd: Option<&Path>) -> Result<Child, String> {
     let codex = codex_executable();
     let log = fs::OpenOptions::new()
         .create(true)
@@ -359,7 +382,11 @@ fn spawn_app_server(paths: &RuntimePaths) -> Result<Child, String> {
     let log2 = log
         .try_clone()
         .map_err(|err| format!("clone app-server log: {err}"))?;
-    Command::new(codex)
+    let mut command = Command::new(codex);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command
         .arg("app-server")
         .arg("--listen")
         .arg(format!("unix://{}", paths.app_server_socket.display()))
@@ -375,7 +402,7 @@ fn spawn_tracked_app_server(
     paths: RuntimePaths,
 ) -> Result<u32, String> {
     remove_socket_if_present(&paths.app_server_socket)?;
-    let mut app_server = spawn_app_server(&paths)?;
+    let mut app_server = spawn_app_server(&paths, None)?;
     let pid = app_server.id();
     if let Ok(mut state) = state.lock() {
         state.app_server_pid = Some(pid);
@@ -426,7 +453,24 @@ fn restart_tracked_app_server(
     state: Arc<Mutex<ServerState>>,
     paths: RuntimePaths,
 ) -> Result<u32, String> {
+    restart_tracked_app_server_with_cwd(state, paths, None)
+}
+
+fn restart_tracked_app_server_with_cwd(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    cwd: Option<PathBuf>,
+) -> Result<u32, String> {
     let old_pid = state.lock().ok().and_then(|state| state.app_server_pid);
+    if let Ok(mut state) = state.lock() {
+        state.app_server_generation = state.app_server_generation.saturating_add(1);
+        for client in state.clients.values_mut() {
+            if client.status == "running" {
+                client.status = "restarting".to_string();
+                client.updated_at = now_secs();
+            }
+        }
+    }
     if let Some(pid) = old_pid {
         let _ = Command::new("kill")
             .arg("-TERM")
@@ -434,7 +478,31 @@ fn restart_tracked_app_server(
             .status();
         wait_for_pid_exit(pid, Duration::from_secs(5));
     }
-    spawn_tracked_app_server(state, paths)
+    remove_socket_if_present(&paths.app_server_socket)?;
+    let mut app_server = spawn_app_server(&paths, cwd.as_deref())?;
+    let pid = app_server.id();
+    if let Ok(mut state) = state.lock() {
+        state.app_server_pid = Some(pid);
+    }
+
+    let monitor_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let status = app_server.wait().ok();
+        if let Ok(mut state) = monitor_state.lock()
+            && state.app_server_pid == Some(pid)
+        {
+            state.app_server_pid = None;
+            for client in state.clients.values_mut() {
+                if matches!(client.status.as_str(), "running" | "restarting") {
+                    client.status = "app-server-exited".to_string();
+                    client.updated_at = now_secs();
+                }
+            }
+        }
+        eprintln!("yolo server: codex app-server pid {pid} exited: {status:?}");
+    });
+
+    Ok(pid)
 }
 
 fn run_client(args: Vec<OsString>) {
@@ -459,7 +527,9 @@ fn run_client(args: Vec<OsString>) {
         .display()
         .to_string();
     let original_args = args.clone();
-    let launch_args = args;
+    let codex_cwd = effective_codex_cwd(&args, &cwd);
+    ensure_codex_project_trusted(&codex_cwd);
+    let launch_args = codex_args_with_cwd(args, &cwd);
     let string_args = original_args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
@@ -469,6 +539,8 @@ fn run_client(args: Vec<OsString>) {
     let initial_service_tier = initial_config.service_tier.clone();
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
     let thread_id = thread_id_from_args(&original_args);
+    repair_resume_session_cwd(&original_args, &codex_cwd);
+    reinforce_loaded_resume_permissions(&paths.app_server_socket, &original_args);
     if let Some(thread_id) = thread_id.as_deref()
         && let Some(existing) = running_duplicate_thread_client(thread_id, std::process::id())
     {
@@ -481,7 +553,7 @@ fn run_client(args: Vec<OsString>) {
         id: client_id.clone(),
         yolo_pid: std::process::id(),
         codex_pid: None,
-        cwd,
+        cwd: cwd.clone(),
         args: string_args,
         remote: remote.clone(),
         model: initial_config.model,
@@ -503,7 +575,7 @@ fn run_client(args: Vec<OsString>) {
     let heartbeat_id = client_id.clone();
     let restart_requested = Arc::new(AtomicBool::new(false));
     let heartbeat_restart_requested = Arc::clone(&restart_requested);
-    let seen_resume_generation = Arc::new(AtomicU64::new(current_resume_generation()));
+    let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
     thread::spawn(move || {
         loop {
@@ -515,8 +587,7 @@ fn run_client(args: Vec<OsString>) {
             });
             match api_post_json("/clients/heartbeat", &body) {
                 Ok(value) => {
-                    if let Some(generation) = value.get("resume_generation").and_then(Value::as_u64)
-                    {
+                    if let Some(generation) = restart_generation_from_status(&value) {
                         let seen = heartbeat_seen_generation.load(Ordering::SeqCst);
                         if generation > seen {
                             heartbeat_seen_generation.store(generation, Ordering::SeqCst);
@@ -532,6 +603,7 @@ fn run_client(args: Vec<OsString>) {
     let codex = codex_executable();
     let mut command = Command::new(codex);
     command
+        .current_dir(&cwd)
         .arg("--remote")
         .arg(&remote)
         .arg("--search")
@@ -566,8 +638,11 @@ fn run_client(args: Vec<OsString>) {
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !status.success() && wait_for_resume_generation_advance(&seen_resume_generation)
-                {
+                if should_reexec_after_codex_exit(
+                    status.success(),
+                    &original_args,
+                    &seen_resume_generation,
+                ) {
                     reexec_client_for_resume(&original_args);
                 }
                 info.updated_at = now_secs();
@@ -589,21 +664,714 @@ fn run_client(args: Vec<OsString>) {
     }
 }
 
+fn codex_args_with_cwd(args: Vec<OsString>, cwd: &str) -> Vec<OsString> {
+    if has_explicit_codex_cwd_arg(&args) {
+        return args;
+    }
+
+    let mut out = Vec::with_capacity(args.len() + 2);
+    out.push(OsString::from("--cd"));
+    out.push(OsString::from(cwd));
+    out.extend(args);
+    out
+}
+
+fn has_explicit_codex_cwd_arg(args: &[OsString]) -> bool {
+    args.iter().any(|arg| {
+        let Some(arg) = arg.to_str() else {
+            return false;
+        };
+        arg == "--cd" || arg == "-C" || arg.starts_with("--cd=")
+    })
+}
+
+fn effective_codex_cwd(args: &[OsString], launch_cwd: &str) -> String {
+    let Some(raw) = explicit_codex_cwd_arg(args) else {
+        return launch_cwd.to_string();
+    };
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path.display().to_string()
+    } else {
+        PathBuf::from(launch_cwd).join(path).display().to_string()
+    }
+}
+
+fn explicit_codex_cwd_arg(args: &[OsString]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--cd" || arg == "-C" {
+            return iter
+                .next()
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string);
+        }
+        if let Some(value) = arg.strip_prefix("--cd=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn ensure_codex_project_trusted(cwd: &str) {
+    if let Err(err) = ensure_codex_project_trusted_inner(cwd) {
+        eprintln!("yolo: failed to persist Codex trusted project for {cwd}: {err}");
+    }
+}
+
+fn ensure_codex_project_trusted_inner(cwd: &str) -> Result<(), String> {
+    let path = codex_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let input = fs::read_to_string(&path).unwrap_or_default();
+    let output = trusted_project_config(&input, cwd);
+    if output != input {
+        fs::write(&path, output).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn trusted_project_config(input: &str, cwd: &str) -> String {
+    let header = format!("[projects.\"{}\"]", toml_basic_string_escape(cwd));
+    let mut lines = input
+        .split_inclusive('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut section_start = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if line.trim() == header {
+            section_start = Some(idx);
+            break;
+        }
+    }
+
+    let Some(start) = section_start else {
+        let mut output = input.to_string();
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&header);
+        output.push('\n');
+        output.push_str("trust_level = \"trusted\"\n");
+        return output;
+    };
+
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with('[') && !trimmed.starts_with("[[")).then_some(idx)
+        })
+        .unwrap_or(lines.len());
+
+    for idx in start + 1..section_end {
+        let trimmed = lines[idx].trim_start();
+        if trimmed.starts_with("trust_level") {
+            let newline = if lines[idx].ends_with('\n') { "\n" } else { "" };
+            lines[idx] = format!("trust_level = \"trusted\"{newline}");
+            return lines.concat();
+        }
+    }
+
+    lines.insert(start + 1, "trust_level = \"trusted\"\n".to_string());
+    lines.concat()
+}
+
+fn toml_basic_string_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeTarget {
+    Last,
+    Thread(String),
+}
+
+fn repair_resume_session_cwd(args: &[OsString], cwd: &str) {
+    let Some(target) = resume_target_from_args(args) else {
+        return;
+    };
+    if let Err(err) = repair_resume_target(&target, cwd) {
+        eprintln!(
+            "yolo: failed to repair Codex resume state for {:?}: {err}",
+            target
+        );
+    }
+}
+
+fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString]) {
+    let Some(thread_id) = resume_thread_id(args) else {
+        return;
+    };
+    if let Err(err) = update_app_server_thread_permissions(socket, &thread_id) {
+        eprintln!("yolo: failed to update loaded Codex thread permissions for {thread_id}: {err}");
+    }
+}
+
+fn resume_thread_id(args: &[OsString]) -> Option<String> {
+    let target = resume_target_from_args(args)?;
+    match target {
+        ResumeTarget::Thread(thread_id) => Some(thread_id),
+        ResumeTarget::Last => session_path_for_resume_target(&ResumeTarget::Last)
+            .as_deref()
+            .and_then(session_id_from_path),
+    }
+}
+
+fn resume_target_from_args(args: &[OsString]) -> Option<ResumeTarget> {
+    let resume_idx = args
+        .iter()
+        .position(|arg| matches!(arg.to_str(), Some("resume")))?;
+    for arg in args
+        .iter()
+        .skip(resume_idx + 1)
+        .filter_map(|arg| arg.to_str())
+    {
+        if arg == "--last" {
+            return Some(ResumeTarget::Last);
+        }
+        if !arg.starts_with('-') {
+            return Some(ResumeTarget::Thread(arg.to_string()));
+        }
+    }
+    None
+}
+
+fn session_path_for_resume_target(target: &ResumeTarget) -> Option<PathBuf> {
+    let mut paths = Vec::new();
+    collect_session_paths(&codex_sessions_dir()?, &mut paths);
+    match target {
+        ResumeTarget::Thread(thread_id) => paths.into_iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(thread_id))
+        }),
+        ResumeTarget::Last => paths
+            .into_iter()
+            .filter_map(|path| {
+                let modified = fs::metadata(&path).ok()?.modified().ok()?;
+                Some((modified, path))
+            })
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, path)| path),
+    }
+}
+
+fn repair_resume_thread_id(thread_id: &str, cwd: &str) -> Result<(), String> {
+    repair_resume_target(&ResumeTarget::Thread(thread_id.to_string()), cwd)
+}
+
+fn repair_resume_target(target: &ResumeTarget, cwd: &str) -> Result<(), String> {
+    let Some(path) = session_path_for_resume_target(target) else {
+        return Ok(());
+    };
+    let thread_id = match target {
+        ResumeTarget::Thread(thread_id) => Some(thread_id.clone()),
+        ResumeTarget::Last => session_id_from_path(&path),
+    };
+    rewrite_session_meta_cwd(&path, cwd).map_err(|err| format!("{}: {err}", path.display()))?;
+    if let Some(thread_id) = thread_id {
+        rewrite_state_thread_cwd(&thread_id, cwd)?;
+    }
+    Ok(())
+}
+
+fn codex_sessions_dir() -> Option<PathBuf> {
+    if let Some(codex_home) = env::var_os("CODEX_HOME") {
+        return Some(PathBuf::from(codex_home).join("sessions"));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+fn collect_session_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_session_paths(&path, out);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+fn session_id_from_path(path: &Path) -> Option<String> {
+    if let Ok(input) = fs::read_to_string(path) {
+        for line in input.lines().take(20) {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+                continue;
+            }
+            if let Some(id) = value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+            {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    let name = path.file_name()?.to_string_lossy();
+    let marker = "rollout-";
+    let start = name.find(marker)?;
+    let suffix = &name[start + marker.len()..];
+    let id_start = suffix.find("019e")?;
+    let candidate = suffix[id_start..].trim_end_matches(".jsonl");
+    (!candidate.is_empty()).then(|| candidate.to_string())
+}
+
+fn rewrite_state_thread_cwd(thread_id: &str, cwd: &str) -> Result<(), String> {
+    let Some(dir) = codex_home_dir() else {
+        return Ok(());
+    };
+    let mut updated = false;
+    for db in codex_state_db_paths(&dir) {
+        let sql = format!(
+            "UPDATE threads SET cwd = {cwd}, sandbox_policy = {sandbox}, approval_mode = 'never' WHERE id = {thread_id};",
+            cwd = sqlite_quote(cwd),
+            sandbox = sqlite_quote(YOLO_SANDBOX_POLICY_JSON),
+            thread_id = sqlite_quote(thread_id)
+        );
+        let status = Command::new("sqlite3")
+            .arg(&db)
+            .arg(sql)
+            .status()
+            .map_err(|err| err.to_string())?;
+        if !status.success() {
+            return Err(format_exit_status(
+                &format!("sqlite3 {}", db.display()),
+                status,
+            ));
+        }
+        updated = true;
+    }
+    let _ = updated;
+    Ok(())
+}
+
+fn codex_home_dir() -> Option<PathBuf> {
+    if let Some(codex_home) = env::var_os("CODEX_HOME") {
+        return Some(PathBuf::from(codex_home));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+}
+
+fn codex_state_db_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            name.starts_with("state_") && name.ends_with(".sqlite")
+        })
+        .collect()
+}
+
+const YOLO_SANDBOX_POLICY_JSON: &str = r#"{"type":"disabled"}"#;
+const YOLO_APP_SERVER_SANDBOX_POLICY: &str = "dangerFullAccess";
+const YOLO_PERMISSIONS_INSTRUCTIONS: &str = r#"<permissions instructions>
+Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted. Network access is enabled.
+Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
+</permissions instructions>"#;
+
+fn sqlite_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<(), String> {
+    let input = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut changed = false;
+    let mut output = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let raw = line.trim_end_matches('\n');
+        if raw.contains("\"session_meta\"") || raw.contains("\"turn_context\"") {
+            if let Ok(mut value) = serde_json::from_str::<Value>(raw)
+                && matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("session_meta" | "turn_context")
+                )
+            {
+                let is_turn_context =
+                    value.get("type").and_then(Value::as_str) == Some("turn_context");
+                if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                    if payload.get("cwd").and_then(Value::as_str) != Some(cwd) {
+                        payload.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                        changed = true;
+                    }
+                    if is_turn_context {
+                        let sandbox = json!({"type": "danger-full-access"});
+                        if payload.get("sandbox_policy") != Some(&sandbox) {
+                            payload.insert("sandbox_policy".to_string(), sandbox);
+                            changed = true;
+                        }
+                        if payload.get("approval_policy").and_then(Value::as_str) != Some("never") {
+                            payload.insert(
+                                "approval_policy".to_string(),
+                                Value::String("never".to_string()),
+                            );
+                            changed = true;
+                        }
+                        let permission_profile = json!({"type": "disabled"});
+                        if payload.get("permission_profile") != Some(&permission_profile) {
+                            payload.insert("permission_profile".to_string(), permission_profile);
+                            changed = true;
+                        }
+                    }
+                    output.push_str(&serde_json::to_string(&value).map_err(|err| err.to_string())?);
+                    if has_newline {
+                        output.push('\n');
+                    }
+                    continue;
+                }
+            }
+        }
+        if raw.contains("<permissions instructions>")
+            || raw.contains("<environment_context>")
+            || raw.contains("sandbox_mode")
+        {
+            if let Ok(mut value) = serde_json::from_str::<Value>(raw)
+                && value.get("type").and_then(Value::as_str) == Some("response_item")
+                && repair_resume_context_message(&mut value, cwd)
+            {
+                changed = true;
+                output.push_str(&serde_json::to_string(&value).map_err(|err| err.to_string())?);
+                if has_newline {
+                    output.push('\n');
+                }
+                continue;
+            }
+        }
+        output.push_str(raw);
+        if has_newline {
+            output.push('\n');
+        }
+    }
+    if changed {
+        fs::write(path, output).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn repair_resume_context_message(value: &mut Value, cwd: &str) -> bool {
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return false;
+    }
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(content) = payload.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for item in content {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("input_text") {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if role == "developer"
+            && text.contains("<permissions instructions>")
+            && (text.contains("sandbox_mode") || text.contains("Approval policy"))
+            && text != YOLO_PERMISSIONS_INSTRUCTIONS
+        {
+            item.insert(
+                "text".to_string(),
+                Value::String(YOLO_PERMISSIONS_INSTRUCTIONS.to_string()),
+            );
+            changed = true;
+            continue;
+        }
+        if role == "user" && text.contains("<environment_context>") && text.contains("<filesystem>")
+        {
+            let replacement = yolo_environment_context(cwd);
+            if text != replacement {
+                item.insert("text".to_string(), Value::String(replacement));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn yolo_environment_context(cwd: &str) -> String {
+    format!(
+        r#"<environment_context>
+  <cwd>{cwd}</cwd>
+  <filesystem><workspace_roots><root>{cwd}</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
+</environment_context>"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn string_args(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn codex_args_with_cwd_injects_launch_cwd() {
+        let args = codex_args_with_cwd(os_args(&["resume", "--last"]), "/home/vagrant/head");
+        assert_eq!(
+            string_args(args),
+            vec!["--cd", "/home/vagrant/head", "resume", "--last"]
+        );
+    }
+
+    #[test]
+    fn codex_args_with_cwd_keeps_explicit_cd() {
+        let args = codex_args_with_cwd(os_args(&["--cd", "/tmp", "resume", "--last"]), "/home");
+        assert_eq!(string_args(args), vec!["--cd", "/tmp", "resume", "--last"]);
+
+        let args = codex_args_with_cwd(os_args(&["--cd=/tmp", "resume", "--last"]), "/home");
+        assert_eq!(string_args(args), vec!["--cd=/tmp", "resume", "--last"]);
+
+        let args = codex_args_with_cwd(os_args(&["-C", "/tmp", "resume", "--last"]), "/home");
+        assert_eq!(string_args(args), vec!["-C", "/tmp", "resume", "--last"]);
+    }
+
+    #[test]
+    fn effective_codex_cwd_uses_explicit_cd() {
+        assert_eq!(
+            effective_codex_cwd(&os_args(&["resume", "--last"]), "/home/vagrant/head"),
+            "/home/vagrant/head"
+        );
+        assert_eq!(
+            effective_codex_cwd(&os_args(&["--cd", "/tmp", "resume"]), "/home/vagrant/head"),
+            "/tmp"
+        );
+        assert_eq!(
+            effective_codex_cwd(&os_args(&["--cd=child", "resume"]), "/home/vagrant/head"),
+            "/home/vagrant/head/child"
+        );
+    }
+
+    #[test]
+    fn trusted_project_config_adds_or_updates_project() {
+        let input = "[projects.\"/home/vagrant/websh\"]\ntrust_level = \"trusted\"\n";
+        let output = trusted_project_config(input, "/home/vagrant/head");
+        assert!(output.contains("[projects.\"/home/vagrant/websh\"]"));
+        assert!(output.contains("[projects.\"/home/vagrant/head\"]\ntrust_level = \"trusted\""));
+
+        let input = "[projects.\"/home/vagrant/head\"]\ntrust_level = \"untrusted\"\n";
+        let output = trusted_project_config(input, "/home/vagrant/head");
+        assert_eq!(
+            output,
+            "[projects.\"/home/vagrant/head\"]\ntrust_level = \"trusted\"\n"
+        );
+
+        let input = "[projects.\"/home/vagrant/head\"]\nfoo = \"bar\"\n";
+        let output = trusted_project_config(input, "/home/vagrant/head");
+        assert_eq!(
+            output,
+            "[projects.\"/home/vagrant/head\"]\ntrust_level = \"trusted\"\nfoo = \"bar\"\n"
+        );
+    }
+
+    #[test]
+    fn resume_target_from_args_detects_thread_and_last() {
+        assert_eq!(
+            resume_target_from_args(&os_args(&["resume", "019e-test"])),
+            Some(ResumeTarget::Thread("019e-test".to_string()))
+        );
+        assert_eq!(
+            resume_target_from_args(&os_args(&["resume", "--last"])),
+            Some(ResumeTarget::Last)
+        );
+        assert_eq!(resume_target_from_args(&os_args(&["hello"])), None);
+    }
+
+    #[test]
+    fn rewrite_session_meta_cwd_updates_turn_contexts() {
+        let path = env::temp_dir().join(format!(
+            "yolo-session-cwd-test-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/home/vagrant\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/home/vagrant\",\"workspace_roots\":[\"/home/vagrant/websh\"]}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/home/vagrant\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"cwd\":\"/home/vagrant\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        rewrite_session_meta_cwd(&path, "/home/vagrant/websh").unwrap();
+        let output = fs::read_to_string(&path).unwrap();
+        let rows = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows[0]["payload"]["cwd"].as_str(),
+            Some("/home/vagrant/websh")
+        );
+        assert_eq!(
+            rows[1]["payload"]["cwd"].as_str(),
+            Some("/home/vagrant/websh")
+        );
+        assert_eq!(
+            rows[2]["payload"]["cwd"].as_str(),
+            Some("/home/vagrant/websh")
+        );
+        assert_eq!(rows[3]["payload"]["cwd"].as_str(), Some("/home/vagrant"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rewrite_session_meta_cwd_repairs_stale_read_only_context_messages() {
+        let path = env::temp_dir().join(format!(
+            "yolo-session-permission-test-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"<permissions instructions>\\nFilesystem sandboxing defines which files can be read or written. `sandbox_mode` is `read-only`: The sandbox only permits reading files.\\n# Escalation Requests\\nProvide the `sandbox_permissions` parameter with the value `require_escalated`.\\n</permissions instructions>\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<environment_context>\\n  <filesystem><workspace_roots><root>/home/vagrant/head</root></workspace_roots><permission_profile type=\\\"managed\\\"><file_system type=\\\"restricted\\\"><entry access=\\\"read\\\"><special>:root</special></entry></file_system></permission_profile></filesystem>\\n</environment_context>\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        rewrite_session_meta_cwd(&path, "/home/vagrant/head").unwrap();
+        let output = fs::read_to_string(&path).unwrap();
+
+        assert!(output.contains("sandbox_mode` is `danger-full-access`"));
+        assert!(output.contains("Approval policy is currently never"));
+        assert!(output.contains("permission_profile type=\\\"disabled\\\""));
+        assert!(!output.contains("read-only"));
+        assert!(!output.contains("require_escalated"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_id_from_path_reads_session_meta() {
+        let path = env::temp_dir().join(format!(
+            "rollout-2026-06-07T00-00-00-019etest-from-name.jsonl"
+        ));
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019etest-from-meta\",\"cwd\":\"/tmp\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_id_from_path(&path),
+            Some("019etest-from-meta".to_string())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_quote_escapes_single_quotes() {
+        assert_eq!(sqlite_quote("/tmp/it's"), "'/tmp/it''s'");
+    }
+}
+
 fn wait_for_resume_generation_advance(seen_resume_generation: &AtomicU64) -> bool {
-    let seen = seen_resume_generation.load(Ordering::SeqCst);
     let start = SystemTime::now();
     while start.elapsed().unwrap_or_default() < RESUME_GENERATION_GRACE {
-        if let Ok(value) = api_get_json("/status")
-            && let Some(generation) = value.get("resume_generation").and_then(Value::as_u64)
-            && generation > seen
-        {
-            seen_resume_generation.store(generation, Ordering::SeqCst);
+        if resume_generation_advanced(seen_resume_generation) {
             eprintln!(
                 "yolo: Codex child exited during app-server restart; resuming via Phoenix mode"
             );
             return true;
         }
         thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+fn should_reexec_after_codex_exit(
+    success: bool,
+    original_args: &[OsString],
+    seen_resume_generation: &AtomicU64,
+) -> bool {
+    if resume_generation_advanced(seen_resume_generation) {
+        return true;
+    }
+    if success {
+        return false;
+    }
+    if wait_for_resume_generation_advance(seen_resume_generation) {
+        return true;
+    }
+    if resume_target_from_args(original_args).is_some() && wait_for_app_server_reconnect() {
+        eprintln!("yolo: Codex child lost the app-server transport; app-server is back, resuming");
+        return true;
+    }
+    false
+}
+
+fn wait_for_app_server_reconnect() -> bool {
+    let Ok(paths) = runtime_paths() else {
+        return false;
+    };
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < RESUME_GENERATION_GRACE {
+        if paths.api_socket.exists()
+            && paths.app_server_socket.exists()
+            && api_get_json("/status").is_ok()
+            && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+fn resume_generation_advanced(seen_resume_generation: &AtomicU64) -> bool {
+    let seen = seen_resume_generation.load(Ordering::SeqCst);
+    if let Ok(value) = api_get_json("/status")
+        && let Some(generation) = restart_generation_from_status(&value)
+        && generation > seen
+    {
+        seen_resume_generation.store(generation, Ordering::SeqCst);
+        return true;
     }
     false
 }
@@ -916,6 +1684,48 @@ fn run_configure(args: Vec<OsString>) -> Result<(), String> {
         serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
     );
     Ok(())
+}
+
+fn run_refresh_resume(args: Vec<OsString>) -> Result<(), String> {
+    ensure_server()?;
+    let request = parse_refresh_resume_args(args)?;
+    let value = api_post_json(
+        "/clients/refresh-resume",
+        &serde_json::to_value(&request).map_err(|err| err.to_string())?,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn parse_refresh_resume_args(args: Vec<OsString>) -> Result<RefreshResumeRequest, String> {
+    let mut request = RefreshResumeRequest::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy().to_string();
+        let mut value_for = |name: &str| -> Result<String, String> {
+            iter.next()
+                .map(|value| value.to_string_lossy().to_string())
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+        match arg.as_str() {
+            "--all" => request.all = true,
+            "--client" | "--client-id" => request.client_id = Some(value_for(&arg)?),
+            "--thread" | "--thread-id" => request.thread_id = Some(value_for(&arg)?),
+            "--cwd" => request.cwd = Some(value_for(&arg)?),
+            _ => return Err(format!("unknown refresh-resume argument: {arg}")),
+        }
+    }
+    if !request.all
+        && request.client_id.is_none()
+        && request.thread_id.is_none()
+        && request.cwd.is_none()
+    {
+        return Err("refresh-resume requires --all, --client, --thread, or --cwd".to_string());
+    }
+    Ok(request)
 }
 
 fn parse_configure_args(args: Vec<OsString>) -> Result<ConfigureClientsRequest, String> {
@@ -1232,11 +2042,23 @@ fn thread_id_from_args_strs(args: &[String]) -> Option<String> {
         .cloned()
 }
 
-fn current_resume_generation() -> u64 {
+fn current_restart_generation() -> u64 {
     api_get_json("/status")
         .ok()
-        .and_then(|value| value.get("resume_generation").and_then(Value::as_u64))
+        .and_then(|value| restart_generation_from_status(&value))
         .unwrap_or(0)
+}
+
+fn restart_generation_from_status(value: &Value) -> Option<u64> {
+    let resume_generation = value
+        .get("resume_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let app_server_generation = value
+        .get("app_server_generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(resume_generation.max(app_server_generation))
 }
 
 fn ensure_server() -> Result<(), String> {
@@ -1618,6 +2440,7 @@ fn run_codex_upgrade_resume_all_local(
                 return Ok(json!({
                     "ok": true,
                     "app_server_pid": app_server_pid,
+                    "app_server_generation": state.app_server_generation,
                     "resume_generation": generation,
                     "codex_version": codex_version,
                     "clients": state.clients.len()
@@ -1625,6 +2448,81 @@ fn run_codex_upgrade_resume_all_local(
             }
             Err("server state lock poisoned".to_string())
         })
+}
+
+fn refresh_resume_clients(
+    state: Arc<Mutex<ServerState>>,
+    request: RefreshResumeRequest,
+) -> Result<Value, String> {
+    let clients = {
+        let state = state
+            .lock()
+            .map_err(|_| "server state lock poisoned".to_string())?;
+        state
+            .clients
+            .values()
+            .filter(|client| client.status == "running")
+            .filter(|client| refresh_resume_request_matches(&request, client))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if clients.is_empty() {
+        return Ok(json!({"ok": true, "matched": 0, "resume_generation": null}));
+    }
+
+    let mut repaired = Vec::new();
+    let mut errors = Vec::new();
+    for client in &clients {
+        let Some(thread_id) = client.thread_id.as_deref() else {
+            continue;
+        };
+        match repair_resume_thread_id(thread_id, &client.cwd) {
+            Ok(()) => repaired.push(json!({
+                "client_id": client.id,
+                "thread_id": thread_id,
+                "cwd": client.cwd
+            })),
+            Err(err) => errors.push(json!({
+                "client_id": client.id,
+                "thread_id": thread_id,
+                "cwd": client.cwd,
+                "error": err
+            })),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!("failed to repair resume contexts: {errors:?}"));
+    }
+
+    let generation = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "server state lock poisoned".to_string())?;
+        state.resume_generation = state.resume_generation.saturating_add(1);
+        state.resume_generation
+    };
+    Ok(json!({
+        "ok": true,
+        "matched": clients.len(),
+        "repaired": repaired,
+        "resume_generation": generation
+    }))
+}
+
+fn refresh_resume_request_matches(request: &RefreshResumeRequest, client: &ClientInfo) -> bool {
+    request.all
+        || request
+            .client_id
+            .as_deref()
+            .is_some_and(|value| value == client.id)
+        || request
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| client.thread_id.as_deref() == Some(value))
+        || request
+            .cwd
+            .as_deref()
+            .is_some_and(|value| value == client.cwd)
 }
 
 fn upgrade_yolo(command: &SlaveCommand) -> Result<Value, String> {
@@ -1712,10 +2610,12 @@ fn handle_api_connection(
             match parsed {
                 Ok(value) => {
                     let mut resume_generation = 0;
+                    let mut app_server_generation = 0;
                     if let Some(id) = value.get("id").and_then(Value::as_str)
                         && let Ok(mut state) = state.lock()
                     {
                         resume_generation = state.resume_generation;
+                        app_server_generation = state.app_server_generation;
                         if let Some(client) = state.clients.get_mut(id) {
                             client.updated_at = value
                                 .get("updated_at")
@@ -1747,7 +2647,11 @@ fn handle_api_connection(
                     }
                     json_response(
                         200,
-                        &json!({"ok": true, "resume_generation": resume_generation}),
+                        &json!({
+                            "ok": true,
+                            "app_server_generation": app_server_generation,
+                            "resume_generation": resume_generation
+                        }),
                     )
                 }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
@@ -1773,6 +2677,15 @@ fn handle_api_connection(
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
             }
         }
+        ("POST", "/clients/refresh-resume") => {
+            match serde_json::from_str::<RefreshResumeRequest>(body) {
+                Ok(request) => match refresh_resume_clients(Arc::clone(&state), request) {
+                    Ok(value) => json_response(200, &value),
+                    Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+                },
+                Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
+        }
         ("POST", "/upgrade-resume-all") => {
             let request = serde_json::from_str::<UpgradeResumeAllRequest>(body).unwrap_or_default();
             let version = request.codex_version.as_deref();
@@ -1781,6 +2694,49 @@ fn handle_api_connection(
             match result {
                 Ok(value) => json_response(200, &value),
                 Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+            }
+        }
+        ("POST", "/app-server/restart") => {
+            let parsed = serde_json::from_str::<Value>(body);
+            match parsed {
+                Ok(value) => {
+                    let cwd = value.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+                    if let Some(invalid_cwd) = cwd
+                        .as_deref()
+                        .filter(|cwd| !cwd.is_absolute() || !cwd.is_dir())
+                    {
+                        json_response(
+                            400,
+                            &json!({"ok": false, "error": format!("invalid cwd: {}", invalid_cwd.display())}),
+                        )
+                    } else {
+                        match restart_tracked_app_server_with_cwd(
+                            Arc::clone(&state),
+                            paths.clone(),
+                            cwd,
+                        ) {
+                            Ok(pid) => {
+                                let (app_server_generation, resume_generation) = state
+                                    .lock()
+                                    .map(|state| {
+                                        (state.app_server_generation, state.resume_generation)
+                                    })
+                                    .unwrap_or_default();
+                                json_response(
+                                    200,
+                                    &json!({
+                                        "ok": true,
+                                        "app_server_pid": pid,
+                                        "app_server_generation": app_server_generation,
+                                        "resume_generation": resume_generation
+                                    }),
+                                )
+                            }
+                            Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+                        }
+                    }
+                }
+                Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
             }
         }
         ("POST", "/shutdown") => {
@@ -2565,6 +3521,7 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         version: VERSION.to_string(),
         pid: std::process::id(),
         app_server_pid: state.app_server_pid,
+        app_server_generation: state.app_server_generation,
         resume_generation: state.resume_generation,
         api_socket: paths.api_socket.display().to_string(),
         app_server_socket: paths.app_server_socket.display().to_string(),
@@ -2625,6 +3582,23 @@ fn app_server_thread_snapshot(
         }
     }
     Ok(threads)
+}
+
+fn update_app_server_thread_permissions(socket: &Path, thread_id: &str) -> Result<(), String> {
+    let mut client = AppServerRpcClient::connect(socket)?;
+    client.initialize()?;
+    client.request(
+        "thread/settings/update",
+        json!({
+            "threadId": thread_id,
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandboxPolicy": {
+                "type": YOLO_APP_SERVER_SANDBOX_POLICY
+            }
+        }),
+    )?;
+    Ok(())
 }
 
 fn apply_app_thread_settings(snapshot: &mut AppThreadSnapshot, response: &Value) {
