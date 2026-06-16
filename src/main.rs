@@ -432,10 +432,24 @@ fn ensure_tracked_app_server(
     state: Arc<Mutex<ServerState>>,
     paths: RuntimePaths,
 ) -> Result<Option<u32>, String> {
+    let existing_pids = find_app_server_pids(&paths);
+    if existing_pids.len() > 1 {
+        eprintln!(
+            "yolo server: found duplicate codex app-servers for unix://{}: {:?}; restarting app-server",
+            paths.app_server_socket.display(),
+            existing_pids
+        );
+        terminate_app_servers_for_socket(&paths, Duration::from_secs(2));
+        remove_socket_if_present(&paths.app_server_socket)?;
+        return spawn_tracked_app_server(state, paths).map(Some);
+    }
     if paths.app_server_socket.exists()
         && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
     {
-        let pid = find_app_server_pid(&paths);
+        let pid = existing_pids
+            .first()
+            .copied()
+            .or_else(|| find_app_server_pid(&paths));
         if let Ok(mut state) = state.lock() {
             state.app_server_pid = pid;
         }
@@ -472,12 +486,9 @@ fn restart_tracked_app_server_with_cwd(
         }
     }
     if let Some(pid) = old_pid {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
-        wait_for_pid_exit(pid, Duration::from_secs(5));
+        terminate_pid_tree(pid, Duration::from_secs(2));
     }
+    terminate_app_servers_for_socket(&paths, Duration::from_secs(2));
     remove_socket_if_present(&paths.app_server_socket)?;
     let mut app_server = spawn_app_server(&paths, cwd.as_deref())?;
     let pid = app_server.id();
@@ -1877,20 +1888,6 @@ fn wait_for_server_stopped(timeout: Duration) -> Result<(), String> {
     Err("server did not stop after shutdown request".to_string())
 }
 
-fn wait_for_pid_exit(pid: u32, timeout: Duration) {
-    let start = SystemTime::now();
-    while start.elapsed().unwrap_or_default() < timeout {
-        if !pid_is_alive(pid) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .status();
-}
-
 fn terminate_pid_tree(pid: u32, timeout: Duration) {
     let mut pids = child_pids_recursive(pid);
     pids.push(pid);
@@ -1937,6 +1934,17 @@ fn child_pids_recursive(pid: u32) -> Vec<u32> {
 }
 
 fn pid_is_alive(pid: u32) -> bool {
+    let proc_stat = PathBuf::from(format!("/proc/{pid}/stat"));
+    if let Ok(stat) = fs::read_to_string(proc_stat)
+        && let Some(after_comm) = stat.rsplit_once(") ")
+        && after_comm
+            .1
+            .split_whitespace()
+            .next()
+            .is_some_and(|state| state == "Z")
+    {
+        return false;
+    }
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -2710,30 +2718,38 @@ fn handle_api_connection(
                             &json!({"ok": false, "error": format!("invalid cwd: {}", invalid_cwd.display())}),
                         )
                     } else {
-                        match restart_tracked_app_server_with_cwd(
-                            Arc::clone(&state),
-                            paths.clone(),
-                            cwd,
-                        ) {
-                            Ok(pid) => {
-                                let (app_server_generation, resume_generation) = state
-                                    .lock()
-                                    .map(|state| {
-                                        (state.app_server_generation, state.resume_generation)
-                                    })
-                                    .unwrap_or_default();
-                                json_response(
-                                    200,
-                                    &json!({
-                                        "ok": true,
-                                        "app_server_pid": pid,
-                                        "app_server_generation": app_server_generation,
-                                        "resume_generation": resume_generation
-                                    }),
+                        let (app_server_generation, resume_generation, app_server_pid) = state
+                            .lock()
+                            .map(|state| {
+                                (
+                                    state.app_server_generation,
+                                    state.resume_generation,
+                                    state.app_server_pid,
                                 )
+                            })
+                            .unwrap_or_default();
+                        let restart_state = Arc::clone(&state);
+                        let restart_paths = paths.clone();
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_millis(50));
+                            if let Err(err) = restart_tracked_app_server_with_cwd(
+                                restart_state,
+                                restart_paths,
+                                cwd,
+                            ) {
+                                eprintln!("yolo server: app-server restart failed: {err}");
                             }
-                            Err(err) => json_response(500, &json!({"ok": false, "error": err})),
-                        }
+                        });
+                        json_response(
+                            202,
+                            &json!({
+                                "ok": true,
+                                "restart_scheduled": true,
+                                "app_server_pid": app_server_pid,
+                                "app_server_generation": app_server_generation,
+                                "resume_generation": resume_generation
+                            }),
+                        )
                     }
                 }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
@@ -2999,12 +3015,30 @@ fn is_yolo_client_args(args: &[String]) -> bool {
 }
 
 fn find_app_server_pid(paths: &RuntimePaths) -> Option<u32> {
+    find_app_server_pids(paths).into_iter().next()
+}
+
+fn find_app_server_pids(paths: &RuntimePaths) -> Vec<u32> {
     let needle = paths.app_server_socket.display().to_string();
-    read_process_table().ok()?.into_iter().find_map(|process| {
-        let is_app_server = process.cmdline.iter().any(|arg| arg == "app-server")
-            && process.cmdline.iter().any(|arg| arg.contains(&needle));
-        is_app_server.then_some(process.pid)
-    })
+    let mut pids: Vec<u32> = read_process_table()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|process| {
+            let is_app_server = process.cmdline.iter().any(|arg| arg == "app-server")
+                && process.cmdline.iter().any(|arg| arg.contains(&needle));
+            is_app_server.then_some(process.pid)
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn terminate_app_servers_for_socket(paths: &RuntimePaths, timeout: Duration) {
+    for pid in find_app_server_pids(paths) {
+        terminate_pid_tree(pid, timeout);
+    }
 }
 
 fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadSnapshot]) {
