@@ -537,11 +537,18 @@ fn run_client(args: Vec<OsString>) {
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
         .to_string();
-    let original_args = args.clone();
     let codex_cwd = effective_codex_cwd(&args, &cwd);
+    let resolved_args = match resolve_resume_last_args(&args, &codex_cwd) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("yolo: {err}");
+            std::process::exit(2);
+        }
+    };
+    let original_args = resolved_args.clone();
     ensure_codex_project_trusted(&codex_cwd);
-    let launch_args = codex_args_with_cwd(args, &cwd);
-    let string_args = original_args
+    let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
+    let string_args = resolved_args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
@@ -549,9 +556,12 @@ fn run_client(args: Vec<OsString>) {
     let initial_config = read_codex_config();
     let initial_service_tier = initial_config.service_tier.clone();
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
-    let thread_id = thread_id_from_args(&original_args);
-    repair_resume_session_cwd(&original_args, &codex_cwd);
-    reinforce_loaded_resume_permissions(&paths.app_server_socket, &original_args);
+    let thread_id = thread_id_from_args(&resolved_args);
+    repair_resume_session_cwd(&resolved_args, &codex_cwd);
+    reinforce_loaded_resume_permissions(&paths.app_server_socket, &resolved_args, &codex_cwd);
+    if let Some(thread_id) = thread_id.as_deref() {
+        spawn_resume_context_repair_watcher(thread_id, &codex_cwd);
+    }
     if let Some(thread_id) = thread_id.as_deref()
         && let Some(existing) = running_duplicate_thread_client(thread_id, std::process::id())
     {
@@ -618,7 +628,11 @@ fn run_client(args: Vec<OsString>) {
         .arg("--remote")
         .arg(&remote)
         .arg("--search")
-        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("--dangerously-bypass-approvals-and-sandbox");
+    if resume_target_from_args(&resolved_args).is_some() {
+        command.arg("-c").arg("include_environment_context=false");
+    }
+    command
         .args(&launch_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -807,6 +821,125 @@ enum ResumeTarget {
     Thread(String),
 }
 
+#[derive(Debug)]
+struct SessionCandidate {
+    path: PathBuf,
+    modified: SystemTime,
+    id: String,
+    cwd: Option<String>,
+}
+
+fn resolve_resume_last_args(args: &[OsString], cwd: &str) -> Result<Vec<OsString>, String> {
+    if resume_target_from_args(args) != Some(ResumeTarget::Last) {
+        return Ok(args.to_vec());
+    }
+    let Some(candidate) = latest_resume_candidate_for_cwd(cwd) else {
+        return Err(format!(
+            "refusing resume --last for {cwd}: no non-running Codex session with matching cwd"
+        ));
+    };
+    replace_resume_last_with_thread(args, &candidate.id)
+}
+
+fn replace_resume_last_with_thread(
+    args: &[OsString],
+    thread_id: &str,
+) -> Result<Vec<OsString>, String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut replaced = false;
+    for (idx, arg) in args.iter().enumerate() {
+        if !replaced && arg.to_str() == Some("--last") {
+            out.push(OsString::from(thread_id));
+            replaced = true;
+        } else if !replaced && arg.to_str() == Some("resume") && idx + 1 == args.len() {
+            out.push(arg.clone());
+            out.push(OsString::from(thread_id));
+            replaced = true;
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    if replaced {
+        Ok(out)
+    } else {
+        Err("resume --last marker was not found".to_string())
+    }
+}
+
+fn latest_resume_candidate_for_cwd(cwd: &str) -> Option<SessionCandidate> {
+    latest_resume_candidate_for_cwd_from(session_candidates(), cwd, |candidate| {
+        resume_candidate_unavailable(candidate, std::process::id())
+    })
+}
+
+fn latest_resume_candidate_for_cwd_from<F>(
+    candidates: Vec<SessionCandidate>,
+    cwd: &str,
+    mut is_unavailable: F,
+) -> Option<SessionCandidate>
+where
+    F: FnMut(&SessionCandidate) -> bool,
+{
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.cwd.as_deref() == Some(cwd))
+        .max_by_key(|candidate| candidate.modified)
+        .filter(|candidate| !is_unavailable(candidate))
+}
+
+fn resume_candidate_unavailable(candidate: &SessionCandidate, current_pid: u32) -> bool {
+    if running_duplicate_thread_client(&candidate.id, current_pid).is_some() {
+        return true;
+    }
+    thread_was_updated_after_yolo_exit(&candidate.id, candidate.modified)
+}
+
+fn thread_was_updated_after_yolo_exit(thread_id: &str, modified: SystemTime) -> bool {
+    let Some(modified_secs) = modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+    else {
+        return false;
+    };
+    let Ok(value) = api_get_json("/clients") else {
+        return false;
+    };
+    let Some(clients) = value.get("clients").and_then(Value::as_array) else {
+        return false;
+    };
+    clients.iter().any(|client| {
+        client.get("thread_id").and_then(Value::as_str) == Some(thread_id)
+            && client.get("status").and_then(Value::as_str) == Some("exited")
+            && client
+                .get("ended_at")
+                .and_then(Value::as_u64)
+                .is_some_and(|ended_at| modified_secs > ended_at.saturating_add(5))
+    })
+}
+
+fn session_candidates() -> Vec<SessionCandidate> {
+    let mut paths = Vec::new();
+    let Some(dir) = codex_sessions_dir() else {
+        return Vec::new();
+    };
+    collect_session_paths(&dir, &mut paths);
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).ok()?.modified().ok()?;
+            let (id, cwd) = session_meta_from_path(&path);
+            let id = id.or_else(|| session_id_from_filename(&path))?;
+            Some(SessionCandidate {
+                path,
+                modified,
+                id,
+                cwd,
+            })
+        })
+        .collect()
+}
+
 fn repair_resume_session_cwd(args: &[OsString], cwd: &str) {
     let Some(target) = resume_target_from_args(args) else {
         return;
@@ -819,12 +952,12 @@ fn repair_resume_session_cwd(args: &[OsString], cwd: &str) {
     }
 }
 
-fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString]) {
+fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString], cwd: &str) {
     let Some(thread_id) = resume_thread_id(args) else {
         return;
     };
-    if let Err(err) = update_app_server_thread_permissions(socket, &thread_id) {
-        eprintln!("yolo: failed to update loaded Codex thread permissions for {thread_id}: {err}");
+    if let Err(err) = update_app_server_resume_thread_settings(socket, &thread_id, cwd) {
+        eprintln!("yolo: failed to update loaded Codex thread settings for {thread_id}: {err}");
     }
 }
 
@@ -854,30 +987,58 @@ fn resume_target_from_args(args: &[OsString]) -> Option<ResumeTarget> {
             return Some(ResumeTarget::Thread(arg.to_string()));
         }
     }
-    None
+    Some(ResumeTarget::Last)
 }
 
 fn session_path_for_resume_target(target: &ResumeTarget) -> Option<PathBuf> {
-    let mut paths = Vec::new();
-    collect_session_paths(&codex_sessions_dir()?, &mut paths);
+    let paths = session_candidates();
     match target {
-        ResumeTarget::Thread(thread_id) => paths.into_iter().find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(thread_id))
-        }),
+        ResumeTarget::Thread(thread_id) => paths
+            .into_iter()
+            .find(|candidate| {
+                candidate.id == *thread_id
+                    || candidate
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().contains(thread_id))
+            })
+            .map(|candidate| candidate.path),
         ResumeTarget::Last => paths
             .into_iter()
-            .filter_map(|path| {
-                let modified = fs::metadata(&path).ok()?.modified().ok()?;
-                Some((modified, path))
-            })
-            .max_by_key(|(modified, _)| *modified)
-            .map(|(_, path)| path),
+            .max_by_key(|candidate| candidate.modified)
+            .map(|candidate| candidate.path),
     }
 }
 
 fn repair_resume_thread_id(thread_id: &str, cwd: &str) -> Result<(), String> {
     repair_resume_target(&ResumeTarget::Thread(thread_id.to_string()), cwd)
+}
+
+fn spawn_resume_context_repair_watcher(thread_id: &str, cwd: &str) {
+    let thread_id = thread_id.to_string();
+    let cwd = cwd.to_string();
+    thread::spawn(move || {
+        let mut last_modified = None;
+        loop {
+            let target = ResumeTarget::Thread(thread_id.clone());
+            if let Some(path) = session_path_for_resume_target(&target) {
+                let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+                if modified.is_some() && modified != last_modified {
+                    if let Err(err) = rewrite_session_meta_cwd(&path, &cwd) {
+                        eprintln!(
+                            "yolo: failed to repair Codex rollout context for {}: {err}",
+                            path.display()
+                        );
+                    }
+                    last_modified = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .or(modified);
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
 }
 
 fn repair_resume_target(target: &ResumeTarget, cwd: &str) -> Result<(), String> {
@@ -917,6 +1078,14 @@ fn collect_session_paths(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn session_id_from_path(path: &Path) -> Option<String> {
+    session_meta_from_path(path)
+        .0
+        .or_else(|| session_id_from_filename(path))
+}
+
+fn session_meta_from_path(path: &Path) -> (Option<String>, Option<String>) {
+    let mut id = None;
+    let mut cwd = None;
     if let Ok(input) = fs::read_to_string(path) {
         for line in input.lines().take(20) {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -925,16 +1094,29 @@ fn session_id_from_path(path: &Path) -> Option<String> {
             if value.get("type").and_then(Value::as_str) != Some("session_meta") {
                 continue;
             }
-            if let Some(id) = value
-                .get("payload")
-                .and_then(|payload| payload.get("id"))
-                .and_then(Value::as_str)
-            {
-                return Some(id.to_string());
+            if id.is_none() {
+                id = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+            }
+            if cwd.is_none() {
+                cwd = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+            }
+            if id.is_some() && cwd.is_some() {
+                break;
             }
         }
     }
+    (id, cwd)
+}
 
+fn session_id_from_filename(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy();
     let marker = "rollout-";
     let start = name.find(marker)?;
@@ -1029,6 +1211,11 @@ fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<(), String> {
                         changed = true;
                     }
                     if is_turn_context {
+                        let workspace_roots = json!([cwd]);
+                        if payload.get("workspace_roots") != Some(&workspace_roots) {
+                            payload.insert("workspace_roots".to_string(), workspace_roots);
+                            changed = true;
+                        }
                         let sandbox = json!({"type": "danger-full-access"});
                         if payload.get("sandbox_policy") != Some(&sandbox) {
                             payload.insert("sandbox_policy".to_string(), sandbox);
@@ -1224,7 +1411,119 @@ mod tests {
             resume_target_from_args(&os_args(&["resume", "--last"])),
             Some(ResumeTarget::Last)
         );
+        assert_eq!(
+            resume_target_from_args(&os_args(&["resume"])),
+            Some(ResumeTarget::Last)
+        );
         assert_eq!(resume_target_from_args(&os_args(&["hello"])), None);
+    }
+
+    #[test]
+    fn replace_resume_last_with_thread_keeps_other_args() {
+        let args = replace_resume_last_with_thread(
+            &os_args(&["--model", "gpt-5.5", "resume", "--last"]),
+            "019e-thread",
+        )
+        .unwrap();
+        assert_eq!(
+            string_args(args),
+            vec!["--model", "gpt-5.5", "resume", "019e-thread"]
+        );
+
+        let args = replace_resume_last_with_thread(&os_args(&["resume"]), "019e-thread").unwrap();
+        assert_eq!(string_args(args), vec!["resume", "019e-thread"]);
+    }
+
+    #[test]
+    fn latest_resume_candidate_for_cwd_ignores_other_cwd() {
+        let older = UNIX_EPOCH + Duration::from_secs(10);
+        let newer = UNIX_EPOCH + Duration::from_secs(20);
+        let candidates = vec![
+            SessionCandidate {
+                path: PathBuf::from("/tmp/head.jsonl"),
+                modified: newer,
+                id: "head-thread".to_string(),
+                cwd: Some("/home/vagrant/head".to_string()),
+            },
+            SessionCandidate {
+                path: PathBuf::from("/tmp/websh-old.jsonl"),
+                modified: older,
+                id: "websh-old".to_string(),
+                cwd: Some("/home/vagrant/websh".to_string()),
+            },
+            SessionCandidate {
+                path: PathBuf::from("/tmp/websh-new.jsonl"),
+                modified: newer,
+                id: "websh-new".to_string(),
+                cwd: Some("/home/vagrant/websh".to_string()),
+            },
+        ];
+        let candidate =
+            latest_resume_candidate_for_cwd_from(candidates, "/home/vagrant/websh", |_| false)
+                .unwrap();
+        assert_eq!(candidate.id, "websh-new");
+    }
+
+    #[test]
+    fn latest_resume_candidate_for_cwd_refuses_running_latest() {
+        let older = UNIX_EPOCH + Duration::from_secs(10);
+        let newer = UNIX_EPOCH + Duration::from_secs(20);
+        let candidates = vec![
+            SessionCandidate {
+                path: PathBuf::from("/tmp/websh-old.jsonl"),
+                modified: older,
+                id: "websh-old".to_string(),
+                cwd: Some("/home/vagrant/websh".to_string()),
+            },
+            SessionCandidate {
+                path: PathBuf::from("/tmp/websh-running.jsonl"),
+                modified: newer,
+                id: "websh-running".to_string(),
+                cwd: Some("/home/vagrant/websh".to_string()),
+            },
+        ];
+        assert!(
+            latest_resume_candidate_for_cwd_from(candidates, "/home/vagrant/websh", |candidate| {
+                candidate.id == "websh-running"
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn session_meta_from_path_reads_id_and_cwd() {
+        let path = env::temp_dir().join(format!(
+            "yolo-session-meta-test-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019e-meta\",\"cwd\":\"/home/vagrant/websh\"}}\n",
+        )
+        .unwrap();
+        let (id, cwd) = session_meta_from_path(&path);
+        assert_eq!(id.as_deref(), Some("019e-meta"));
+        assert_eq!(cwd.as_deref(), Some("/home/vagrant/websh"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_thread_id_detects_codex_resume_arg() {
+        let process = ProcInfo {
+            pid: 1,
+            ppid: 0,
+            comm: "codex".to_string(),
+            cmdline: vec![
+                "codex".to_string(),
+                "--remote".to_string(),
+                "unix:///tmp/codex.sock".to_string(),
+                "resume".to_string(),
+                "019e-thread".to_string(),
+            ],
+            cwd: Some("/home/vagrant/websh".to_string()),
+        };
+        assert_eq!(process_thread_id(&process), Some("019e-thread"));
     }
 
     #[test]
@@ -1261,8 +1560,16 @@ mod tests {
             Some("/home/vagrant/websh")
         );
         assert_eq!(
+            rows[1]["payload"]["workspace_roots"],
+            json!(["/home/vagrant/websh"])
+        );
+        assert_eq!(
             rows[2]["payload"]["cwd"].as_str(),
             Some("/home/vagrant/websh")
+        );
+        assert_eq!(
+            rows[2]["payload"]["workspace_roots"],
+            json!(["/home/vagrant/websh"])
         );
         assert_eq!(rows[3]["payload"]["cwd"].as_str(), Some("/home/vagrant"));
 
@@ -1388,6 +1695,9 @@ fn resume_generation_advanced(seen_resume_generation: &AtomicU64) -> bool {
 }
 
 fn running_duplicate_thread_client(thread_id: &str, current_pid: u32) -> Option<String> {
+    if let Some(existing) = running_duplicate_thread_process(thread_id, current_pid) {
+        return Some(existing);
+    }
     let value = api_get_json("/clients").ok()?;
     let clients = value.get("clients")?.as_array()?;
     for client in clients {
@@ -1410,6 +1720,42 @@ fn running_duplicate_thread_client(thread_id: &str, current_pid: u32) -> Option<
         return Some(format!("{id} pid={yolo_pid} cwd={cwd}"));
     }
     None
+}
+
+fn running_duplicate_thread_process(thread_id: &str, current_pid: u32) -> Option<String> {
+    let processes = read_process_table().ok()?;
+    let current_children = child_pids_recursive(current_pid)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for process in processes {
+        if process.pid == current_pid || current_children.contains(&process.pid) {
+            continue;
+        }
+        if process_thread_id(&process) != Some(thread_id) {
+            continue;
+        }
+        let cwd = process.cwd.as_deref().unwrap_or_default();
+        let label = if is_yolo_process(&process) {
+            "yolo"
+        } else {
+            "codex"
+        };
+        return Some(format!(
+            "{label} pid={} cwd={} args={}",
+            process.pid,
+            cwd,
+            process.cmdline.join(" ")
+        ));
+    }
+    None
+}
+
+fn process_thread_id(process: &ProcInfo) -> Option<&str> {
+    process.cmdline.windows(2).find_map(|window| {
+        let first = window[0].as_str();
+        let second = window[1].as_str();
+        (first == "resume" && !second.starts_with('-')).then_some(second)
+    })
 }
 
 fn run_upgrade_resume(mut args: Vec<OsString>) {
@@ -3618,13 +3964,19 @@ fn app_server_thread_snapshot(
     Ok(threads)
 }
 
-fn update_app_server_thread_permissions(socket: &Path, thread_id: &str) -> Result<(), String> {
+fn update_app_server_resume_thread_settings(
+    socket: &Path,
+    thread_id: &str,
+    cwd: &str,
+) -> Result<(), String> {
     let mut client = AppServerRpcClient::connect(socket)?;
     client.initialize()?;
     client.request(
         "thread/settings/update",
         json!({
             "threadId": thread_id,
+            "cwd": cwd,
+            "runtimeWorkspaceRoots": [cwd],
             "approvalPolicy": "never",
             "approvalsReviewer": "user",
             "sandboxPolicy": {
