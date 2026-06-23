@@ -6,7 +6,7 @@ permissions and web search enabled.
 The default client runs:
 
 ```sh
-codex --remote unix://$XDG_RUNTIME_DIR/yolo/codex-app-server.sock \
+codex --remote unix://$XDG_RUNTIME_DIR/yolo/app-server/codex-app-server.sock \
   --search \
   --dangerously-bypass-approvals-and-sandbox \
   "$@"
@@ -28,6 +28,7 @@ cargo install --path .
 ```sh
 yolo --cd /home/vagrant/websh
 yolo resume --last
+yolo codex resume 019e9c04-eaa2-7c20-bd0e-13c297d4dc45
 yolo upgrade-resume --last
 yolo upgrade-resume-all
 yolo external-codex-upgrade-resume --codex-version 0.137.0 --system
@@ -41,6 +42,13 @@ yolo stop
 yolo-managed user-writable npm prefix, restarts the yolo-managed app-server so
 it uses the upgraded Codex binary, then launches `codex resume` through yolo.
 With no arguments it resumes `--last`.
+
+`yolo codex [CODEX_ARGS...]` is an emergency escape hatch for yolo
+server/app-server trouble. It does not contact the yolo API and does not use
+the yolo-managed app-server. Instead it execs the native `codex` CLI directly,
+passes through all following arguments, and only adds YOLO mode flags plus
+cwd/resume metadata repair. Set `YOLO_NATIVE_CODEX` when the native binary is
+not simply `codex` on `PATH`.
 
 `yolo upgrade-resume-all` waits for active app-server threads to become idle,
 updates the yolo-managed Codex CLI, restarts the app-server, then asks live
@@ -146,6 +154,7 @@ processes.
 
 - `YOLO_CODEX`: Codex executable to run. Defaults to yolo's managed Codex when
   present, otherwise `codex` on `PATH`.
+- `YOLO_NATIVE_CODEX`: native Codex executable used by `yolo codex`.
 - `YOLO_CODEX_UPGRADE_COMMAND`: override command used by `upgrade-resume`.
 - `YOLO_CODEX_PREFIX`: managed Codex npm prefix. Defaults to
   `$XDG_DATA_HOME/yolo/codex-npm` or `~/.local/share/yolo/codex-npm`.

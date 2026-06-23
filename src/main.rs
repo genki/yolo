@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CODEX: &str = "codex";
@@ -28,6 +28,8 @@ const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RESUME_GENERATION_GRACE: Duration = Duration::from_secs(20);
 const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const APP_SERVER_RPC_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -287,6 +289,10 @@ fn main() {
             args.remove(0);
             run_client(args);
         }
+        Some("codex") => {
+            args.remove(0);
+            run_native_codex_passthrough(args);
+        }
         _ => run_client(args),
     }
 }
@@ -374,6 +380,9 @@ fn spawn_server_daemon() -> Result<(), String> {
 
 fn spawn_app_server(paths: &RuntimePaths, cwd: Option<&Path>) -> Result<Child, String> {
     let codex = codex_executable();
+    if let Some(parent) = paths.app_server_socket.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create app-server socket dir: {err}"))?;
+    }
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -689,6 +698,35 @@ fn run_client(args: Vec<OsString>) {
     }
 }
 
+fn run_native_codex_passthrough(args: Vec<OsString>) -> ! {
+    let cwd = env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string();
+    let codex_cwd = effective_codex_cwd(&args, &cwd);
+    let resolved_args = match resolve_resume_last_args_without_api(&args, &codex_cwd) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("yolo codex: {err}");
+            std::process::exit(2);
+        }
+    };
+    ensure_codex_project_trusted(&codex_cwd);
+    repair_resume_session_cwd(&resolved_args, &codex_cwd);
+    let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
+    let mut command = Command::new(native_codex_executable());
+    command
+        .current_dir(&cwd)
+        .arg("--search")
+        .arg("--dangerously-bypass-approvals-and-sandbox");
+    if resume_target_from_args(&resolved_args).is_some() {
+        command.arg("-c").arg("include_environment_context=false");
+    }
+    let err = command.args(&launch_args).exec();
+    eprintln!("yolo codex: failed to exec native codex: {err}");
+    std::process::exit(127);
+}
+
 fn codex_args_with_cwd(args: Vec<OsString>, cwd: &str) -> Vec<OsString> {
     if has_explicit_codex_cwd_arg(&args) {
         return args;
@@ -834,6 +872,26 @@ fn resolve_resume_last_args(args: &[OsString], cwd: &str) -> Result<Vec<OsString
         return Ok(args.to_vec());
     }
     let Some(candidate) = latest_resume_candidate_for_cwd(cwd) else {
+        return Err(format!(
+            "refusing resume --last for {cwd}: no non-running Codex session with matching cwd"
+        ));
+    };
+    replace_resume_last_with_thread(args, &candidate.id)
+}
+
+fn resolve_resume_last_args_without_api(
+    args: &[OsString],
+    cwd: &str,
+) -> Result<Vec<OsString>, String> {
+    if resume_target_from_args(args) != Some(ResumeTarget::Last) {
+        return Ok(args.to_vec());
+    }
+    let current_pid = std::process::id();
+    let Some(candidate) =
+        latest_resume_candidate_for_cwd_from(session_candidates(), cwd, |candidate| {
+            running_duplicate_thread_process(&candidate.id, current_pid).is_some()
+        })
+    else {
         return Err(format!(
             "refusing resume --last for {cwd}: no non-running Codex session with matching cwd"
         ));
@@ -1524,6 +1582,71 @@ mod tests {
             cwd: Some("/home/vagrant/websh".to_string()),
         };
         assert_eq!(process_thread_id(&process), Some("019e-thread"));
+    }
+
+    #[test]
+    fn app_server_pid_detection_collapses_node_native_pair() {
+        let socket = "/run/user/1000/yolo/app-server/codex-app-server.sock";
+        let processes = vec![
+            ProcInfo {
+                pid: 10,
+                ppid: 1,
+                comm: "node".to_string(),
+                cmdline: vec![
+                    "node".to_string(),
+                    "/home/vagrant/.local/share/yolo/codex-npm/bin/codex".to_string(),
+                    "app-server".to_string(),
+                    "--listen".to_string(),
+                    format!("unix://{socket}"),
+                ],
+                cwd: None,
+            },
+            ProcInfo {
+                pid: 11,
+                ppid: 10,
+                comm: "codex".to_string(),
+                cmdline: vec![
+                    "/vendor/codex".to_string(),
+                    "app-server".to_string(),
+                    "--listen".to_string(),
+                    format!("unix://{socket}"),
+                ],
+                cwd: None,
+            },
+        ];
+        assert_eq!(top_level_app_server_pids(&processes, socket), vec![10]);
+    }
+
+    #[test]
+    fn app_server_pid_detection_keeps_real_duplicate_roots() {
+        let socket = "/run/user/1000/yolo/app-server/codex-app-server.sock";
+        let processes = vec![
+            ProcInfo {
+                pid: 10,
+                ppid: 1,
+                comm: "node".to_string(),
+                cmdline: vec![
+                    "node".to_string(),
+                    "codex".to_string(),
+                    "app-server".to_string(),
+                    format!("unix://{socket}"),
+                ],
+                cwd: None,
+            },
+            ProcInfo {
+                pid: 20,
+                ppid: 1,
+                comm: "node".to_string(),
+                cmdline: vec![
+                    "node".to_string(),
+                    "codex".to_string(),
+                    "app-server".to_string(),
+                    format!("unix://{socket}"),
+                ],
+                cwd: None,
+            },
+        ];
+        assert_eq!(top_level_app_server_pids(&processes, socket), vec![10, 20]);
     }
 
     #[test]
@@ -2920,23 +3043,25 @@ fn handle_api_connection(
     state: Arc<Mutex<ServerState>>,
     paths: RuntimePaths,
 ) {
-    let mut request = Vec::new();
-    if stream.read_to_end(&mut request).is_err() {
-        return;
-    }
-    let request = String::from_utf8_lossy(&request);
-    let mut lines = request.lines();
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
-    let body = request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .or_else(|| request.split_once("\n\n").map(|(_, body)| body))
-        .unwrap_or_default();
+    let response = match read_http_request(&mut stream) {
+        Ok((method, path, _headers, body)) => {
+            handle_api_request(&method, &path, &body, state, paths, &mut stream)
+        }
+        Err(err) => json_response(400, &json!({"ok": false, "error": err})),
+    };
 
-    let response = match (method, path) {
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn handle_api_request(
+    method: &str,
+    path: &str,
+    body: &str,
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    stream: &mut UnixStream,
+) -> String {
+    match (method, path) {
         ("GET", "/status") => {
             let info = server_info(&state, &paths);
             json_response(200, &info)
@@ -3111,9 +3236,7 @@ fn handle_api_connection(
             std::process::exit(0);
         }
         _ => json_response(404, &json!({"ok": false, "error": "not found"})),
-    };
-
-    let _ = stream.write_all(response.as_bytes());
+    }
 }
 
 fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
@@ -3351,7 +3474,7 @@ fn is_yolo_client_args(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         None => true,
         Some("client") | Some("resume") => true,
-        Some("server" | "status" | "clients" | "stop" | "set" | "configure") => false,
+        Some("server" | "status" | "clients" | "stop" | "set" | "configure" | "codex") => false,
         Some("upgrade-resume" | "resume-upgrade" | "upgrade-and-resume") => false,
         Some("upgrade-resume-all" | "resume-all-upgrade") => false,
         Some("external-codex-upgrade-resume" | "upgrade-external-codex") => false,
@@ -3366,19 +3489,33 @@ fn find_app_server_pid(paths: &RuntimePaths) -> Option<u32> {
 
 fn find_app_server_pids(paths: &RuntimePaths) -> Vec<u32> {
     let needle = paths.app_server_socket.display().to_string();
-    let mut pids: Vec<u32> = read_process_table()
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|process| {
-            let is_app_server = process.cmdline.iter().any(|arg| arg == "app-server")
-                && process.cmdline.iter().any(|arg| arg.contains(&needle));
-            is_app_server.then_some(process.pid)
-        })
+    let processes = read_process_table().unwrap_or_default();
+    top_level_app_server_pids(&processes, &needle)
+}
+
+fn top_level_app_server_pids(processes: &[ProcInfo], socket_needle: &str) -> Vec<u32> {
+    let app_server_pids = processes
+        .iter()
+        .filter(|process| is_app_server_process(process, socket_needle))
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    let mut pids: Vec<u32> = processes
+        .iter()
+        .filter(|process| is_app_server_process(process, socket_needle))
+        .filter(|process| !app_server_pids.contains(&process.ppid))
+        .map(|process| process.pid)
         .collect();
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+fn is_app_server_process(process: &ProcInfo, socket_needle: &str) -> bool {
+    process.cmdline.iter().any(|arg| arg == "app-server")
+        && process
+            .cmdline
+            .iter()
+            .any(|arg| arg.contains(socket_needle))
 }
 
 fn terminate_app_servers_for_socket(paths: &RuntimePaths, timeout: Duration) {
@@ -4186,25 +4323,20 @@ fn websocket_send_text(stream: &mut UnixStream, text: &str) -> Result<(), String
 }
 
 fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
+    let deadline = Instant::now() + APP_SERVER_RPC_READ_RETRY_TIMEOUT;
     loop {
         let mut header = [0u8; 2];
-        stream
-            .read_exact(&mut header)
-            .map_err(|err| format!("read websocket frame header: {err}"))?;
+        read_exact_retry(stream, &mut header, "read websocket frame header", deadline)?;
         let opcode = header[0] & 0x0f;
         let masked = (header[1] & 0x80) != 0;
         let mut len = (header[1] & 0x7f) as u64;
         if len == 126 {
             let mut buf = [0u8; 2];
-            stream
-                .read_exact(&mut buf)
-                .map_err(|err| format!("read websocket frame length: {err}"))?;
+            read_exact_retry(stream, &mut buf, "read websocket frame length", deadline)?;
             len = u16::from_be_bytes(buf) as u64;
         } else if len == 127 {
             let mut buf = [0u8; 8];
-            stream
-                .read_exact(&mut buf)
-                .map_err(|err| format!("read websocket frame length: {err}"))?;
+            read_exact_retry(stream, &mut buf, "read websocket frame length", deadline)?;
             len = u64::from_be_bytes(buf);
         }
         if len > 16 * 1024 * 1024 {
@@ -4212,17 +4344,18 @@ fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
         }
         let mask = if masked {
             let mut mask = [0u8; 4];
-            stream
-                .read_exact(&mut mask)
-                .map_err(|err| format!("read websocket frame mask: {err}"))?;
+            read_exact_retry(stream, &mut mask, "read websocket frame mask", deadline)?;
             Some(mask)
         } else {
             None
         };
         let mut payload = vec![0u8; len as usize];
-        stream
-            .read_exact(&mut payload)
-            .map_err(|err| format!("read websocket frame payload: {err}"))?;
+        read_exact_retry(
+            stream,
+            &mut payload,
+            "read websocket frame payload",
+            deadline,
+        )?;
         if let Some(mask) = mask {
             for (idx, byte) in payload.iter_mut().enumerate() {
                 *byte ^= mask[idx % 4];
@@ -4240,6 +4373,36 @@ fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
             _ => {}
         }
     }
+}
+
+fn read_exact_retry(
+    stream: &mut UnixStream,
+    mut buf: &mut [u8],
+    context: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    while !buf.is_empty() {
+        match stream.read(buf) {
+            Ok(0) => return Err(format!("{context}: failed to fill whole buffer")),
+            Ok(nread) => {
+                let tmp = buf;
+                buf = &mut tmp[nread..];
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!("{context}: timed out waiting for app-server"));
+                }
+                thread::sleep(APP_SERVER_RPC_READ_RETRY_INTERVAL);
+            }
+            Err(err) => return Err(format!("{context}: {err}")),
+        }
+    }
+    Ok(())
 }
 
 fn websocket_send_pong(stream: &mut UnixStream, payload: &[u8]) -> Result<(), String> {
@@ -4528,6 +4691,10 @@ fn codex_executable() -> OsString {
     OsString::from(DEFAULT_CODEX)
 }
 
+fn native_codex_executable() -> OsString {
+    env::var_os("YOLO_NATIVE_CODEX").unwrap_or_else(|| OsString::from(DEFAULT_CODEX))
+}
+
 fn managed_codex_prefix() -> PathBuf {
     let base = env::var_os("YOLO_CODEX_PREFIX")
         .map(PathBuf::from)
@@ -4565,7 +4732,7 @@ fn runtime_paths() -> Result<RuntimePaths, String> {
     };
     Ok(RuntimePaths {
         api_socket: dir.join(API_SOCKET_NAME),
-        app_server_socket: dir.join(APP_SERVER_SOCKET_NAME),
+        app_server_socket: dir.join("app-server").join(APP_SERVER_SOCKET_NAME),
         pid_file: dir.join(PID_FILE_NAME),
         log_file: dir.join("server.log"),
         dir,
@@ -4619,6 +4786,7 @@ Launch Codex through a yolo-managed app-server in YOLO mode with web search enab
 Usage:
   yolo [CODEX_ARGS...]
   yolo client [CODEX_ARGS...]
+  yolo codex [CODEX_ARGS...]
   yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
   yolo upgrade-resume-all
   yolo server [--daemon|--foreground] [--federation-listen ADDR]
@@ -4626,11 +4794,16 @@ Usage:
   yolo stop
 
 Default client command:
-  codex --remote unix://$YOLO_RUNTIME_DIR/codex-app-server.sock --search --dangerously-bypass-approvals-and-sandbox [CODEX_ARGS...]
+  codex --remote unix://$YOLO_RUNTIME_DIR/app-server/codex-app-server.sock --search --dangerously-bypass-approvals-and-sandbox [CODEX_ARGS...]
 
 The client keeps Codex stdio attached to the terminal and reports its process,
 model, service_tier, fast state, and app-server thread status to the yolo
 server API.
+
+yolo codex is an emergency escape hatch for yolo server/app-server trouble. It
+execs the native Codex CLI directly, passes through all following arguments,
+and only adds YOLO mode flags plus cwd/resume metadata repair. It does not use
+the yolo server or remote app-server.
 
 upgrade-resume installs the latest Codex CLI into a yolo-managed
 user-writable npm prefix, restarts the yolo app-server, then launches
@@ -4660,6 +4833,7 @@ the configured master URL.
 
 Environment:
   YOLO_CODEX        Codex executable to run (default: codex)
+  YOLO_NATIVE_CODEX Native Codex executable for `yolo codex`
   YOLO_CODEX_UPGRADE_COMMAND
                     Override upgrade command
   YOLO_CODEX_PREFIX Managed Codex npm prefix
