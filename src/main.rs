@@ -422,6 +422,8 @@ fn spawn_tracked_app_server(
         state.app_server_pid = Some(pid);
     }
 
+    wait_for_app_server_ready(&paths, Duration::from_secs(10))?;
+
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || {
         let status = app_server.wait().ok();
@@ -509,6 +511,8 @@ fn restart_tracked_app_server_with_cwd(
     if let Ok(mut state) = state.lock() {
         state.app_server_pid = Some(pid);
     }
+
+    wait_for_app_server_ready(&paths, Duration::from_secs(10))?;
 
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || {
@@ -2541,7 +2545,7 @@ fn restart_generation_from_status(value: &Value) -> Option<u64> {
 fn ensure_server() -> Result<(), String> {
     let paths = runtime_paths()?;
     if api_get_json("/status").is_ok() {
-        return Ok(());
+        return wait_for_app_server_ready(&paths, Duration::from_secs(10));
     }
     spawn_server_daemon()?;
     wait_for_server_ready(&paths, Duration::from_secs(10))
@@ -2551,8 +2555,8 @@ fn wait_for_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), 
     let start = SystemTime::now();
     while start.elapsed().unwrap_or_default() < timeout {
         if paths.api_socket.exists()
-            && paths.app_server_socket.exists()
             && api_get_json("/status").is_ok()
+            && wait_for_app_server_ready(paths, Duration::from_millis(100)).is_ok()
         {
             return Ok(());
         }
@@ -2561,6 +2565,22 @@ fn wait_for_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), 
     Err(format!(
         "server did not become ready at {}",
         paths.api_socket.display()
+    ))
+}
+
+fn wait_for_app_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), String> {
+    let start = SystemTime::now();
+    while start.elapsed().unwrap_or_default() < timeout {
+        if paths.app_server_socket.exists()
+            && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "app-server did not become ready at {}",
+        paths.app_server_socket.display()
     ))
 }
 
