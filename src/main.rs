@@ -30,6 +30,9 @@ const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60)
 const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const APP_SERVER_RPC_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const APP_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT: Duration = Duration::from_secs(60);
+const RESUME_CONTEXT_REPAIR_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -380,7 +383,7 @@ fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
         .spawn()
         .map_err(|err| format!("spawn yolo server: {err}"))?;
     println!("started yolo server pid {}", child.id());
-    wait_for_server_ready(&paths, Duration::from_secs(10))
+    wait_for_server_ready(&paths, APP_SERVER_READY_TIMEOUT)
 }
 
 fn server_foreground_args(args: &[OsString]) -> Vec<OsString> {
@@ -432,7 +435,7 @@ fn spawn_tracked_app_server(
         state.app_server_pid = Some(pid);
     }
 
-    wait_for_app_server_ready(&paths, Duration::from_secs(10))?;
+    wait_for_app_server_ready(&paths, APP_SERVER_READY_TIMEOUT)?;
 
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || {
@@ -522,7 +525,7 @@ fn restart_tracked_app_server_with_cwd(
         state.app_server_pid = Some(pid);
     }
 
-    wait_for_app_server_ready(&paths, Duration::from_secs(10))?;
+    wait_for_app_server_ready(&paths, APP_SERVER_READY_TIMEOUT)?;
 
     let monitor_state = Arc::clone(&state);
     thread::spawn(move || {
@@ -1109,16 +1112,27 @@ fn spawn_resume_context_repair_watcher(thread_id: &str, cwd: &str) {
     let cwd = cwd.to_string();
     thread::spawn(move || {
         let mut last_modified = None;
-        loop {
+        let mut stable_checks = 0_u8;
+        let started = Instant::now();
+        while started.elapsed() < RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT {
             let target = ResumeTarget::Thread(thread_id.clone());
             if let Some(path) = session_path_for_resume_target(&target) {
                 let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
                 if modified.is_some() && modified != last_modified {
-                    if let Err(err) = rewrite_session_meta_cwd(&path, &cwd) {
-                        eprintln!(
-                            "yolo: failed to repair Codex rollout context for {}: {err}",
-                            path.display()
-                        );
+                    match rewrite_session_meta_cwd(&path, &cwd) {
+                        Ok(true) => stable_checks = 0,
+                        Ok(false) => {
+                            stable_checks = stable_checks.saturating_add(1);
+                            if stable_checks >= 2 {
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "yolo: failed to repair Codex rollout context for {}: {err}",
+                                path.display()
+                            );
+                        }
                     }
                     last_modified = fs::metadata(&path)
                         .and_then(|meta| meta.modified())
@@ -1126,7 +1140,7 @@ fn spawn_resume_context_repair_watcher(thread_id: &str, cwd: &str) {
                         .or(modified);
                 }
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(RESUME_CONTEXT_REPAIR_WATCH_INTERVAL);
         }
     });
 }
@@ -1279,7 +1293,7 @@ fn sqlite_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<(), String> {
+fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<bool, String> {
     let input = fs::read_to_string(path).map_err(|err| err.to_string())?;
     let mut changed = false;
     let mut output = String::with_capacity(input.len());
@@ -1356,7 +1370,7 @@ fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<(), String> {
     if changed {
         fs::write(path, output).map_err(|err| err.to_string())?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn repair_resume_context_message(value: &mut Value, cwd: &str) -> bool {
@@ -2555,10 +2569,10 @@ fn restart_generation_from_status(value: &Value) -> Option<u64> {
 fn ensure_server() -> Result<(), String> {
     let paths = runtime_paths()?;
     if api_get_json("/status").is_ok() {
-        return wait_for_app_server_ready(&paths, Duration::from_secs(10));
+        return wait_for_app_server_ready(&paths, APP_SERVER_READY_TIMEOUT);
     }
     spawn_server_daemon(&[])?;
-    wait_for_server_ready(&paths, Duration::from_secs(10))
+    wait_for_server_ready(&paths, APP_SERVER_READY_TIMEOUT)
 }
 
 fn wait_for_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), String> {
