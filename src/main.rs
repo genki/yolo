@@ -9,9 +9,9 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -168,6 +168,11 @@ struct AppThreadStatusUpdate {
     thread_id: String,
     status: String,
     active_flags: Vec<String>,
+}
+
+enum ClientEvent {
+    RestartRequested,
+    CodexExited(Result<ExitStatus, String>),
 }
 
 #[derive(Debug, Default)]
@@ -603,8 +608,8 @@ fn run_client(args: Vec<OsString>) {
     };
 
     let heartbeat_id = client_id.clone();
-    let restart_requested = Arc::new(AtomicBool::new(false));
-    let heartbeat_restart_requested = Arc::clone(&restart_requested);
+    let (event_tx, event_rx) = mpsc::channel::<ClientEvent>();
+    let heartbeat_event_tx = event_tx.clone();
     let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
     thread::spawn(move || {
@@ -621,7 +626,12 @@ fn run_client(args: Vec<OsString>) {
                         let seen = heartbeat_seen_generation.load(Ordering::SeqCst);
                         if generation > seen {
                             heartbeat_seen_generation.store(generation, Ordering::SeqCst);
-                            heartbeat_restart_requested.store(true, Ordering::SeqCst);
+                            if heartbeat_event_tx
+                                .send(ClientEvent::RestartRequested)
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                 }
@@ -654,8 +664,9 @@ fn run_client(args: Vec<OsString>) {
             std::process::exit(127);
         }
     };
+    let child_pid = child.id();
 
-    info.codex_pid = Some(child.id());
+    info.codex_pid = Some(child_pid);
     info.updated_at = now_secs();
     info.ended_at = None;
     info.exit_code = None;
@@ -665,13 +676,20 @@ fn run_client(args: Vec<OsString>) {
         &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
     );
 
+    let child_event_tx = event_tx.clone();
+    thread::spawn(move || {
+        let result = child.wait().map_err(|err| err.to_string());
+        let _ = child_event_tx.send(ClientEvent::CodexExited(result));
+    });
+    drop(event_tx);
+
     loop {
-        if restart_requested.swap(false, Ordering::SeqCst) {
-            terminate_child(&mut child);
-            reexec_client_for_resume(&original_args);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        match event_rx.recv() {
+            Ok(ClientEvent::RestartRequested) => {
+                terminate_pid_tree(child_pid, Duration::from_secs(5));
+                reexec_client_for_resume(&original_args);
+            }
+            Ok(ClientEvent::CodexExited(Ok(status))) => {
                 if should_reexec_after_codex_exit(
                     status.success(),
                     &original_args,
@@ -689,11 +707,11 @@ fn run_client(args: Vec<OsString>) {
                 );
                 std::process::exit(info.exit_code.unwrap_or(1));
             }
-            Ok(None) => thread::sleep(Duration::from_millis(200)),
-            Err(err) => {
+            Ok(ClientEvent::CodexExited(Err(err))) => {
                 eprintln!("yolo: failed to wait for codex: {err}");
                 std::process::exit(1);
             }
+            Err(_) => std::process::exit(1),
         }
     }
 }
@@ -2420,24 +2438,6 @@ fn pid_is_alive(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
-}
-
-fn terminate_child(child: &mut Child) {
-    let pid = child.id();
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
-    let start = SystemTime::now();
-    while start.elapsed().unwrap_or_default() < Duration::from_secs(5) {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
-            Err(_) => return,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
