@@ -135,10 +135,14 @@ restarts the slave app-server, and asks running yolo clients to resume. This
 updates the Codex CLI used inside yolo; it is distinct from upgrading the yolo
 binary itself.
 
-`yolo-upgrade` runs `cargo install --git https://github.com/genki/yolo` by
-default, then restarts the yolo server. It upgrades the yolo binary and does not
-imply a Codex CLI package update. Override it with `YOLO_SELF_UPGRADE_COMMAND`
-when the slave needs a local package or different installer.
+`yolo-upgrade` waits until Codex clients become idle, runs
+`cargo install --git https://github.com/genki/yolo` by default, then advances the
+resume generation so live yolo clients re-exec in place through the newly
+installed binary. It upgrades the yolo binary and does not imply a Codex CLI
+package update. The yolo server process itself is left running and reports that
+a server restart is still deferred; this avoids resetting active Codex clients.
+Override it with `YOLO_SELF_UPGRADE_COMMAND` when the slave needs a local
+package or different installer.
 
 ## Tests
 

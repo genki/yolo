@@ -2877,24 +2877,26 @@ fn execute_slave_command(
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
-        "yolo-upgrade" | "upgrade-yolo" => match upgrade_yolo(command) {
-            Ok(value) => {
-                let result = SlaveResultRequest {
-                    slave_id: slave_id.to_string(),
-                    command_id: command.id.clone(),
-                    ok: true,
-                    result: value.clone(),
-                };
-                let _ = federation_post_json(
-                    master_url,
-                    "/federation/slaves/result",
-                    bearer_token,
-                    &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-                );
-                value
+        "yolo-upgrade" | "upgrade-yolo" => {
+            match run_yolo_upgrade_resume_local(Arc::clone(&state), paths, command) {
+                Ok(value) => {
+                    let result = SlaveResultRequest {
+                        slave_id: slave_id.to_string(),
+                        command_id: command.id.clone(),
+                        ok: true,
+                        result: value.clone(),
+                    };
+                    let _ = federation_post_json(
+                        master_url,
+                        "/federation/slaves/result",
+                        bearer_token,
+                        &serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+                    );
+                    value
+                }
+                Err(err) => json!({"ok": false, "error": err}),
             }
-            Err(err) => json!({"ok": false, "error": err}),
-        },
+        }
         _ => {
             json!({"ok": false, "error": format!("unknown slave command action: {}", command.action)})
         }
@@ -3000,6 +3002,33 @@ fn refresh_resume_request_matches(request: &RefreshResumeRequest, client: &Clien
             .cwd
             .as_deref()
             .is_some_and(|value| value == client.cwd)
+}
+
+fn run_yolo_upgrade_resume_local(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    command: &SlaveCommand,
+) -> Result<Value, String> {
+    let request = UpgradeResumeAllRequest::default();
+    wait_for_clients_idle(Arc::clone(&state), paths, &request)?;
+    let mut value = upgrade_yolo(command)?;
+    let generation = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "server state lock poisoned".to_string())?;
+        state.resume_generation = state.resume_generation.saturating_add(1);
+        state.resume_generation
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("resume_generation".to_string(), Value::from(generation));
+        object.insert("client_reexec_scheduled".to_string(), Value::Bool(true));
+        object.insert("server_restart_required".to_string(), Value::Bool(true));
+        object.insert(
+            "restart_policy".to_string(),
+            Value::String("clients_reexec_in_place_after_idle_server_restart_deferred".to_string()),
+        );
+    }
+    Ok(value)
 }
 
 fn upgrade_yolo(command: &SlaveCommand) -> Result<Value, String> {
