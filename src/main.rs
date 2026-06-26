@@ -306,7 +306,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     let daemon = args.iter().any(|arg| arg == "--daemon");
     let foreground = args.iter().any(|arg| arg == "--foreground");
     if daemon && !foreground {
-        return spawn_server_daemon();
+        return spawn_server_daemon(&args);
     }
 
     let paths = runtime_paths()?;
@@ -358,7 +358,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_server_daemon() -> Result<(), String> {
+fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
     let exe = env::current_exe().map_err(|err| format!("current exe: {err}"))?;
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
@@ -370,10 +370,10 @@ fn spawn_server_daemon() -> Result<(), String> {
     let log2 = log
         .try_clone()
         .map_err(|err| format!("clone daemon log: {err}"))?;
+    let foreground_args = server_foreground_args(args);
     let child = Command::new("setsid")
         .arg(exe)
-        .arg("server")
-        .arg("--foreground")
+        .args(foreground_args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
@@ -381,6 +381,16 @@ fn spawn_server_daemon() -> Result<(), String> {
         .map_err(|err| format!("spawn yolo server: {err}"))?;
     println!("started yolo server pid {}", child.id());
     wait_for_server_ready(&paths, Duration::from_secs(10))
+}
+
+fn server_foreground_args(args: &[OsString]) -> Vec<OsString> {
+    let mut out = vec![OsString::from("server"), OsString::from("--foreground")];
+    out.extend(
+        args.iter()
+            .filter(|arg| arg.to_str() != Some("--daemon") && arg.to_str() != Some("--foreground"))
+            .cloned(),
+    );
+    out
 }
 
 fn spawn_app_server(paths: &RuntimePaths, cwd: Option<&Path>) -> Result<Child, String> {
@@ -2547,7 +2557,7 @@ fn ensure_server() -> Result<(), String> {
     if api_get_json("/status").is_ok() {
         return wait_for_app_server_ready(&paths, Duration::from_secs(10));
     }
-    spawn_server_daemon()?;
+    spawn_server_daemon(&[])?;
     wait_for_server_ready(&paths, Duration::from_secs(10))
 }
 
