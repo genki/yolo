@@ -33,6 +33,8 @@ const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const APP_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const RESUME_CONTEXT_REPAIR_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+const RESUME_PERMISSIONS_REINFORCE_TIMEOUT: Duration = Duration::from_secs(120);
+const RESUME_PERMISSIONS_REINFORCE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -293,6 +295,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("refresh-permissions") | Some("permissions-refresh") => {
+            args.remove(0);
+            if let Err(err) = run_refresh_permissions(args) {
+                eprintln!("yolo refresh-permissions: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("client") => {
             args.remove(0);
             run_client(args);
@@ -314,7 +323,15 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
 
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
-    remove_socket_if_present(&paths.api_socket)?;
+    if paths.api_socket.exists() {
+        if api_get_json("/status").is_ok() {
+            return Err(format!(
+                "yolo server is already running at {}",
+                paths.api_socket.display()
+            ));
+        }
+        remove_socket_if_present(&paths.api_socket)?;
+    }
     fs::write(&paths.pid_file, std::process::id().to_string())
         .map_err(|err| format!("write pid file: {err}"))?;
 
@@ -375,6 +392,7 @@ fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
         .map_err(|err| format!("clone daemon log: {err}"))?;
     let foreground_args = server_foreground_args(args);
     let child = Command::new("setsid")
+        .arg("--")
         .arg(exe)
         .args(foreground_args)
         .stdin(Stdio::null())
@@ -588,6 +606,7 @@ fn run_client(args: Vec<OsString>) {
     let initial_service_tier = initial_config.service_tier.clone();
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
     let thread_id = thread_id_from_args(&resolved_args);
+    let resume_thread_id = thread_id.clone();
     repair_resume_session_cwd(&resolved_args, &codex_cwd);
     reinforce_loaded_resume_permissions(&paths.app_server_socket, &resolved_args, &codex_cwd);
     if let Some(thread_id) = thread_id.as_deref() {
@@ -692,6 +711,13 @@ fn run_client(args: Vec<OsString>) {
         "/clients/register",
         &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
     );
+    if let Some(thread_id) = resume_thread_id {
+        spawn_loaded_resume_permissions_reinforcer(
+            paths.app_server_socket.clone(),
+            thread_id,
+            codex_cwd.clone(),
+        );
+    }
 
     let child_event_tx = event_tx.clone();
     thread::spawn(move || {
@@ -1052,6 +1078,25 @@ fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString], cwd: &s
     if let Err(err) = update_app_server_resume_thread_settings(socket, &thread_id, cwd) {
         eprintln!("yolo: failed to update loaded Codex thread settings for {thread_id}: {err}");
     }
+}
+
+fn spawn_loaded_resume_permissions_reinforcer(socket: PathBuf, thread_id: String, cwd: String) {
+    thread::spawn(move || {
+        let start = Instant::now();
+        loop {
+            let err = match update_app_server_resume_thread_settings(&socket, &thread_id, &cwd) {
+                Ok(()) => return,
+                Err(err) => err,
+            };
+            if start.elapsed() >= RESUME_PERMISSIONS_REINFORCE_TIMEOUT {
+                eprintln!(
+                    "yolo: failed to reinforce loaded Codex thread settings for {thread_id}: {err}"
+                );
+                return;
+            }
+            thread::sleep(RESUME_PERMISSIONS_REINFORCE_INTERVAL);
+        }
+    });
 }
 
 fn resume_thread_id(args: &[OsString]) -> Option<String> {
@@ -2226,6 +2271,20 @@ fn run_refresh_resume(args: Vec<OsString>) -> Result<(), String> {
     Ok(())
 }
 
+fn run_refresh_permissions(args: Vec<OsString>) -> Result<(), String> {
+    ensure_server()?;
+    let request = parse_refresh_resume_args(args)?;
+    let value = api_post_json(
+        "/clients/refresh-permissions",
+        &serde_json::to_value(&request).map_err(|err| err.to_string())?,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
 fn parse_refresh_resume_args(args: Vec<OsString>) -> Result<RefreshResumeRequest, String> {
     let mut request = RefreshResumeRequest::default();
     let mut iter = args.into_iter();
@@ -2571,8 +2630,26 @@ fn ensure_server() -> Result<(), String> {
     if api_get_json("/status").is_ok() {
         return wait_for_app_server_ready(&paths, APP_SERVER_READY_TIMEOUT);
     }
+    if let Some(pid) = read_server_pid(&paths)
+        && process_exists(pid)
+    {
+        return Err(format!(
+            "yolo server pid {pid} is running but {} is not reachable",
+            paths.api_socket.display()
+        ));
+    }
     spawn_server_daemon(&[])?;
     wait_for_server_ready(&paths, APP_SERVER_READY_TIMEOUT)
+}
+
+fn read_server_pid(paths: &RuntimePaths) -> Option<u32> {
+    fs::read_to_string(&paths.pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+fn process_exists(pid: u32) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
 fn wait_for_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), String> {
@@ -3032,6 +3109,72 @@ fn refresh_resume_clients(
     }))
 }
 
+fn refresh_resume_permissions_clients(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    request: RefreshResumeRequest,
+) -> Result<Value, String> {
+    let clients = {
+        let state = state
+            .lock()
+            .map_err(|_| "server state lock poisoned".to_string())?;
+        state
+            .clients
+            .values()
+            .filter(|client| client.status == "running")
+            .filter(|client| refresh_resume_request_matches(&request, client))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if clients.is_empty() {
+        return Ok(json!({"ok": true, "matched": 0, "updated": []}));
+    }
+
+    let mut updated = Vec::new();
+    let mut skipped = Vec::new();
+    let mut errors = Vec::new();
+    for client in &clients {
+        let Some(thread_id) = client.thread_id.as_deref() else {
+            skipped.push(json!({
+                "client_id": client.id,
+                "cwd": client.cwd,
+                "reason": "client has no thread_id"
+            }));
+            continue;
+        };
+        match update_app_server_resume_thread_settings(
+            &paths.app_server_socket,
+            thread_id,
+            &client.cwd,
+        ) {
+            Ok(()) => {
+                note_client_permissions_update(&state, &client.id);
+                updated.push(json!({
+                    "client_id": client.id,
+                    "thread_id": thread_id,
+                    "cwd": client.cwd
+                }));
+            }
+            Err(err) => errors.push(json!({
+                "client_id": client.id,
+                "thread_id": thread_id,
+                "cwd": client.cwd,
+                "error": err
+            })),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!("failed to refresh yolo permissions: {errors:?}"));
+    }
+
+    Ok(json!({
+        "ok": true,
+        "matched": clients.len(),
+        "updated": updated,
+        "skipped": skipped
+    }))
+}
+
 fn refresh_resume_request_matches(request: &RefreshResumeRequest, client: &ClientInfo) -> bool {
     request.all
         || request
@@ -3235,6 +3378,17 @@ fn handle_api_request(
                     Ok(value) => json_response(200, &value),
                     Err(err) => json_response(500, &json!({"ok": false, "error": err})),
                 },
+                Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
+        }
+        ("POST", "/clients/refresh-permissions") => {
+            match serde_json::from_str::<RefreshResumeRequest>(body) {
+                Ok(request) => {
+                    match refresh_resume_permissions_clients(Arc::clone(&state), &paths, request) {
+                        Ok(value) => json_response(200, &value),
+                        Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+                    }
+                }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
             }
         }
@@ -3988,6 +4142,18 @@ fn note_client_settings_update(
     if let Some(reasoning_effort) = reasoning_effort {
         client.reasoning_effort = Some(reasoning_effort);
     }
+    client.settings_updated_at = Some(now);
+    client.updated_at = now;
+}
+
+fn note_client_permissions_update(state: &Arc<Mutex<ServerState>>, client_id: &str) {
+    let now = now_secs();
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let Some(client) = state.clients.get_mut(client_id) else {
+        return;
+    };
     client.settings_updated_at = Some(now);
     client.updated_at = now;
 }
@@ -4862,6 +5028,7 @@ Usage:
   yolo codex [CODEX_ARGS...]
   yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
   yolo upgrade-resume-all
+  yolo refresh-permissions --all|--client ID|--thread THREAD_ID|--cwd DIR
   yolo server [--daemon|--foreground] [--federation-listen ADDR]
   yolo status
   yolo stop
@@ -4886,6 +5053,9 @@ upgrade-resume-all asks the running yolo server to install the latest Codex
 CLI, wait for active app-server threads to become idle, restart its app-server
 child, and request every live yolo client wrapper to restart its Codex child as
 `codex resume` on the same terminal.
+
+refresh-permissions reapplies YOLO-mode live settings to already-loaded resume
+threads without restarting the yolo client or Codex child process.
 
 When run from inside Codex, upgrade-resume-all uses Phoenix mode: it excludes
 the caller's CODEX_THREAD_ID from the idle wait, then lets the final resume
