@@ -35,6 +35,8 @@ const RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const RESUME_CONTEXT_REPAIR_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 const RESUME_PERMISSIONS_REINFORCE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESUME_PERMISSIONS_REINFORCE_INTERVAL: Duration = Duration::from_secs(2);
+const APP_SERVER_SELF_HEAL_STABLE_AFTER: Duration = Duration::from_secs(60);
+const APP_SERVER_SELF_HEAL_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -1538,6 +1540,45 @@ mod tests {
             .collect()
     }
 
+    fn test_client(id: &str, args: &[&str], cwd: &str, thread_id: Option<&str>) -> ClientInfo {
+        ClientInfo {
+            id: id.to_string(),
+            yolo_pid: 1,
+            codex_pid: None,
+            cwd: cwd.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            remote: String::new(),
+            model: None,
+            service_tier: None,
+            reasoning_effort: None,
+            fast: false,
+            thread_id: thread_id.map(ToString::to_string),
+            started_at: 1,
+            updated_at: 1,
+            ended_at: None,
+            exit_code: None,
+            status: "running".to_string(),
+            codex_status: thread_id.map(|_| "active".to_string()),
+            codex_active_flags: Vec::new(),
+            codex_status_updated_at: thread_id.map(|_| 1),
+            settings_updated_at: None,
+        }
+    }
+
+    fn test_state(clients: Vec<ClientInfo>) -> ServerState {
+        ServerState {
+            started_at: 1,
+            app_server_pid: None,
+            app_server_generation: 0,
+            resume_generation: 0,
+            clients: clients
+                .into_iter()
+                .map(|client| (client.id.clone(), client))
+                .collect(),
+            slaves: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn codex_args_with_cwd_injects_launch_cwd() {
         let args = codex_args_with_cwd(os_args(&["resume", "--last"]), "/home/vagrant/head");
@@ -1785,6 +1826,80 @@ mod tests {
             },
         ];
         assert_eq!(top_level_app_server_pids(&processes, socket), vec![10, 20]);
+    }
+
+    #[test]
+    fn next_self_heal_backoff_doubles_until_cap() {
+        assert_eq!(
+            next_self_heal_backoff(Duration::from_secs(2)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_self_heal_backoff(Duration::from_secs(45)),
+            APP_SERVER_SELF_HEAL_MAX_BACKOFF
+        );
+        assert_eq!(
+            next_self_heal_backoff(APP_SERVER_SELF_HEAL_MAX_BACKOFF),
+            APP_SERVER_SELF_HEAL_MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn clear_conflicting_inferred_thread_ids_keeps_explicit_owner() {
+        let mut state = test_state(vec![
+            test_client(
+                "explicit",
+                &["resume", "thread-a"],
+                "/home/vagrant/head",
+                Some("thread-a"),
+            ),
+            test_client("inferred", &[], "/home/vagrant/head", Some("thread-a")),
+        ]);
+
+        clear_conflicting_inferred_thread_ids(&mut state);
+
+        assert_eq!(
+            state.clients["explicit"].thread_id.as_deref(),
+            Some("thread-a")
+        );
+        assert_eq!(state.clients["inferred"].thread_id, None);
+        assert_eq!(state.clients["inferred"].codex_status, None);
+    }
+
+    #[test]
+    fn clear_conflicting_inferred_thread_ids_repairs_wrong_explicit_client() {
+        let mut state = test_state(vec![test_client(
+            "explicit",
+            &["resume", "thread-real"],
+            "/home/vagrant/head",
+            Some("thread-wrong"),
+        )]);
+
+        clear_conflicting_inferred_thread_ids(&mut state);
+
+        assert_eq!(
+            state.clients["explicit"].thread_id.as_deref(),
+            Some("thread-real")
+        );
+        assert_eq!(state.clients["explicit"].codex_status, None);
+    }
+
+    #[test]
+    fn clear_conflicting_inferred_thread_ids_clears_duplicate_inferred_owners() {
+        let mut state = test_state(vec![
+            test_client("first", &[], "/home/vagrant/head", Some("thread-a")),
+            test_client("second", &[], "/home/vagrant/head", Some("thread-a")),
+            test_client("unique", &[], "/home/vagrant/websh", Some("thread-b")),
+        ]);
+
+        clear_conflicting_inferred_thread_ids(&mut state);
+
+        assert_eq!(state.clients["first"].thread_id, None);
+        assert_eq!(state.clients["second"].thread_id, None);
+        assert_eq!(
+            state.clients["unique"].thread_id.as_deref(),
+            Some("thread-b")
+        );
     }
 
     #[test]
@@ -3520,39 +3635,71 @@ fn handle_api_request(
 
 fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
     thread::spawn(move || {
+        let mut heal_backoff = THREAD_MONITOR_INTERVAL;
         loop {
+            let listener_started = Instant::now();
             if let Err(err) = run_thread_status_event_listener(&state, &paths) {
                 eprintln!("yolo server: Codex app-server status listener stopped: {err}");
+                if listener_started.elapsed() >= APP_SERVER_SELF_HEAL_STABLE_AFTER {
+                    heal_backoff = THREAD_MONITOR_INTERVAL;
+                }
                 thread::sleep(THREAD_MONITOR_INTERVAL);
-                if let Err(heal_err) =
-                    heal_missing_app_server_after_listener_error(Arc::clone(&state), &paths)
-                {
-                    eprintln!("yolo server: Codex app-server self-heal failed: {heal_err}");
-                    thread::sleep(THREAD_MONITOR_INTERVAL);
+                match heal_missing_app_server_after_listener_error(Arc::clone(&state), &paths) {
+                    Ok(
+                        AppServerSelfHeal::AlreadyReachable | AppServerSelfHeal::AdoptedExisting,
+                    ) => {}
+                    Ok(AppServerSelfHeal::SpawnedReplacement) => {
+                        eprintln!(
+                            "yolo server: Codex app-server replacement spawned; gating next rapid self-heal for {:?}",
+                            heal_backoff
+                        );
+                        thread::sleep(heal_backoff);
+                        heal_backoff = next_self_heal_backoff(heal_backoff);
+                    }
+                    Err(heal_err) => {
+                        eprintln!(
+                            "yolo server: Codex app-server self-heal failed: {heal_err}; retrying in {:?}",
+                            heal_backoff
+                        );
+                        thread::sleep(heal_backoff);
+                        heal_backoff = next_self_heal_backoff(heal_backoff);
+                    }
                 }
             }
         }
     });
 }
 
+enum AppServerSelfHeal {
+    AlreadyReachable,
+    AdoptedExisting,
+    SpawnedReplacement,
+}
+
 fn heal_missing_app_server_after_listener_error(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
-) -> Result<(), String> {
+) -> Result<AppServerSelfHeal, String> {
     if paths.app_server_socket.exists()
         && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
     {
-        return Ok(());
+        return Ok(AppServerSelfHeal::AlreadyReachable);
     }
     let existing_pids = find_app_server_pids(paths);
     if let Some(pid) = existing_pids.first().copied() {
         if let Ok(mut state) = state.lock() {
             state.app_server_pid = Some(pid);
         }
-        return Ok(());
+        return Ok(AppServerSelfHeal::AdoptedExisting);
     }
     eprintln!("yolo server: restarting missing Codex app-server after listener disconnect");
-    spawn_tracked_app_server(state, paths.clone()).map(|_| ())
+    spawn_tracked_app_server(state, paths.clone()).map(|_| AppServerSelfHeal::SpawnedReplacement)
+}
+
+fn next_self_heal_backoff(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(APP_SERVER_SELF_HEAL_MAX_BACKOFF)
 }
 
 fn run_thread_status_event_listener(
@@ -3834,6 +3981,8 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
     let Ok(mut state) = state.lock() else {
         return;
     };
+    clear_conflicting_inferred_thread_ids(&mut state);
+    let claimed_thread_ids = claimed_client_thread_ids(&state);
 
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
@@ -3844,8 +3993,14 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
             Some(thread_id) => snapshot.iter().find(|thread| thread.id == thread_id),
             None => snapshot
                 .iter()
+                .filter(|thread| !claimed_thread_ids.contains(&thread.id))
                 .find(|thread| thread.cwd == client.cwd && thread.status == "active")
-                .or_else(|| snapshot.iter().find(|thread| thread.cwd == client.cwd)),
+                .or_else(|| {
+                    snapshot
+                        .iter()
+                        .filter(|thread| !claimed_thread_ids.contains(&thread.id))
+                        .find(|thread| thread.cwd == client.cwd)
+                }),
         };
 
         let Some(thread) = matched else {
@@ -3888,6 +4043,8 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
     let Ok(mut state) = state.lock() else {
         return;
     };
+    clear_conflicting_inferred_thread_ids(&mut state);
+    let claimed_thread_ids = claimed_client_thread_ids(&state);
 
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
@@ -3896,7 +4053,11 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
 
         let matched = match client.thread_id.as_deref() {
             Some(thread_id) => thread.id == thread_id,
-            None => thread.cwd == client.cwd && thread.status == "active",
+            None => {
+                !claimed_thread_ids.contains(&thread.id)
+                    && thread.cwd == client.cwd
+                    && thread.status == "active"
+            }
         };
         if !matched {
             continue;
@@ -3929,6 +4090,75 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
             client.reasoning_effort = Some(reasoning_effort);
         }
     }
+}
+
+fn clear_conflicting_inferred_thread_ids(state: &mut ServerState) {
+    let explicit_thread_ids = state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter_map(|client| thread_id_from_args_strs(&client.args))
+        .collect::<BTreeSet<_>>();
+    let mut inferred_thread_id_counts = BTreeMap::<String, usize>::new();
+
+    for client in state.clients.values() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        let Some(thread_id) = client.thread_id.as_deref() else {
+            continue;
+        };
+        if thread_id_from_args_strs(&client.args)
+            .as_deref()
+            .is_some_and(|explicit_thread_id| explicit_thread_id == thread_id)
+        {
+            continue;
+        }
+        *inferred_thread_id_counts
+            .entry(thread_id.to_string())
+            .or_default() += 1;
+    }
+
+    for client in state.clients.values_mut() {
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        let Some(thread_id) = client.thread_id.clone() else {
+            continue;
+        };
+        let explicit_for_client = thread_id_from_args_strs(&client.args);
+        if let Some(explicit_thread_id) = explicit_for_client {
+            if explicit_thread_id != thread_id {
+                client.thread_id = Some(explicit_thread_id);
+                clear_client_codex_thread_status(client);
+            }
+            continue;
+        }
+        let duplicated_inferred = inferred_thread_id_counts
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default()
+            > 1;
+        if explicit_thread_ids.contains(&thread_id) || duplicated_inferred {
+            client.thread_id = None;
+            clear_client_codex_thread_status(client);
+        }
+    }
+}
+
+fn clear_client_codex_thread_status(client: &mut ClientInfo) {
+    client.codex_status = None;
+    client.codex_active_flags.clear();
+    client.codex_status_updated_at = Some(now_secs());
+}
+
+fn claimed_client_thread_ids(state: &ServerState) -> BTreeSet<String> {
+    state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter_map(|client| client.thread_id.clone())
+        .collect()
 }
 
 fn apply_thread_status_update(state: &Arc<Mutex<ServerState>>, update: &AppThreadStatusUpdate) {
