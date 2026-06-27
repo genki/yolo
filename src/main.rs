@@ -323,6 +323,12 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
 
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
+    if let Some(pid) = running_yolo_server_pid(&paths) {
+        return Err(format!(
+            "yolo server pid {pid} is already running; refusing to replace {}",
+            paths.api_socket.display()
+        ));
+    }
     if paths.api_socket.exists() {
         if api_get_json("/status").is_ok() {
             return Err(format!(
@@ -379,9 +385,21 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
 }
 
 fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
-    let exe = yolo_daemon_executable()?;
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
+    if api_get_json("/status").is_ok() {
+        return Err(format!(
+            "yolo server is already running at {}",
+            paths.api_socket.display()
+        ));
+    }
+    if let Some(pid) = running_yolo_server_pid(&paths) {
+        return Err(format!(
+            "yolo server pid {pid} is already running but {} is not reachable",
+            paths.api_socket.display()
+        ));
+    }
+    let exe = yolo_daemon_executable()?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -405,13 +423,18 @@ fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
 }
 
 fn yolo_daemon_executable() -> Result<PathBuf, String> {
+    if let Ok(value) = env::var("YOLO_REEXEC_BIN")
+        && !value.trim().is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    if let Some(path_exe) = find_executable_in_path("yolo") {
+        return Ok(path_exe);
+    }
     if let Ok(exe) = env::current_exe()
         && !exe.to_string_lossy().contains("(deleted)")
     {
         return Ok(exe);
-    }
-    if let Some(path_exe) = find_executable_in_path("yolo") {
-        return Ok(path_exe);
     }
     Err("could not find a non-deleted yolo executable for daemon startup".to_string())
 }
@@ -2654,9 +2677,7 @@ fn ensure_server() -> Result<(), String> {
     if api_get_json("/status").is_ok() {
         return wait_for_app_server_ready(&paths, APP_SERVER_READY_TIMEOUT);
     }
-    if let Some(pid) = read_server_pid(&paths)
-        && process_exists(pid)
-    {
+    if let Some(pid) = running_yolo_server_pid(&paths) {
         return Err(format!(
             "yolo server pid {pid} is running but {} is not reachable",
             paths.api_socket.display()
@@ -2666,14 +2687,21 @@ fn ensure_server() -> Result<(), String> {
     wait_for_server_ready(&paths, APP_SERVER_READY_TIMEOUT)
 }
 
+fn running_yolo_server_pid(paths: &RuntimePaths) -> Option<u32> {
+    read_server_pid(paths).filter(|pid| pid_is_alive(*pid) && pid_is_yolo_server(*pid))
+}
+
 fn read_server_pid(paths: &RuntimePaths) -> Option<u32> {
     fs::read_to_string(&paths.pid_file)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
-fn process_exists(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+fn pid_is_yolo_server(pid: u32) -> bool {
+    let cmdline = read_proc_cmdline(PathBuf::from(format!("/proc/{pid}/cmdline")));
+    cmdline.first().is_some_and(|arg| {
+        Path::new(arg).file_name().and_then(|name| name.to_str()) == Some("yolo")
+    }) && cmdline.iter().skip(1).any(|arg| arg == "server")
 }
 
 fn wait_for_server_ready(paths: &RuntimePaths, timeout: Duration) -> Result<(), String> {
