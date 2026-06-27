@@ -379,7 +379,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
 }
 
 fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
-    let exe = env::current_exe().map_err(|err| format!("current exe: {err}"))?;
+    let exe = yolo_daemon_executable()?;
     let paths = runtime_paths()?;
     fs::create_dir_all(&paths.dir).map_err(|err| format!("create runtime dir: {err}"))?;
     let log = fs::OpenOptions::new()
@@ -402,6 +402,18 @@ fn spawn_server_daemon(args: &[OsString]) -> Result<(), String> {
         .map_err(|err| format!("spawn yolo server: {err}"))?;
     println!("started yolo server pid {}", child.id());
     wait_for_server_ready(&paths, APP_SERVER_READY_TIMEOUT)
+}
+
+fn yolo_daemon_executable() -> Result<PathBuf, String> {
+    if let Ok(exe) = env::current_exe()
+        && !exe.to_string_lossy().contains("(deleted)")
+    {
+        return Ok(exe);
+    }
+    if let Some(path_exe) = find_executable_in_path("yolo") {
+        return Ok(path_exe);
+    }
+    Err("could not find a non-deleted yolo executable for daemon startup".to_string())
 }
 
 fn server_foreground_args(args: &[OsString]) -> Vec<OsString> {
@@ -1076,7 +1088,9 @@ fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString], cwd: &s
         return;
     };
     if let Err(err) = update_app_server_resume_thread_settings(socket, &thread_id, cwd) {
-        eprintln!("yolo: failed to update loaded Codex thread settings for {thread_id}: {err}");
+        if !is_app_server_thread_not_found_error(&err, &thread_id) {
+            eprintln!("yolo: failed to update loaded Codex thread settings for {thread_id}: {err}");
+        }
     }
 }
 
@@ -1089,14 +1103,24 @@ fn spawn_loaded_resume_permissions_reinforcer(socket: PathBuf, thread_id: String
                 Err(err) => err,
             };
             if start.elapsed() >= RESUME_PERMISSIONS_REINFORCE_TIMEOUT {
-                eprintln!(
-                    "yolo: failed to reinforce loaded Codex thread settings for {thread_id}: {err}"
-                );
+                if is_app_server_thread_not_found_error(&err, &thread_id) {
+                    eprintln!(
+                        "yolo: Codex thread {thread_id} was not loaded before permissions reinforcement timed out"
+                    );
+                } else {
+                    eprintln!(
+                        "yolo: failed to reinforce loaded Codex thread settings for {thread_id}: {err}"
+                    );
+                }
                 return;
             }
             thread::sleep(RESUME_PERMISSIONS_REINFORCE_INTERVAL);
         }
     });
+}
+
+fn is_app_server_thread_not_found_error(err: &str, thread_id: &str) -> bool {
+    err.contains(&format!("thread not found: {thread_id}"))
 }
 
 fn resume_thread_id(args: &[OsString]) -> Option<String> {
@@ -3472,9 +3496,35 @@ fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePat
             if let Err(err) = run_thread_status_event_listener(&state, &paths) {
                 eprintln!("yolo server: Codex app-server status listener stopped: {err}");
                 thread::sleep(THREAD_MONITOR_INTERVAL);
+                if let Err(heal_err) =
+                    heal_missing_app_server_after_listener_error(Arc::clone(&state), &paths)
+                {
+                    eprintln!("yolo server: Codex app-server self-heal failed: {heal_err}");
+                    thread::sleep(THREAD_MONITOR_INTERVAL);
+                }
             }
         }
     });
+}
+
+fn heal_missing_app_server_after_listener_error(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+) -> Result<(), String> {
+    if paths.app_server_socket.exists()
+        && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
+    {
+        return Ok(());
+    }
+    let existing_pids = find_app_server_pids(paths);
+    if let Some(pid) = existing_pids.first().copied() {
+        if let Ok(mut state) = state.lock() {
+            state.app_server_pid = Some(pid);
+        }
+        return Ok(());
+    }
+    eprintln!("yolo server: restarting missing Codex app-server after listener disconnect");
+    spawn_tracked_app_server(state, paths.clone()).map(|_| ())
 }
 
 fn run_thread_status_event_listener(
