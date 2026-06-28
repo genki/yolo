@@ -144,6 +144,8 @@ struct SlaveCommand {
     yolo_version: Option<String>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    configure: Option<ConfigureClientsRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,7 +191,7 @@ struct CodexLaunchConfig {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConfigureClientsRequest {
     #[serde(default)]
     client_id: Option<String>,
@@ -2003,6 +2005,45 @@ mod tests {
     fn sqlite_quote_escapes_single_quotes() {
         assert_eq!(sqlite_quote("/tmp/it's"), "'/tmp/it''s'");
     }
+
+    #[test]
+    fn ensure_json_ok_rejects_explicit_false() {
+        let value = json!({
+            "ok": false,
+            "error": "timed out waiting for selected Codex clients"
+        });
+
+        assert_eq!(
+            ensure_json_ok(&value).unwrap_err(),
+            "timed out waiting for selected Codex clients"
+        );
+        assert!(ensure_json_ok(&json!({"ok": true})).is_ok());
+        assert!(ensure_json_ok(&json!({"clients": []})).is_ok());
+    }
+
+    #[test]
+    fn slave_command_deserializes_configure_request() {
+        let command = serde_json::from_value::<SlaveCommand>(json!({
+            "id": "cmd-test",
+            "action": "configure-clients",
+            "configure": {
+                "all": true,
+                "model": "gpt-5.5",
+                "reasoning_effort": "medium",
+                "fast": false,
+                "timeout_secs": 5
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(command.action, "configure-clients");
+        let configure = command.configure.unwrap();
+        assert!(configure.all);
+        assert_eq!(configure.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(configure.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(configure.fast, Some(false));
+        assert_eq!(configure.timeout_secs, Some(5));
+    }
 }
 
 fn wait_for_resume_generation_advance(seen_resume_generation: &AtomicU64) -> bool {
@@ -2412,11 +2453,8 @@ fn run_configure(args: Vec<OsString>) -> Result<(), String> {
         "/clients/configure",
         &serde_json::to_value(&request).map_err(|err| err.to_string())?,
     )?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
-    );
-    Ok(())
+    print_pretty_json(&value)?;
+    ensure_json_ok(&value)
 }
 
 fn run_refresh_resume(args: Vec<OsString>) -> Result<(), String> {
@@ -2431,6 +2469,25 @@ fn run_refresh_resume(args: Vec<OsString>) -> Result<(), String> {
         serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
     );
     Ok(())
+}
+
+fn print_pretty_json(value: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
+fn ensure_json_ok(value: &Value) -> Result<(), String> {
+    if value.get("ok").and_then(Value::as_bool) != Some(false) {
+        return Ok(());
+    }
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("server returned ok=false");
+    Err(message.to_string())
 }
 
 fn run_refresh_permissions(args: Vec<OsString>) -> Result<(), String> {
@@ -3182,6 +3239,18 @@ fn execute_slave_command(
                     );
                     value
                 }
+                Err(err) => json!({"ok": false, "error": err}),
+            }
+        }
+        "configure-clients" | "clients-configure" | "configure" | "set" => {
+            let Some(request) = command.configure.clone() else {
+                return json!({
+                    "ok": false,
+                    "error": "configure-clients command requires a configure request"
+                });
+            };
+            match configure_clients_when_idle(state, paths, request) {
+                Ok(value) => value,
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
@@ -5336,6 +5405,7 @@ Usage:
   yolo codex [CODEX_ARGS...]
   yolo upgrade-resume [--last|SESSION_ID|RESUME_ARGS...]
   yolo upgrade-resume-all
+  yolo set --all|--client ID|--thread THREAD_ID|--cwd DIR [--model MODEL] [--effort EFFORT] [--fast-on|--fast-off]
   yolo refresh-permissions --all|--client ID|--thread THREAD_ID|--cwd DIR
   yolo server [--daemon|--foreground] [--federation-listen ADDR]
   yolo status
@@ -5377,6 +5447,8 @@ Federation:
   yolo server --daemon --federation-listen 127.0.0.1:47040
   YOLO_MASTER_URL=https://agent-gate/.../@localhost:47040 \
     YOLO_SLAVE_ID=slave YOLO_MASTER_BEARER_TOKEN=agt_... yolo server --daemon
+  curl -X POST http://127.0.0.1:47040/federation/slaves/slave/commands \
+    -d '{{\"action\":\"configure-clients\",\"configure\":{{\"all\":true,\"model\":\"gpt-5.5\",\"reasoning_effort\":\"medium\",\"fast\":false}}}}'
 
 Federation authentication and HTTPS are delegated to agent-gate fine grained
 tokens. yolo only serves localhost HTTP and sends the optional Bearer token to
