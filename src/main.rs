@@ -191,7 +191,7 @@ struct CodexLaunchConfig {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConfigureClientsRequest {
     #[serde(default)]
     client_id: Option<String>,
@@ -3254,6 +3254,31 @@ fn execute_slave_command(
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
+        "refresh-permissions" | "permissions-refresh" | "refresh-yolo-permissions" => {
+            let request = command.configure.clone().map_or_else(
+                || ConfigureClientsRequest {
+                    all: true,
+                    ..ConfigureClientsRequest::default()
+                },
+                |configure| ConfigureClientsRequest {
+                    all: configure.all,
+                    client_id: configure.client_id,
+                    thread_id: configure.thread_id,
+                    cwd: configure.cwd,
+                    ..ConfigureClientsRequest::default()
+                },
+            );
+            let request = RefreshResumeRequest {
+                all: request.all,
+                client_id: request.client_id,
+                thread_id: request.thread_id,
+                cwd: request.cwd,
+            };
+            match refresh_resume_permissions_clients(state, paths, request) {
+                Ok(value) => value,
+                Err(err) => json!({"ok": false, "error": err}),
+            }
+        }
         _ => {
             json!({"ok": false, "error": format!("unknown slave command action: {}", command.action)})
         }
@@ -3378,6 +3403,16 @@ fn refresh_resume_permissions_clients(
             }));
             continue;
         };
+        if let Err(err) = repair_resume_thread_id(thread_id, &client.cwd) {
+            errors.push(json!({
+                "client_id": client.id,
+                "thread_id": thread_id,
+                "cwd": client.cwd,
+                "stage": "repair_resume_context",
+                "error": err
+            }));
+            continue;
+        }
         match update_app_server_resume_thread_settings(
             &paths.app_server_socket,
             thread_id,
