@@ -4088,6 +4088,8 @@ fn is_yolo_client_args(args: &[String]) -> bool {
         Some("upgrade-resume" | "resume-upgrade" | "upgrade-and-resume") => false,
         Some("upgrade-resume-all" | "resume-all-upgrade") => false,
         Some("external-codex-upgrade-resume" | "upgrade-external-codex") => false,
+        Some("refresh-resume" | "resume-refresh") => false,
+        Some("refresh-permissions" | "permissions-refresh") => false,
         Some(arg) if arg.starts_with('-') => true,
         Some(_) => true,
     }
