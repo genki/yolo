@@ -3392,6 +3392,7 @@ fn refresh_resume_permissions_clients(
     }
 
     let mut updated = Vec::new();
+    let mut updated_thread_ids = BTreeSet::new();
     let mut skipped = Vec::new();
     let mut errors = Vec::new();
     for client in &clients {
@@ -3420,6 +3421,7 @@ fn refresh_resume_permissions_clients(
         ) {
             Ok(()) => {
                 note_client_permissions_update(&state, &client.id);
+                updated_thread_ids.insert(thread_id.to_string());
                 updated.push(json!({
                     "client_id": client.id,
                     "thread_id": thread_id,
@@ -3434,6 +3436,42 @@ fn refresh_resume_permissions_clients(
             })),
         }
     }
+    let loaded_threads = app_server_thread_snapshot(paths, None).unwrap_or_else(|err| {
+        errors.push(json!({
+            "stage": "app_server_snapshot",
+            "error": err
+        }));
+        Vec::new()
+    });
+    let mut updated_loaded_threads = Vec::new();
+    for thread in loaded_threads {
+        if updated_thread_ids.contains(&thread.id) {
+            continue;
+        }
+        if !refresh_resume_request_matches_thread(&request, &thread) {
+            continue;
+        }
+        match update_app_server_resume_thread_settings(
+            &paths.app_server_socket,
+            &thread.id,
+            &thread.cwd,
+        ) {
+            Ok(()) => {
+                updated_thread_ids.insert(thread.id.clone());
+                updated_loaded_threads.push(json!({
+                    "thread_id": thread.id,
+                    "cwd": thread.cwd,
+                    "status": thread.status
+                }));
+            }
+            Err(err) => errors.push(json!({
+                "thread_id": thread.id,
+                "cwd": thread.cwd,
+                "stage": "loaded_thread_settings_update",
+                "error": err
+            })),
+        }
+    }
     if !errors.is_empty() {
         return Err(format!("failed to refresh yolo permissions: {errors:?}"));
     }
@@ -3442,8 +3480,24 @@ fn refresh_resume_permissions_clients(
         "ok": true,
         "matched": clients.len(),
         "updated": updated,
+        "updated_loaded_threads": updated_loaded_threads,
         "skipped": skipped
     }))
+}
+
+fn refresh_resume_request_matches_thread(
+    request: &RefreshResumeRequest,
+    thread: &AppThreadSnapshot,
+) -> bool {
+    request.all
+        || request
+            .thread_id
+            .as_deref()
+            .is_some_and(|value| value == thread.id)
+        || request
+            .cwd
+            .as_deref()
+            .is_some_and(|value| value == thread.cwd)
 }
 
 fn refresh_resume_request_matches(request: &RefreshResumeRequest, client: &ClientInfo) -> bool {
