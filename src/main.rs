@@ -89,6 +89,27 @@ struct ServerInfo {
     clients: Vec<ClientInfo>,
     #[serde(default)]
     slaves: Vec<SlaveInfo>,
+    #[serde(default)]
+    tmux_panes: Vec<TmuxPaneInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CodexUiStatus {
+    model: Option<String>,
+    effort: Option<String>,
+    fast: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TmuxPaneInfo {
+    session_name: Option<String>,
+    window_index: Option<u32>,
+    pane_index: Option<u32>,
+    pane_pid: Option<u32>,
+    cwd: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    codex_ui_status: Option<CodexUiStatus>,
 }
 
 #[derive(Debug)]
@@ -3279,6 +3300,15 @@ fn execute_slave_command(
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
+        "status" | "clients" | "local-status" | "local-clients" => {
+            let info = server_info(&state, paths);
+            json!({
+                "ok": true,
+                "status": info,
+                "clients": info.clients,
+                "tmux_panes": info.tmux_panes,
+            })
+        }
         _ => {
             json!({"ok": false, "error": format!("unknown slave command action: {}", command.action)})
         }
@@ -3983,10 +4013,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         }
         let cfg = read_codex_config();
         let launch_cfg = parse_codex_launch_config(&args);
-        let service_tier = launch_cfg
-            .service_tier
-            .clone()
-            .or_else(|| cfg.service_tier.clone());
+        let service_tier = launch_cfg.service_tier.clone();
         state.clients.insert(
             id.clone(),
             ClientInfo {
@@ -4751,7 +4778,129 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         app_server_socket: paths.app_server_socket.display().to_string(),
         clients: state.clients.values().cloned().collect(),
         slaves: state.slaves.values().cloned().collect(),
+        tmux_panes: collect_tmux_panes(),
     }
+}
+
+fn collect_tmux_panes() -> Vec<TmuxPaneInfo> {
+    let socket_name = env::var("YOLO_TMUX_SOCKET")
+        .or_else(|_| env::var("WEBSH_TMUX_SOCKET_NAME"))
+        .unwrap_or_else(|_| "websh".to_string());
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            &socket_name,
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| parse_tmux_pane_line(line, &socket_name))
+        .collect()
+}
+
+fn parse_tmux_pane_line(line: &str, socket_name: &str) -> Option<TmuxPaneInfo> {
+    let mut parts = line.split('\t');
+    let session_name = nonempty_string(parts.next());
+    let window_index = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let pane_index = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let pane_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let cwd = nonempty_string(parts.next());
+    let command = nonempty_string(parts.next());
+    let codex_ui_status = if matches!(command.as_deref(), Some("yolo" | "codex")) {
+        session_name
+            .as_ref()
+            .zip(window_index)
+            .zip(pane_index)
+            .and_then(|((session, window), pane)| {
+                capture_codex_ui_status(socket_name, session, window, pane)
+            })
+    } else {
+        None
+    };
+    Some(TmuxPaneInfo {
+        session_name,
+        window_index,
+        pane_index,
+        pane_pid,
+        cwd,
+        command,
+        codex_ui_status,
+    })
+}
+
+fn nonempty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn capture_codex_ui_status(
+    socket_name: &str,
+    session_name: &str,
+    window_index: u32,
+    pane_index: u32,
+) -> Option<CodexUiStatus> {
+    let target = format!("{session_name}:{window_index}.{pane_index}");
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            socket_name,
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            &target,
+            "-S",
+            "-20",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    extract_codex_ui_status(&text)
+}
+
+fn extract_codex_ui_status(text: &str) -> Option<CodexUiStatus> {
+    for line in text.lines().rev() {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        for pair in words.windows(2) {
+            let model = pair[0].trim();
+            let effort = pair[1].trim().to_ascii_lowercase();
+            if !model.starts_with("gpt-") {
+                continue;
+            }
+            if !matches!(
+                effort.as_str(),
+                "fast" | "medium" | "high" | "xhigh" | "default"
+            ) {
+                continue;
+            }
+            return Some(CodexUiStatus {
+                model: Some(model.to_string()),
+                effort: if effort == "default" {
+                    None
+                } else {
+                    Some(effort.clone())
+                },
+                fast: Some(effort == "fast"),
+            });
+        }
+    }
+    None
 }
 
 fn app_server_thread_snapshot(
