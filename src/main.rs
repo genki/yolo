@@ -76,6 +76,14 @@ struct ClientInfo {
     settings_updated_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ClientResumeSettings {
+    thread_id: Option<String>,
+    model: Option<String>,
+    service_tier: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerInfo {
     version: String,
@@ -376,6 +384,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
     scan_existing_yolo_clients(&state);
+    apply_initial_app_server_thread_snapshot(&state, &paths);
     spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
     if let Some(addr) = federation_listen_addr(&args) {
         spawn_federation_listener(Arc::clone(&state), paths.clone(), addr)?;
@@ -790,7 +799,7 @@ fn run_client(args: Vec<OsString>) {
         match event_rx.recv() {
             Ok(ClientEvent::RestartRequested) => {
                 terminate_pid_tree(child_pid, Duration::from_secs(5));
-                reexec_client_for_resume(&original_args);
+                reexec_client_for_resume(&original_args, &client_id);
             }
             Ok(ClientEvent::CodexExited(Ok(status))) => {
                 if should_reexec_after_codex_exit(
@@ -798,7 +807,7 @@ fn run_client(args: Vec<OsString>) {
                     &original_args,
                     &seen_resume_generation,
                 ) {
-                    reexec_client_for_resume(&original_args);
+                    reexec_client_for_resume(&original_args, &client_id);
                 }
                 info.updated_at = now_secs();
                 info.ended_at = Some(now_secs());
@@ -1692,6 +1701,105 @@ mod tests {
 
         let args = replace_resume_last_with_thread(&os_args(&["resume"]), "019e-thread").unwrap();
         assert_eq!(string_args(args), vec!["resume", "019e-thread"]);
+    }
+
+    #[test]
+    fn resume_args_for_keeps_explicit_thread() {
+        let args = resume_args_for(&os_args(&["resume", "019e-thread"]), Some("other-thread"));
+        assert_eq!(string_args(args), vec!["resume", "019e-thread"]);
+    }
+
+    #[test]
+    fn resume_args_for_uses_preferred_thread_for_plain_yolo() {
+        let args = resume_args_for(&os_args(&[]), Some("019e-thread"));
+        assert_eq!(string_args(args), vec!["resume", "019e-thread"]);
+    }
+
+    #[test]
+    fn resume_args_for_preserves_options_with_preferred_thread() {
+        let args = resume_args_for(&os_args(&["--model", "gpt-5.5"]), Some("019e-thread"));
+        assert_eq!(
+            string_args(args),
+            vec!["--model", "gpt-5.5", "resume", "019e-thread"]
+        );
+    }
+
+    #[test]
+    fn resume_args_for_replaces_last_with_preferred_thread() {
+        let args = resume_args_for(
+            &os_args(&["--model", "gpt-5.5", "resume", "--last"]),
+            Some("019e-thread"),
+        );
+        assert_eq!(
+            string_args(args),
+            vec!["--model", "gpt-5.5", "resume", "019e-thread"]
+        );
+    }
+
+    #[test]
+    fn resume_args_for_falls_back_to_last_without_preferred_thread() {
+        let args = resume_args_for(&os_args(&["--model", "gpt-5.5"]), None);
+        assert_eq!(string_args(args), vec!["resume", "--last"]);
+    }
+
+    #[test]
+    fn preserve_resume_settings_args_adds_client_launch_settings() {
+        let settings = ClientResumeSettings {
+            thread_id: Some("019e-thread".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            service_tier: Some("default".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+        };
+        let args = preserve_resume_settings_args(os_args(&["resume", "019e-thread"]), &settings);
+        assert_eq!(
+            string_args(args),
+            vec![
+                "-c",
+                "model=\"gpt-5.5\"",
+                "-c",
+                "service_tier=\"default\"",
+                "-c",
+                "model_reasoning_effort=\"medium\"",
+                "resume",
+                "019e-thread"
+            ]
+        );
+    }
+
+    #[test]
+    fn preserve_resume_settings_args_keeps_explicit_launch_settings() {
+        let settings = ClientResumeSettings {
+            thread_id: Some("019e-thread".to_string()),
+            model: Some("gpt-5.6".to_string()),
+            service_tier: Some("priority".to_string()),
+            reasoning_effort: Some("high".to_string()),
+        };
+        let args = preserve_resume_settings_args(
+            os_args(&[
+                "--model",
+                "gpt-5.5",
+                "-c",
+                "service_tier=default",
+                "-c",
+                "model_reasoning_effort=medium",
+                "resume",
+                "019e-thread",
+            ]),
+            &settings,
+        );
+        assert_eq!(
+            string_args(args),
+            vec![
+                "--model",
+                "gpt-5.5",
+                "-c",
+                "service_tier=default",
+                "-c",
+                "model_reasoning_effort=medium",
+                "resume",
+                "019e-thread"
+            ]
+        );
     }
 
     #[test]
@@ -2767,15 +2875,28 @@ fn pid_is_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn resume_args_for(args: &[OsString]) -> Vec<OsString> {
+fn resume_args_for(args: &[OsString], preferred_thread_id: Option<&str>) -> Vec<OsString> {
     if thread_id_from_args(args).is_some() {
         return args.to_vec();
+    }
+    if let Some(thread_id) = preferred_thread_id.filter(|value| !value.trim().is_empty()) {
+        if resume_target_from_args(args) == Some(ResumeTarget::Last) {
+            if let Ok(args) = replace_resume_last_with_thread(args, thread_id) {
+                return args;
+            }
+        }
+        let mut out = args.to_vec();
+        out.push(OsString::from("resume"));
+        out.push(OsString::from(thread_id));
+        return out;
     }
     vec![OsString::from("resume"), OsString::from("--last")]
 }
 
-fn reexec_client_for_resume(original_args: &[OsString]) -> ! {
-    let resume_args = resume_args_for(original_args);
+fn reexec_client_for_resume(original_args: &[OsString], client_id: &str) -> ! {
+    let resume_settings = current_client_resume_settings(client_id);
+    let resume_args = resume_args_for(original_args, resume_settings.thread_id.as_deref());
+    let resume_args = preserve_resume_settings_args(resume_args, &resume_settings);
     eprintln!(
         "yolo: re-executing client after app-server restart with args: {}",
         resume_args
@@ -2791,6 +2912,97 @@ fn reexec_client_for_resume(original_args: &[OsString]) -> ! {
     }
     eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
     std::process::exit(127);
+}
+
+fn preserve_resume_settings_args(
+    args: Vec<OsString>,
+    settings: &ClientResumeSettings,
+) -> Vec<OsString> {
+    let string_args = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let launch_config = parse_codex_launch_config(&string_args);
+    let mut config_args = Vec::new();
+    if launch_config.model.is_none()
+        && let Some(model) = settings.model.as_deref().filter(|value| !value.is_empty())
+    {
+        config_args.push(codex_config_os_arg("model", model));
+    }
+    if launch_config.service_tier.is_none()
+        && let Some(service_tier) = settings
+            .service_tier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    {
+        config_args.push(codex_config_os_arg("service_tier", service_tier));
+    }
+    if launch_config.reasoning_effort.is_none()
+        && let Some(effort) = settings
+            .reasoning_effort
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    {
+        config_args.push(codex_config_os_arg("model_reasoning_effort", effort));
+    }
+    if config_args.is_empty() {
+        return args;
+    }
+    prepend_codex_config_args(args, config_args)
+}
+
+fn codex_config_os_arg(key: &str, value: &str) -> OsString {
+    OsString::from(format!("{key}=\"{}\"", toml_basic_string_escape(value)))
+}
+
+fn prepend_codex_config_args(args: Vec<OsString>, config_args: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len() + config_args.len() * 2);
+    for config_arg in config_args {
+        out.push(OsString::from("-c"));
+        out.push(config_arg);
+    }
+    out.extend(args);
+    out
+}
+
+fn current_client_resume_settings(client_id: &str) -> ClientResumeSettings {
+    let Ok(value) = api_get_json("/clients") else {
+        return ClientResumeSettings::default();
+    };
+    let Some(clients) = value.get("clients").and_then(Value::as_array) else {
+        return ClientResumeSettings::default();
+    };
+    let Some(client) = clients
+        .iter()
+        .find(|client| client.get("id").and_then(Value::as_str) == Some(client_id))
+    else {
+        return ClientResumeSettings::default();
+    };
+    let thread_id = nonempty_json_string(client, "thread_id");
+    let model = nonempty_json_string(client, "model");
+    let mut service_tier = nonempty_json_string(client, "service_tier").map(normalize_service_tier);
+    if service_tier.is_none() {
+        service_tier = client
+            .get("fast")
+            .and_then(Value::as_bool)
+            .map(|fast| if fast { "priority" } else { "default" }.to_string());
+    }
+    let reasoning_effort = nonempty_json_string(client, "reasoning_effort");
+    ClientResumeSettings {
+        thread_id,
+        model,
+        service_tier,
+        reasoning_effort,
+    }
+}
+
+fn nonempty_json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn yolo_reexec_candidates() -> Vec<PathBuf> {
@@ -4039,6 +4251,13 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 settings_updated_at: None,
             },
         );
+    }
+}
+
+fn apply_initial_app_server_thread_snapshot(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) {
+    match app_server_thread_snapshot(paths, None) {
+        Ok(snapshot) => apply_thread_snapshot(state, &snapshot),
+        Err(err) => eprintln!("yolo server: initial app-server thread snapshot failed: {err}"),
     }
 }
 
@@ -5479,6 +5698,16 @@ fn parse_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
     let mut config = CodexLaunchConfig::default();
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
+        if arg == "--model" || arg == "-m" {
+            if let Some(value) = iter.next() {
+                config.model = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--model=") {
+            config.model = Some(value.to_string());
+            continue;
+        }
         let item = if arg == "-c" || arg == "--config" {
             iter.next().map(String::as_str)
         } else if let Some(value) = arg.strip_prefix("--config=") {
