@@ -1,17 +1,20 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use sha1::{Digest, Sha1};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +33,8 @@ const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60)
 const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const APP_SERVER_RPC_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const APP_SERVER_CONFIGURE_MAX_ATTEMPTS: usize = 3;
+const APP_SERVER_CONFIGURE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const APP_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const RESUME_CONTEXT_REPAIR_WATCH_INTERVAL: Duration = Duration::from_secs(10);
@@ -37,6 +42,16 @@ const RESUME_PERMISSIONS_REINFORCE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESUME_PERMISSIONS_REINFORCE_INTERVAL: Duration = Duration::from_secs(2);
 const APP_SERVER_SELF_HEAL_STABLE_AFTER: Duration = Duration::from_secs(60);
 const APP_SERVER_SELF_HEAL_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const CLIENT_PROXY_DIR_NAME: &str = "client-proxies";
+const TURN_ARCHIVE_FILE_NAME: &str = "turns.jsonl";
+const APP_SERVER_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_TELEMETRY_THREADS: usize = 2048;
+const MAX_TELEMETRY_TOOL_CALLS: usize = 512;
+const MAX_TELEMETRY_HOOK_RUNS: usize = 512;
+const MAX_TELEMETRY_TURNS: usize = 512;
+const MAX_TURN_TEXT_BYTES: usize = 16 * 1024;
+const MAX_PENDING_TURN_INPUTS: usize = 128;
+const MAX_PENDING_TURN_INPUT_AGE_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -45,6 +60,7 @@ struct RuntimePaths {
     app_server_socket: PathBuf,
     pid_file: PathBuf,
     log_file: PathBuf,
+    turn_archive: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +77,8 @@ struct ClientInfo {
     reasoning_effort: Option<String>,
     fast: bool,
     thread_id: Option<String>,
+    #[serde(default)]
+    thread_id_source: String,
     started_at: u64,
     updated_at: u64,
     ended_at: Option<u64>,
@@ -99,6 +117,8 @@ struct ServerInfo {
     slaves: Vec<SlaveInfo>,
     #[serde(default)]
     tmux_panes: Vec<TmuxPaneInfo>,
+    #[serde(default)]
+    telemetry_summary: TelemetrySummary,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -114,6 +134,8 @@ struct TmuxPaneInfo {
     window_index: Option<u32>,
     pane_index: Option<u32>,
     pane_pid: Option<u32>,
+    #[serde(default)]
+    yolo_pid: Option<u32>,
     cwd: Option<String>,
     command: Option<String>,
     #[serde(default)]
@@ -128,6 +150,77 @@ struct ServerState {
     resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
     slaves: BTreeMap<String, SlaveInfo>,
+    telemetry: AgentTelemetry,
+    #[allow(dead_code)]
+    federation_push_senders: BTreeMap<String, mpsc::Sender<Value>>,
+    status_event_senders: BTreeMap<u64, mpsc::Sender<Value>>,
+    next_status_event_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppServerRpcPriority {
+    Control,
+    Background,
+}
+
+#[derive(Debug, Default)]
+struct AppServerRpcGateState {
+    active: bool,
+    control_waiters: usize,
+}
+
+#[derive(Debug)]
+struct AppServerRpcGate {
+    state: Mutex<AppServerRpcGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct AppServerRpcLease {
+    gate: &'static AppServerRpcGate,
+}
+
+static APP_SERVER_RPC_GATE: OnceLock<AppServerRpcGate> = OnceLock::new();
+
+fn app_server_rpc_gate() -> &'static AppServerRpcGate {
+    APP_SERVER_RPC_GATE.get_or_init(|| AppServerRpcGate {
+        state: Mutex::new(AppServerRpcGateState::default()),
+        changed: Condvar::new(),
+    })
+}
+
+fn acquire_app_server_rpc(priority: AppServerRpcPriority) -> AppServerRpcLease {
+    let gate = app_server_rpc_gate();
+    let mut state = gate.state.lock().expect("app-server RPC gate poisoned");
+    if priority == AppServerRpcPriority::Control {
+        state.control_waiters = state.control_waiters.saturating_add(1);
+        while state.active {
+            state = gate
+                .changed
+                .wait(state)
+                .expect("app-server RPC gate poisoned");
+        }
+        state.control_waiters = state.control_waiters.saturating_sub(1);
+    } else {
+        while state.active || state.control_waiters > 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .expect("app-server RPC gate poisoned");
+        }
+    }
+    state.active = true;
+    drop(state);
+    AppServerRpcLease { gate }
+}
+
+impl Drop for AppServerRpcLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.active = false;
+            self.gate.changed.notify_all();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +234,8 @@ struct SlaveInfo {
     status: String,
     #[serde(default)]
     commands: Vec<SlaveCommandRecord>,
+    #[serde(default)]
+    latest_status: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,6 +270,10 @@ struct SlaveCommand {
     command: Option<String>,
     #[serde(default)]
     configure: Option<ConfigureClientsRequest>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -208,9 +307,1293 @@ struct AppThreadStatusUpdate {
     active_flags: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct AgentTelemetry {
+    threads: BTreeMap<String, AgentThreadRecord>,
+    tool_calls: BTreeMap<String, ToolCallRecord>,
+    hook_runs: BTreeMap<String, HookRunRecord>,
+    turns: BTreeMap<String, TurnRecord>,
+    pending_turn_inputs: BTreeMap<String, VecDeque<PendingTurnInput>>,
+    last_event_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AgentThreadRecord {
+    thread_id: String,
+    parent_thread_id: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    name: Option<String>,
+    agent_role: Option<String>,
+    agent_nickname: Option<String>,
+    source: Option<String>,
+    status: String,
+    active_flags: Vec<String>,
+    created_at: Option<u64>,
+    updated_at: u64,
+    last_activity: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolCallRecord {
+    key: String,
+    item_id: String,
+    thread_id: String,
+    turn_id: String,
+    item_type: String,
+    tool_name: Option<String>,
+    phase: String,
+    status: String,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    success: Option<bool>,
+    receiver_thread_ids: Vec<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HookRunRecord {
+    key: String,
+    run_id: String,
+    thread_id: String,
+    turn_id: Option<String>,
+    event_name: String,
+    phase: String,
+    status: String,
+    handler_type: Option<String>,
+    scope: Option<String>,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    duration_ms: Option<u64>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TurnRecord {
+    key: String,
+    thread_id: String,
+    turn_id: String,
+    status: String,
+    #[serde(default)]
+    started_at_ms: Option<u64>,
+    #[serde(default)]
+    completed_at_ms: Option<u64>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    report: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingTurnInput {
+    prompt: String,
+    captured_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TurnInfo {
+    thread_id: String,
+    turn_id: String,
+    status: String,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    prompt: Option<String>,
+    report: Option<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TurnArchiveSnapshot {
+    generated_at: u64,
+    turns: Vec<TurnInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TelemetrySummary {
+    thread_count: usize,
+    subagent_count: usize,
+    active_agent_count: usize,
+    active_tool_call_count: usize,
+    running_hook_count: usize,
+    turn_count: usize,
+    captured_prompt_count: usize,
+    captured_report_count: usize,
+    last_event_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AgentInfo {
+    thread_id: String,
+    parent_thread_id: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    name: Option<String>,
+    agent_role: Option<String>,
+    agent_nickname: Option<String>,
+    source: Option<String>,
+    status: String,
+    active_flags: Vec<String>,
+    is_subagent: bool,
+    subagent_count: usize,
+    active_subagent_count: usize,
+    descendant_count: usize,
+    active_descendant_count: usize,
+    created_at: Option<u64>,
+    updated_at: u64,
+    last_activity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ToolCallInfo {
+    item_id: String,
+    thread_id: String,
+    turn_id: String,
+    item_type: String,
+    tool_name: Option<String>,
+    phase: String,
+    status: String,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    success: Option<bool>,
+    receiver_thread_ids: Vec<String>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HookRunInfo {
+    run_id: String,
+    thread_id: String,
+    turn_id: Option<String>,
+    event_name: String,
+    phase: String,
+    status: String,
+    handler_type: Option<String>,
+    scope: Option<String>,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    duration_ms: Option<u64>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TelemetrySnapshot {
+    generated_at: u64,
+    summary: TelemetrySummary,
+    agents: Vec<AgentInfo>,
+    tool_calls: Vec<ToolCallInfo>,
+    hook_runs: Vec<HookRunInfo>,
+}
+
+impl AgentTelemetry {
+    fn summary(&self) -> TelemetrySummary {
+        TelemetrySummary {
+            thread_count: self.threads.len(),
+            subagent_count: self
+                .threads
+                .values()
+                .filter(|thread| thread.parent_thread_id.is_some())
+                .count(),
+            active_agent_count: self
+                .threads
+                .values()
+                .filter(|thread| is_active_agent_status(&thread.status))
+                .count(),
+            active_tool_call_count: self
+                .tool_calls
+                .values()
+                .filter(|call| is_running_tool_status(&call.status))
+                .count(),
+            running_hook_count: self
+                .hook_runs
+                .values()
+                .filter(|run| is_running_hook_status(&run.status))
+                .count(),
+            turn_count: self.turns.len(),
+            captured_prompt_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.prompt.is_some())
+                .count(),
+            captured_report_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.report.is_some())
+                .count(),
+            last_event_at: self.last_event_at,
+        }
+    }
+
+    fn snapshot(&self) -> TelemetrySnapshot {
+        let mut agents = self
+            .threads
+            .values()
+            .map(|thread| {
+                let direct_children = self
+                    .threads
+                    .values()
+                    .filter(|candidate| {
+                        candidate.parent_thread_id.as_deref() == Some(thread.thread_id.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                let descendants = self
+                    .threads
+                    .values()
+                    .filter(|candidate| {
+                        candidate.thread_id != thread.thread_id
+                            && self.is_descendant_of(&candidate.thread_id, &thread.thread_id)
+                    })
+                    .collect::<Vec<_>>();
+                AgentInfo {
+                    thread_id: thread.thread_id.clone(),
+                    parent_thread_id: thread.parent_thread_id.clone(),
+                    session_id: thread.session_id.clone(),
+                    cwd: thread.cwd.clone(),
+                    name: thread.name.clone(),
+                    agent_role: thread.agent_role.clone(),
+                    agent_nickname: thread.agent_nickname.clone(),
+                    source: thread.source.clone(),
+                    status: thread.status.clone(),
+                    active_flags: thread.active_flags.clone(),
+                    is_subagent: thread.parent_thread_id.is_some(),
+                    subagent_count: direct_children.len(),
+                    active_subagent_count: direct_children
+                        .iter()
+                        .filter(|child| is_active_agent_status(&child.status))
+                        .count(),
+                    descendant_count: descendants.len(),
+                    active_descendant_count: descendants
+                        .iter()
+                        .filter(|child| is_active_agent_status(&child.status))
+                        .count(),
+                    created_at: thread.created_at,
+                    updated_at: thread.updated_at,
+                    last_activity: thread.last_activity.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
+
+        let mut tool_calls = self
+            .tool_calls
+            .values()
+            .map(|call| ToolCallInfo {
+                item_id: call.item_id.clone(),
+                thread_id: call.thread_id.clone(),
+                turn_id: call.turn_id.clone(),
+                item_type: call.item_type.clone(),
+                tool_name: call.tool_name.clone(),
+                phase: call.phase.clone(),
+                status: call.status.clone(),
+                started_at_ms: call.started_at_ms,
+                completed_at_ms: call.completed_at_ms,
+                duration_ms: call.duration_ms,
+                success: call.success,
+                receiver_thread_ids: call.receiver_thread_ids.clone(),
+                updated_at: call.updated_at,
+            })
+            .collect::<Vec<_>>();
+        tool_calls.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.item_id.cmp(&right.item_id))
+        });
+
+        let mut hook_runs = self
+            .hook_runs
+            .values()
+            .map(|run| HookRunInfo {
+                run_id: run.run_id.clone(),
+                thread_id: run.thread_id.clone(),
+                turn_id: run.turn_id.clone(),
+                event_name: run.event_name.clone(),
+                phase: run.phase.clone(),
+                status: run.status.clone(),
+                handler_type: run.handler_type.clone(),
+                scope: run.scope.clone(),
+                started_at: run.started_at,
+                completed_at: run.completed_at,
+                duration_ms: run.duration_ms,
+                updated_at: run.updated_at,
+            })
+            .collect::<Vec<_>>();
+        hook_runs.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+
+        TelemetrySnapshot {
+            generated_at: now_secs(),
+            summary: self.summary(),
+            agents,
+            tool_calls,
+            hook_runs,
+        }
+    }
+
+    fn turns_snapshot(&self, thread_id: Option<&str>, limit: usize) -> TurnArchiveSnapshot {
+        let mut turns = self
+            .turns
+            .values()
+            .filter(|turn| {
+                thread_id
+                    .map(|thread_id| turn.thread_id == thread_id)
+                    .unwrap_or(true)
+            })
+            .map(turn_info)
+            .collect::<Vec<_>>();
+        turns.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        turns.truncate(limit.clamp(1, MAX_TELEMETRY_TURNS));
+        TurnArchiveSnapshot {
+            generated_at: now_secs(),
+            turns,
+        }
+    }
+
+    fn merge_turn_infos(&mut self, infos: Vec<TurnInfo>) {
+        for info in infos {
+            let record = turn_record_from_info(info);
+            self.turns.insert(record.key.clone(), record);
+        }
+        self.trim_turns();
+    }
+
+    fn record_turn_input(&mut self, thread_id: &str, turn_id: Option<&str>, prompt: &str) -> bool {
+        if !turn_capture_enabled() {
+            return false;
+        }
+        let thread_id = thread_id.trim();
+        let prompt = bounded_turn_text(prompt);
+        if thread_id.is_empty() || prompt.is_empty() {
+            return false;
+        }
+        if let Some(turn_id) = turn_id.map(str::trim).filter(|turn_id| !turn_id.is_empty()) {
+            let record = self.ensure_turn(thread_id, turn_id);
+            record.prompt = Some(prompt);
+            record.updated_at = now_secs();
+            self.last_event_at = Some(now_secs());
+            self.trim_turns();
+            return true;
+        }
+
+        if let Some(record) = self
+            .turns
+            .values_mut()
+            .filter(|turn| {
+                turn.thread_id == thread_id
+                    && is_active_turn_status(&turn.status)
+                    && turn.prompt.is_none()
+            })
+            .max_by_key(|turn| turn.updated_at)
+        {
+            record.prompt = Some(prompt);
+            record.updated_at = now_secs();
+            self.last_event_at = Some(now_secs());
+            self.trim_turns();
+            return true;
+        }
+
+        let pending = self
+            .pending_turn_inputs
+            .entry(thread_id.to_string())
+            .or_default();
+        pending.push_back(PendingTurnInput {
+            prompt,
+            captured_at: now_secs(),
+        });
+        while pending.len() > MAX_PENDING_TURN_INPUTS {
+            pending.pop_front();
+        }
+        self.last_event_at = Some(now_secs());
+        false
+    }
+
+    fn record_turn_started(&mut self, thread_id: &str, turn_id: &str, started_at_ms: Option<u64>) {
+        if !turn_capture_enabled() {
+            return;
+        }
+        let thread_id = thread_id.trim();
+        let turn_id = turn_id.trim();
+        if thread_id.is_empty() || turn_id.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        let pending_prompt = self
+            .pending_turn_inputs
+            .get_mut(thread_id)
+            .and_then(|pending| {
+                while pending.front().is_some_and(|input| {
+                    now.saturating_sub(input.captured_at) > MAX_PENDING_TURN_INPUT_AGE_SECS
+                }) {
+                    pending.pop_front();
+                }
+                pending.pop_front()
+            })
+            .map(|pending| pending.prompt);
+        let record = self.ensure_turn(thread_id, turn_id);
+        record.status = "active".to_string();
+        record.started_at_ms = started_at_ms.or(record.started_at_ms);
+        if record.prompt.is_none() {
+            record.prompt = pending_prompt;
+        }
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+    }
+
+    fn record_turn_completed(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        status: &str,
+        completed_at_ms: Option<u64>,
+    ) {
+        if !turn_capture_enabled() {
+            return;
+        }
+        let thread_id = thread_id.trim();
+        let turn_id = turn_id.trim();
+        if thread_id.is_empty() || turn_id.is_empty() {
+            return;
+        }
+        let record = self.ensure_turn(thread_id, turn_id);
+        record.status = if status.trim().is_empty() {
+            "completed".to_string()
+        } else {
+            status.to_string()
+        };
+        record.completed_at_ms = completed_at_ms.or(record.completed_at_ms);
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+    }
+
+    fn record_turn_message(&mut self, thread_id: &str, turn_id: Option<&str>, item: &Value) {
+        if !turn_capture_enabled() {
+            return;
+        }
+        let Some(text) = extract_message_text(item) else {
+            return;
+        };
+        let Some(turn_id) = turn_id
+            .map(str::trim)
+            .filter(|turn_id| !turn_id.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.turns
+                    .values()
+                    .filter(|turn| {
+                        turn.thread_id == thread_id && is_active_turn_status(&turn.status)
+                    })
+                    .max_by_key(|turn| turn.updated_at)
+                    .map(|turn| turn.turn_id.clone())
+            })
+        else {
+            return;
+        };
+        let record = self.ensure_turn(thread_id, &turn_id);
+        if is_user_message_item(item) {
+            record.prompt = Some(text.clone());
+        }
+        if is_assistant_message_item(item) {
+            record.report = Some(text);
+        }
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+    }
+
+    fn ensure_turn(&mut self, thread_id: &str, turn_id: &str) -> &mut TurnRecord {
+        let key = turn_key(thread_id, turn_id);
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.to_string();
+        self.turns.entry(key.clone()).or_insert_with(|| TurnRecord {
+            key,
+            thread_id,
+            turn_id,
+            status: "unknown".to_string(),
+            updated_at: now_secs(),
+            ..TurnRecord::default()
+        })
+    }
+
+    fn trim_turns(&mut self) {
+        while self.turns.len() > MAX_TELEMETRY_TURNS {
+            let Some(candidate) = self
+                .turns
+                .values()
+                .min_by_key(|turn| turn.updated_at)
+                .map(|turn| turn.key.clone())
+            else {
+                break;
+            };
+            self.turns.remove(&candidate);
+        }
+    }
+
+    fn is_descendant_of(&self, candidate_id: &str, ancestor_id: &str) -> bool {
+        let mut current = self
+            .threads
+            .get(candidate_id)
+            .and_then(|thread| thread.parent_thread_id.clone());
+        let mut visited = BTreeSet::new();
+        while let Some(parent_id) = current {
+            if parent_id == ancestor_id {
+                return true;
+            }
+            if !visited.insert(parent_id.clone()) {
+                return false;
+            }
+            current = self
+                .threads
+                .get(&parent_id)
+                .and_then(|thread| thread.parent_thread_id.clone());
+        }
+        false
+    }
+
+    fn record_thread_value(&mut self, value: &Value) {
+        let Some(incoming) = parse_agent_thread_record(value) else {
+            return;
+        };
+        self.upsert_thread(incoming);
+    }
+
+    fn upsert_thread(&mut self, incoming: AgentThreadRecord) {
+        let now = now_secs();
+        let thread_id = incoming.thread_id.clone();
+        let record = self
+            .threads
+            .entry(thread_id)
+            .or_insert_with(|| AgentThreadRecord {
+                thread_id: incoming.thread_id.clone(),
+                status: "unknown".to_string(),
+                updated_at: now,
+                ..AgentThreadRecord::default()
+            });
+        if incoming.parent_thread_id.is_some() {
+            record.parent_thread_id = incoming.parent_thread_id;
+        }
+        if incoming.session_id.is_some() {
+            record.session_id = incoming.session_id;
+        }
+        if incoming.cwd.is_some() {
+            record.cwd = incoming.cwd;
+        }
+        if incoming.name.is_some() {
+            record.name = incoming.name;
+        }
+        if incoming.agent_role.is_some() {
+            record.agent_role = incoming.agent_role;
+        }
+        if incoming.agent_nickname.is_some() {
+            record.agent_nickname = incoming.agent_nickname;
+        }
+        if incoming.source.is_some() {
+            record.source = incoming.source;
+        }
+        let has_status = !incoming.status.is_empty() && incoming.status != "unknown";
+        if has_status {
+            record.status = incoming.status.clone();
+        }
+        if has_status || !incoming.active_flags.is_empty() {
+            record.active_flags = incoming.active_flags;
+        }
+        if incoming.created_at.is_some() {
+            record.created_at = incoming.created_at;
+        }
+        record.updated_at = incoming.updated_at.max(now);
+        self.last_event_at = Some(now);
+        self.trim_threads();
+    }
+
+    fn record_minimal_thread(
+        &mut self,
+        thread_id: &str,
+        parent_thread_id: Option<&str>,
+        status: Option<&str>,
+    ) {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return;
+        }
+        self.upsert_thread(AgentThreadRecord {
+            thread_id: thread_id.to_string(),
+            parent_thread_id: parent_thread_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            status: status.unwrap_or("unknown").to_string(),
+            updated_at: now_secs(),
+            ..AgentThreadRecord::default()
+        });
+    }
+
+    fn record_thread_status(&mut self, thread_id: &str, status: &str, active_flags: Vec<String>) {
+        self.record_minimal_thread(thread_id, None, Some(status));
+        if let Some(thread) = self.threads.get_mut(thread_id) {
+            thread.status = status.to_string();
+            thread.active_flags = active_flags;
+            thread.updated_at = now_secs();
+        }
+        self.last_event_at = Some(now_secs());
+    }
+
+    fn record_item_event(&mut self, params: &Value, completed: bool) -> bool {
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return false;
+        };
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(item) = params.get("item") else {
+            return false;
+        };
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+
+        self.record_minimal_thread(thread_id, None, Some("active"));
+        self.record_subagent_item(thread_id, item);
+        if item_type == "collabAgentToolCall" {
+            self.record_collab_agent_states(thread_id, item);
+        }
+        let captures_turn_text =
+            is_user_message_item(item) || (completed && is_assistant_message_item(item));
+        if captures_turn_text {
+            self.record_turn_message(thread_id, Some(turn_id), item);
+        }
+        if !is_tracked_tool_call_type(item_type) {
+            self.last_event_at = Some(now_secs());
+            self.trim_turns();
+            return captures_turn_text;
+        }
+
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return captures_turn_text;
+        };
+        let key = format!("{thread_id}:{turn_id}:{item_id}");
+        let item_updated_at = if completed {
+            params
+                .get("completedAtMs")
+                .and_then(Value::as_u64)
+                .map(|value| value / 1000)
+                .unwrap_or_else(now_secs)
+        } else {
+            params
+                .get("startedAtMs")
+                .and_then(Value::as_u64)
+                .map(|value| value / 1000)
+                .unwrap_or_else(now_secs)
+        };
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(if completed { "completed" } else { "running" })
+            .to_string();
+        let tool_name = item
+            .get("tool")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if item_type == "commandExecution" {
+                    Some("commandExecution")
+                } else if item_type == "fileChange" {
+                    Some("fileChange")
+                } else {
+                    None
+                }
+            })
+            .map(ToString::to_string);
+        let receiver_thread_ids = item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let success = item
+            .get("success")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                item.get("exitCode")
+                    .and_then(Value::as_i64)
+                    .map(|code| code == 0)
+            })
+            .or_else(|| match status.as_str() {
+                "completed" | "succeeded" => Some(true),
+                "failed" | "error" | "interrupted" => Some(false),
+                _ => None,
+            });
+
+        let record = self
+            .tool_calls
+            .entry(key.clone())
+            .or_insert_with(|| ToolCallRecord {
+                key: key.clone(),
+                item_id: item_id.to_string(),
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_type: item_type.to_string(),
+                phase: "pre".to_string(),
+                status: "running".to_string(),
+                updated_at: item_updated_at,
+                ..ToolCallRecord::default()
+            });
+        record.item_type = item_type.to_string();
+        record.tool_name = tool_name;
+        record.receiver_thread_ids = receiver_thread_ids.clone();
+        record.phase = if completed { "post" } else { "pre" }.to_string();
+        record.status = status;
+        record.success = success;
+        if completed {
+            record.completed_at_ms = params.get("completedAtMs").and_then(Value::as_u64);
+        } else {
+            record.started_at_ms = params.get("startedAtMs").and_then(Value::as_u64);
+        }
+        record.duration_ms = item.get("durationMs").and_then(Value::as_u64);
+        record.updated_at = item_updated_at;
+        for child_thread_id in receiver_thread_ids {
+            self.record_minimal_thread(child_thread_id.as_str(), Some(thread_id), Some("active"));
+        }
+        self.last_event_at = Some(now_secs());
+        self.trim_tool_calls();
+        captures_turn_text
+    }
+
+    fn record_subagent_item(&mut self, parent_thread_id: &str, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("subAgentActivity") {
+            return;
+        }
+        let Some(child_thread_id) = item.get("agentThreadId").and_then(Value::as_str) else {
+            return;
+        };
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status = match kind {
+            "started" => "active",
+            "interrupted" => "interrupted",
+            _ => "unknown",
+        };
+        self.record_minimal_thread(child_thread_id, Some(parent_thread_id), Some(status));
+        if let Some(thread) = self.threads.get_mut(child_thread_id) {
+            thread.parent_thread_id = Some(parent_thread_id.to_string());
+            thread.last_activity = Some(kind.to_string());
+            thread.updated_at = now_secs();
+        }
+    }
+
+    fn record_collab_agent_states(&mut self, parent_thread_id: &str, item: &Value) {
+        let Some(states) = item.get("agentsStates").and_then(Value::as_object) else {
+            return;
+        };
+        for (child_thread_id, state) in states {
+            let status = state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            self.record_minimal_thread(child_thread_id, Some(parent_thread_id), Some(status));
+            if let Some(thread) = self.threads.get_mut(child_thread_id) {
+                thread.parent_thread_id = Some(parent_thread_id.to_string());
+                thread.last_activity = state
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                thread.updated_at = now_secs();
+            }
+        }
+    }
+
+    fn record_hook_event(&mut self, params: &Value, completed: bool) {
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(run) = params.get("run") else {
+            return;
+        };
+        let Some(run_id) = run.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let key = format!("{thread_id}:{run_id}");
+        let event_name = run
+            .get("eventName")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status = run
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(if completed { "completed" } else { "running" });
+        let record = self
+            .hook_runs
+            .entry(key.clone())
+            .or_insert_with(|| HookRunRecord {
+                key,
+                run_id: run_id.to_string(),
+                thread_id: thread_id.to_string(),
+                turn_id: params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                event_name: event_name.to_string(),
+                phase: hook_phase(event_name).to_string(),
+                status: status.to_string(),
+                updated_at: now_secs(),
+                ..HookRunRecord::default()
+            });
+        record.event_name = event_name.to_string();
+        record.phase = hook_phase(event_name).to_string();
+        record.status = status.to_string();
+        record.handler_type = run
+            .get("handlerType")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        record.scope = run
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        record.started_at = run.get("startedAt").and_then(Value::as_u64);
+        record.completed_at = run.get("completedAt").and_then(Value::as_u64);
+        record.duration_ms = run.get("durationMs").and_then(Value::as_u64);
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_hook_runs();
+    }
+
+    fn record_app_server_event(&mut self, value: &Value) -> bool {
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            if let Some(thread) = value.get("result").and_then(|result| result.get("thread")) {
+                self.record_thread_value(thread);
+            }
+            return false;
+        };
+        let params = value.get("params").unwrap_or(&Value::Null);
+        match method {
+            "thread/started" => {
+                if let Some(thread) = params.get("thread") {
+                    self.record_thread_value(thread);
+                }
+                false
+            }
+            "thread/status/changed" => {
+                if let (Some(thread_id), Some(status)) = (
+                    params.get("threadId").and_then(Value::as_str),
+                    params.get("status"),
+                ) {
+                    let (status, active_flags) = parse_thread_status_value(status)
+                        .unwrap_or_else(|| ("unknown".to_string(), Vec::new()));
+                    self.record_thread_status(thread_id, &status, active_flags);
+                }
+                false
+            }
+            "turn/started" => {
+                if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
+                    if let Some(turn_id) = params.get("turnId").and_then(Value::as_str) {
+                        self.record_turn_started(
+                            thread_id,
+                            turn_id,
+                            params.get("startedAtMs").and_then(Value::as_u64),
+                        );
+                    }
+                    self.record_thread_status(thread_id, "active", Vec::new());
+                }
+                true
+            }
+            "turn/completed" => {
+                if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
+                    if let Some(turn_id) = params.get("turnId").and_then(Value::as_str) {
+                        let status = params
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("completed");
+                        self.record_turn_completed(
+                            thread_id,
+                            turn_id,
+                            status,
+                            params.get("completedAtMs").and_then(Value::as_u64),
+                        );
+                    }
+                    self.record_thread_status(thread_id, "idle", Vec::new());
+                }
+                true
+            }
+            "thread/closed" => {
+                if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
+                    self.record_thread_status(thread_id, "notLoaded", Vec::new());
+                }
+                false
+            }
+            "item/started" => self.record_item_event(params, false),
+            "item/completed" => self.record_item_event(params, true),
+            "hook/started" => {
+                self.record_hook_event(params, false);
+                false
+            }
+            "hook/completed" => {
+                self.record_hook_event(params, true);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn trim_threads(&mut self) {
+        while self.threads.len() > MAX_TELEMETRY_THREADS {
+            let candidate = self
+                .threads
+                .values()
+                .filter(|thread| !is_active_agent_status(&thread.status))
+                .min_by_key(|thread| thread.updated_at)
+                .map(|thread| thread.thread_id.clone());
+            let Some(candidate) = candidate else {
+                break;
+            };
+            self.threads.remove(&candidate);
+        }
+    }
+
+    fn trim_tool_calls(&mut self) {
+        while self.tool_calls.len() > MAX_TELEMETRY_TOOL_CALLS {
+            let Some(candidate) = self
+                .tool_calls
+                .values()
+                .min_by_key(|call| call.updated_at)
+                .map(|call| call.key.clone())
+            else {
+                break;
+            };
+            self.tool_calls.remove(&candidate);
+        }
+    }
+
+    fn trim_hook_runs(&mut self) {
+        while self.hook_runs.len() > MAX_TELEMETRY_HOOK_RUNS {
+            let Some(candidate) = self
+                .hook_runs
+                .values()
+                .min_by_key(|run| run.updated_at)
+                .map(|run| run.key.clone())
+            else {
+                break;
+            };
+            self.hook_runs.remove(&candidate);
+        }
+    }
+}
+
+fn is_active_agent_status(status: &str) -> bool {
+    matches!(status, "active" | "inProgress" | "running" | "pendingInit")
+}
+
+fn is_running_tool_status(status: &str) -> bool {
+    !matches!(
+        status,
+        "completed" | "succeeded" | "failed" | "error" | "interrupted"
+    )
+}
+
+fn is_running_hook_status(status: &str) -> bool {
+    !matches!(
+        status,
+        "completed"
+            | "succeeded"
+            | "failed"
+            | "error"
+            | "timedOut"
+            | "cancelled"
+            | "blocked"
+            | "stopped"
+    )
+}
+
+fn is_active_turn_status(status: &str) -> bool {
+    matches!(status, "active" | "inProgress" | "running" | "pendingInit")
+}
+
+fn turn_capture_enabled() -> bool {
+    env::var("YOLO_TURN_CAPTURE")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn turn_key(thread_id: &str, turn_id: &str) -> String {
+    format!("{thread_id}:{turn_id}")
+}
+
+fn turn_info(turn: &TurnRecord) -> TurnInfo {
+    TurnInfo {
+        thread_id: turn.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        status: turn.status.clone(),
+        started_at_ms: turn.started_at_ms,
+        completed_at_ms: turn.completed_at_ms,
+        prompt: turn.prompt.clone(),
+        report: turn.report.clone(),
+        updated_at: turn.updated_at,
+    }
+}
+
+fn turn_record_from_info(info: TurnInfo) -> TurnRecord {
+    let key = turn_key(&info.thread_id, &info.turn_id);
+    TurnRecord {
+        key,
+        thread_id: info.thread_id,
+        turn_id: info.turn_id,
+        status: info.status,
+        started_at_ms: info.started_at_ms,
+        completed_at_ms: info.completed_at_ms,
+        prompt: info.prompt,
+        report: info.report,
+        updated_at: info.updated_at,
+    }
+}
+
+fn bounded_turn_text(value: &str) -> String {
+    let value = value.trim();
+    if value.len() <= MAX_TURN_TEXT_BYTES {
+        return value.to_string();
+    }
+    let suffix = "\n[truncated]";
+    let max_body = MAX_TURN_TEXT_BYTES.saturating_sub(suffix.len());
+    let mut end = max_body.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], suffix)
+}
+
+fn collect_message_text(value: &Value, output: &mut Vec<String>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                output.push(text.trim().to_string());
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_message_text(value, output, depth + 1);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    output.push(text.trim().to_string());
+                }
+                return;
+            }
+            for key in ["content", "input", "message", "prompt", "items"] {
+                if let Some(value) = object.get(key) {
+                    collect_message_text(value, output, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_message_text(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_message_text(value, &mut parts, 0);
+    if parts.is_empty() {
+        return None;
+    }
+    Some(bounded_turn_text(&parts.join("\n")))
+}
+
+fn extract_turn_prompt(params: &Value) -> Option<String> {
+    for key in ["input", "prompt", "message", "items"] {
+        if let Some(value) = params.get(key)
+            && let Some(text) = extract_message_text(value)
+            && !text.is_empty()
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn is_user_message_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("userMessage")
+        || item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn is_assistant_message_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("agentMessage" | "assistantMessage")
+    ) || item.get("role").and_then(Value::as_str) == Some("assistant")
+}
+
+fn is_tracked_tool_call_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "collabAgentToolCall"
+            | "webSearch"
+            | "imageGeneration"
+            | "imageView"
+    )
+}
+
+fn hook_phase(event_name: &str) -> &'static str {
+    match event_name {
+        "preToolUse" | "permissionRequest" => "pre",
+        "postToolUse" => "post",
+        _ => "lifecycle",
+    }
+}
+
+fn parse_agent_thread_record(value: &Value) -> Option<AgentThreadRecord> {
+    let thread_id = value.get("id").and_then(Value::as_str)?.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+    let status_value = value.get("status");
+    let status = status_value
+        .and_then(|status| status.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active_flags = status_value
+        .and_then(|status| status.get("activeFlags"))
+        .and_then(Value::as_array)
+        .map(|flags| {
+            flags
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let source_value = value.get("source");
+    let parent_thread_id = value
+        .get("parentThreadId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            source_value?
+                .get("subAgent")
+                .and_then(|source| source.get("thread_spawn"))
+                .and_then(|spawn| spawn.get("parent_thread_id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+    Some(AgentThreadRecord {
+        thread_id: thread_id.to_string(),
+        parent_thread_id,
+        session_id: value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        cwd: value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        agent_role: value
+            .get("agentRole")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        agent_nickname: value
+            .get("agentNickname")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        source: source_value.and_then(json_enum_string),
+        status,
+        active_flags,
+        created_at: value.get("createdAt").and_then(Value::as_u64),
+        updated_at: value
+            .get("updatedAt")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(now_secs),
+        ..AgentThreadRecord::default()
+    })
+}
+
+fn json_enum_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .as_object()
+                .and_then(|object| object.keys().next())
+                .map(ToString::to_string)
+        })
+}
+
 enum ClientEvent {
     RestartRequested,
+    ThreadBound(String),
+    TurnInput {
+        thread_id: String,
+        turn_id: Option<String>,
+        prompt: String,
+    },
     CodexExited(Result<ExitStatus, String>),
+}
+
+struct ClientThreadProxy {
+    socket_path: PathBuf,
+    remote: String,
+}
+
+struct WebsocketFrame {
+    raw: Vec<u8>,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+struct ThreadBindingTracker {
+    pending_create_request_ids: BTreeSet<u64>,
+    current_thread_id: Option<String>,
+    event_tx: mpsc::Sender<ClientEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +1621,8 @@ struct ConfigureClientsRequest {
     reasoning_effort: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    queue: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -287,6 +1672,13 @@ fn main() {
         Some("status") | Some("clients") => {
             if let Err(err) = print_status() {
                 eprintln!("yolo status: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("turns") | Some("transcript") => {
+            args.remove(0);
+            if let Err(err) = print_turns(args) {
+                eprintln!("yolo turns: {err}");
                 std::process::exit(1);
             }
         }
@@ -374,6 +1766,8 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
     fs::write(&paths.pid_file, std::process::id().to_string())
         .map_err(|err| format!("write pid file: {err}"))?;
 
+    let mut telemetry = AgentTelemetry::default();
+    load_turn_archive(&paths.turn_archive, &mut telemetry);
     let state = Arc::new(Mutex::new(ServerState {
         started_at: now_secs(),
         app_server_pid: None,
@@ -381,11 +1775,16 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         resume_generation: 0,
         clients: BTreeMap::new(),
         slaves: BTreeMap::new(),
+        telemetry,
+        federation_push_senders: BTreeMap::new(),
+        status_event_senders: BTreeMap::new(),
+        next_status_event_id: 0,
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
     scan_existing_yolo_clients(&state);
-    apply_initial_app_server_thread_snapshot(&state, &paths);
+    spawn_initial_app_server_thread_snapshot(Arc::clone(&state), paths.clone());
     spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
+    spawn_agent_telemetry_snapshot_monitor(Arc::clone(&state), paths.clone());
     if let Some(addr) = federation_listen_addr(&args) {
         spawn_federation_listener(Arc::clone(&state), paths.clone(), addr)?;
     }
@@ -647,7 +2046,7 @@ fn run_client(args: Vec<OsString>) {
             std::process::exit(1);
         }
     };
-    let remote = env::var("YOLO_REMOTE")
+    let upstream_remote = env::var("YOLO_REMOTE")
         .unwrap_or_else(|_| format!("unix://{}", paths.app_server_socket.display()));
 
     let client_id = format!("{}-{}", std::process::id(), now_millis());
@@ -695,12 +2094,17 @@ fn run_client(args: Vec<OsString>) {
         codex_pid: None,
         cwd: cwd.clone(),
         args: string_args,
-        remote: remote.clone(),
+        remote: upstream_remote.clone(),
         model: initial_config.model,
         service_tier: initial_service_tier,
         reasoning_effort: None,
         fast: initial_fast,
         thread_id,
+        thread_id_source: if resume_thread_id.is_some() {
+            "resume_arg".to_string()
+        } else {
+            "unresolved".to_string()
+        },
         started_at: now_secs(),
         updated_at: now_secs(),
         ended_at: None,
@@ -714,6 +2118,18 @@ fn run_client(args: Vec<OsString>) {
 
     let heartbeat_id = client_id.clone();
     let (event_tx, event_rx) = mpsc::channel::<ClientEvent>();
+    let client_proxy =
+        match spawn_client_thread_proxy(&paths, &client_id, &upstream_remote, event_tx.clone()) {
+            Ok(proxy) => Some(proxy),
+            Err(err) => {
+                eprintln!("yolo: thread binding proxy unavailable: {err}");
+                None
+            }
+        };
+    let remote = client_proxy
+        .as_ref()
+        .map(|proxy| proxy.remote.clone())
+        .unwrap_or_else(|| upstream_remote.clone());
     let heartbeat_event_tx = event_tx.clone();
     let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
@@ -798,10 +2214,46 @@ fn run_client(args: Vec<OsString>) {
     loop {
         match event_rx.recv() {
             Ok(ClientEvent::RestartRequested) => {
+                if let Some(proxy) = client_proxy.as_ref() {
+                    let _ = remove_socket_if_present(&proxy.socket_path);
+                }
                 terminate_pid_tree(child_pid, Duration::from_secs(5));
                 reexec_client_for_resume(&original_args, &client_id);
             }
+            Ok(ClientEvent::ThreadBound(thread_id)) => {
+                if info.thread_id.as_deref() != Some(thread_id.as_str())
+                    || info.thread_id_source != "proxy"
+                {
+                    info.thread_id = Some(thread_id);
+                    info.thread_id_source = "proxy".to_string();
+                    info.codex_status = None;
+                    info.codex_active_flags.clear();
+                    info.codex_status_updated_at = Some(now_secs());
+                    info.updated_at = now_secs();
+                    let _ = api_post_json(
+                        "/clients/register",
+                        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                    );
+                }
+            }
+            Ok(ClientEvent::TurnInput {
+                thread_id,
+                turn_id,
+                prompt,
+            }) => {
+                let _ = api_post_json(
+                    "/turns/input",
+                    &json!({
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "prompt": prompt,
+                    }),
+                );
+            }
             Ok(ClientEvent::CodexExited(Ok(status))) => {
+                if let Some(proxy) = client_proxy.as_ref() {
+                    let _ = remove_socket_if_present(&proxy.socket_path);
+                }
                 if should_reexec_after_codex_exit(
                     status.success(),
                     &original_args,
@@ -820,6 +2272,9 @@ fn run_client(args: Vec<OsString>) {
                 std::process::exit(info.exit_code.unwrap_or(1));
             }
             Ok(ClientEvent::CodexExited(Err(err))) => {
+                if let Some(proxy) = client_proxy.as_ref() {
+                    let _ = remove_socket_if_present(&proxy.socket_path);
+                }
                 eprintln!("yolo: failed to wait for codex: {err}");
                 std::process::exit(1);
             }
@@ -1585,6 +3040,11 @@ mod tests {
             reasoning_effort: None,
             fast: false,
             thread_id: thread_id.map(ToString::to_string),
+            thread_id_source: if thread_id.is_some() && args.iter().any(|arg| *arg == "resume") {
+                "resume_arg".to_string()
+            } else {
+                "unresolved".to_string()
+            },
             started_at: 1,
             updated_at: 1,
             ended_at: None,
@@ -1608,7 +3068,277 @@ mod tests {
                 .map(|client| (client.id.clone(), client))
                 .collect(),
             slaves: BTreeMap::new(),
+            telemetry: AgentTelemetry::default(),
+            federation_push_senders: BTreeMap::new(),
+            status_event_senders: BTreeMap::new(),
+            next_status_event_id: 0,
         }
+    }
+
+    #[test]
+    fn telemetry_counts_direct_and_nested_subagents() {
+        let mut telemetry = AgentTelemetry::default();
+        telemetry.record_thread_value(&json!({
+            "id": "root",
+            "sessionId": "session",
+            "cwd": "/tmp/project",
+            "status": {"type": "active"},
+            "updatedAt": 100
+        }));
+        telemetry.record_thread_value(&json!({
+            "id": "child",
+            "source": {
+                "subAgent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "root",
+                        "depth": 1
+                    }
+                }
+            },
+            "status": {"type": "active"},
+            "updatedAt": 101
+        }));
+        telemetry.record_thread_value(&json!({
+            "id": "grandchild",
+            "parentThreadId": "child",
+            "status": {"type": "idle"},
+            "updatedAt": 102
+        }));
+
+        let snapshot = telemetry.snapshot();
+        let root = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.thread_id == "root")
+            .unwrap();
+        assert_eq!(root.subagent_count, 1);
+        assert_eq!(root.active_subagent_count, 1);
+        assert_eq!(root.descendant_count, 2);
+        assert_eq!(root.active_descendant_count, 1);
+        assert_eq!(snapshot.summary.subagent_count, 2);
+    }
+
+    #[test]
+    fn telemetry_tracks_tool_pre_post_and_hook_lifecycle() {
+        let mut telemetry = AgentTelemetry::default();
+        let tool_item = json!({
+            "type": "commandExecution",
+            "id": "item-1",
+            "status": "inProgress"
+        });
+        telemetry.record_app_server_event(&json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "startedAtMs": 1000,
+                "item": tool_item
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "completedAtMs": 2500,
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-1",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 1500
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "hook/started",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "run": {
+                    "id": "hook-1",
+                    "eventName": "preToolUse",
+                    "handlerType": "command",
+                    "scope": "turn",
+                    "status": "running",
+                    "startedAt": 1000
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "hook/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "run": {
+                    "id": "hook-1",
+                    "eventName": "preToolUse",
+                    "handlerType": "command",
+                    "scope": "turn",
+                    "status": "completed",
+                    "startedAt": 1000,
+                    "completedAt": 1001,
+                    "durationMs": 1
+                }
+            }
+        }));
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.tool_calls.len(), 1);
+        assert_eq!(snapshot.tool_calls[0].phase, "post");
+        assert_eq!(snapshot.tool_calls[0].success, Some(true));
+        assert_eq!(snapshot.tool_calls[0].duration_ms, Some(1500));
+        assert_eq!(snapshot.hook_runs.len(), 1);
+        assert_eq!(snapshot.hook_runs[0].phase, "pre");
+        assert_eq!(snapshot.hook_runs[0].status, "completed");
+        assert_eq!(snapshot.summary.active_tool_call_count, 0);
+        assert_eq!(snapshot.summary.running_hook_count, 0);
+    }
+
+    #[test]
+    fn telemetry_captures_turn_prompt_and_final_report() {
+        let mut telemetry = AgentTelemetry::default();
+        telemetry.record_turn_input("root", None, "Investigate the failing service");
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "startedAtMs": 1000
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-1",
+                    "content": [{"type": "text", "text": "Investigate the failing service"}]
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "assistant-1",
+                    "phase": "final_answer",
+                    "text": "The service was restored and verified."
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "completedAtMs": 2500
+            }
+        }));
+
+        let snapshot = telemetry.turns_snapshot(Some("root"), 10);
+        assert_eq!(snapshot.turns.len(), 1);
+        let turn = &snapshot.turns[0];
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.status, "completed");
+        assert_eq!(
+            turn.prompt.as_deref(),
+            Some("Investigate the failing service")
+        );
+        assert_eq!(
+            turn.report.as_deref(),
+            Some("The service was restored and verified.")
+        );
+        assert_eq!(telemetry.summary().captured_prompt_count, 1);
+        assert_eq!(telemetry.summary().captured_report_count, 1);
+    }
+
+    #[test]
+    fn thread_history_extracts_user_prompt_and_final_answer() {
+        let history = json!({
+            "id": "root",
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 100,
+                "completedAt": 110,
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "What changed?"}]
+                    },
+                    {"type": "agentMessage", "phase": "commentary", "text": "I will inspect it."},
+                    {"type": "agentMessage", "phase": "final_answer", "text": "The change is complete."}
+                ]
+            }]
+        });
+
+        let turns = parse_thread_history(&history, 10);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].prompt.as_deref(), Some("What changed?"));
+        assert_eq!(turns[0].report.as_deref(), Some("The change is complete."));
+        assert_eq!(turns[0].started_at_ms, Some(100_000));
+        assert_eq!(turns[0].completed_at_ms, Some(110_000));
+    }
+
+    #[test]
+    fn proxy_turn_start_request_captures_input_for_server() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({
+                "id": 9,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "root",
+                    "input": [{"type": "text", "text": "Run the requested check"}]
+                }
+            }),
+        );
+
+        let first = event_rx.recv().unwrap();
+        let second = event_rx.recv().unwrap();
+        assert!(matches!(first, ClientEvent::ThreadBound(thread_id) if thread_id == "root"));
+        assert!(matches!(
+            second,
+            ClientEvent::TurnInput { thread_id, prompt, .. }
+                if thread_id == "root" && prompt == "Run the requested check"
+        ));
+    }
+
+    #[test]
+    fn federation_websocket_handshake_uses_rfc_accept_key() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "sec-websocket-key".to_string(),
+            "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+        );
+        let response = websocket_upgrade_response(&headers).unwrap();
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+    }
+
+    #[test]
+    fn federation_master_socket_parses_http_authority() {
+        assert_eq!(
+            federation_master_socket("http://kagura-sandbox:47040/api").unwrap(),
+            ("kagura-sandbox".to_string(), 47040)
+        );
+        assert_eq!(
+            federation_master_socket("http://127.0.0.1").unwrap(),
+            ("127.0.0.1".to_string(), 80)
+        );
     }
 
     #[test]
@@ -2016,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_conflicting_inferred_thread_ids_clears_duplicate_inferred_owners() {
+    fn clear_conflicting_inferred_thread_ids_clears_all_unverified_owners() {
         let mut state = test_state(vec![
             test_client("first", &[], "/home/vagrant/head", Some("thread-a")),
             test_client("second", &[], "/home/vagrant/head", Some("thread-a")),
@@ -2027,10 +3757,142 @@ mod tests {
 
         assert_eq!(state.clients["first"].thread_id, None);
         assert_eq!(state.clients["second"].thread_id, None);
+        assert_eq!(state.clients["unique"].thread_id, None);
+    }
+
+    #[test]
+    fn unique_active_thread_rebinds_one_legacy_client_without_a_resume_arg() {
+        let mut state = test_state(vec![test_client("legacy", &[], "/home/vagrant/head", None)]);
+        let snapshot = vec![AppThreadSnapshot {
+            id: "thread-active".to_string(),
+            cwd: "/home/vagrant/head".to_string(),
+            status: "active".to_string(),
+            active_flags: Vec::new(),
+            model: Some("gpt-5.6-sol".to_string()),
+            service_tier: Some("default".to_string()),
+            reasoning_effort: Some("low".to_string()),
+        }];
+
+        bind_unique_active_legacy_clients(&mut state, &snapshot);
+
         assert_eq!(
-            state.clients["unique"].thread_id.as_deref(),
-            Some("thread-b")
+            state.clients["legacy"].thread_id.as_deref(),
+            Some("thread-active")
         );
+        assert_eq!(
+            state.clients["legacy"].thread_id_source,
+            "legacy_active_unique"
+        );
+    }
+
+    #[test]
+    fn thread_settings_override_stale_launch_settings_after_resume() {
+        let state = Arc::new(Mutex::new(test_state(vec![test_client(
+            "resumed",
+            &[
+                "-c",
+                "model=\"gpt-5.6-luna\"",
+                "-c",
+                "service_tier=default",
+                "-c",
+                "model_reasoning_effort=xhigh",
+                "resume",
+                "thread-max",
+            ],
+            "/home/vagrant/head",
+            Some("thread-max"),
+        )])));
+        apply_thread_snapshot(
+            &state,
+            &[AppThreadSnapshot {
+                id: "thread-max".to_string(),
+                cwd: "/home/vagrant/head".to_string(),
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                model: Some("gpt-5.6-luna".to_string()),
+                service_tier: Some("default".to_string()),
+                reasoning_effort: Some("max".to_string()),
+            }],
+        );
+
+        let state = state.lock().unwrap();
+        let client = &state.clients["resumed"];
+        assert_eq!(client.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(client.service_tier.as_deref(), Some("default"));
+        assert_eq!(client.reasoning_effort.as_deref(), Some("max"));
+        assert!(!client.fast);
+    }
+
+    #[test]
+    fn legacy_client_stays_unresolved_when_multiple_active_threads_match_its_cwd() {
+        let mut state = test_state(vec![test_client("legacy", &[], "/home/vagrant/head", None)]);
+        let snapshot = ["thread-a", "thread-b"]
+            .into_iter()
+            .map(|id| AppThreadSnapshot {
+                id: id.to_string(),
+                cwd: "/home/vagrant/head".to_string(),
+                status: "active".to_string(),
+                active_flags: Vec::new(),
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+            })
+            .collect::<Vec<_>>();
+
+        bind_unique_active_legacy_clients(&mut state, &snapshot);
+
+        assert_eq!(state.clients["legacy"].thread_id, None);
+    }
+
+    #[test]
+    fn websocket_resume_request_binds_the_proxy_client_to_its_thread() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({
+                "id": 7,
+                "method": "thread/resume",
+                "params": { "threadId": "thread-resumed" }
+            }),
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-resumed"
+        ));
+    }
+
+    #[test]
+    fn websocket_thread_start_response_binds_the_proxy_client_to_created_thread() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({ "id": 8, "method": "thread/start", "params": {} }),
+        );
+        observe_app_server_response(
+            &tracker,
+            &json!({
+                "id": 8,
+                "result": { "thread": { "id": "thread-created" } }
+            }),
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-created"
+        ));
     }
 
     #[test]
@@ -2172,6 +4034,29 @@ mod tests {
         assert_eq!(configure.reasoning_effort.as_deref(), Some("medium"));
         assert_eq!(configure.fast, Some(false));
         assert_eq!(configure.timeout_secs, Some(5));
+
+        let turns_command = serde_json::from_value::<SlaveCommand>(json!({
+            "id": "cmd-turns",
+            "action": "turns",
+            "thread_id": "thread-1",
+            "limit": 3
+        }))
+        .unwrap();
+        assert_eq!(turns_command.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(turns_command.limit, Some(3));
+    }
+
+    #[test]
+    fn codex_ui_status_parses_low_and_fast_footer_tokens() {
+        let low = extract_codex_ui_status("gpt-5.6-sol low · Context 32% left").unwrap();
+        assert_eq!(low.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(low.effort.as_deref(), Some("low"));
+        assert_eq!(low.fast, Some(false));
+
+        let fast = extract_codex_ui_status("gpt-5.5 xhigh fast · ~/repo").unwrap();
+        assert_eq!(fast.effort.as_deref(), Some("xhigh"));
+        assert_eq!(fast.fast, Some(true));
+        assert!(extract_codex_ui_status("example: gpt-5.6-sol / medium / normal").is_none());
     }
 }
 
@@ -2671,6 +4556,7 @@ fn parse_configure_args(args: Vec<OsString>) -> Result<ConfigureClientsRequest, 
         fast: None,
         reasoning_effort: None,
         timeout_secs: None,
+        queue: false,
     };
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -3149,6 +5035,69 @@ fn print_status() -> Result<(), String> {
     Ok(())
 }
 
+fn print_turns(args: Vec<OsString>) -> Result<(), String> {
+    let mut thread_id = None;
+    let mut limit = 100usize;
+    let mut history = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--thread" || arg == "--thread-id" {
+            thread_id = Some(
+                iter.next()
+                    .ok_or_else(|| format!("{arg} requires a thread id"))?
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else if let Some(value) = arg.strip_prefix("--thread=") {
+            thread_id = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--thread-id=") {
+            thread_id = Some(value.to_string());
+        } else if arg == "--limit" {
+            limit = iter
+                .next()
+                .ok_or_else(|| String::from("--limit requires a number"))?
+                .to_string_lossy()
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --limit: {err}"))?;
+        } else if let Some(value) = arg.strip_prefix("--limit=") {
+            limit = value
+                .parse::<usize>()
+                .map_err(|err| format!("invalid --limit: {err}"))?;
+        } else if arg == "--history" {
+            history = true;
+        } else {
+            return Err(format!("unknown argument: {arg}"));
+        }
+    }
+    if history && thread_id.is_none() {
+        return Err(String::from("--history requires --thread THREAD_ID"));
+    }
+    let mut path = if history {
+        String::from("/turns/history?")
+    } else {
+        format!("/turns?limit={}", limit.clamp(1, MAX_TELEMETRY_TURNS))
+    };
+    if let Some(thread_id) = thread_id.filter(|value| !value.trim().is_empty()) {
+        if history {
+            path.push_str("thread_id=");
+        } else {
+            path.push_str("&thread_id=");
+        }
+        path.push_str(&thread_id);
+        if history {
+            path.push_str("&limit=");
+            path.push_str(&limit.clamp(1, MAX_TELEMETRY_TURNS).to_string());
+        }
+    }
+    let value = api_get_json(&path)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
 fn stop_server() -> Result<(), String> {
     let value = api_post_json("/shutdown", &json!({}))?;
     println!(
@@ -3198,13 +5147,280 @@ fn handle_federation_connection(
     state: Arc<Mutex<ServerState>>,
     paths: RuntimePaths,
 ) {
-    let response = match read_http_request(&mut stream) {
-        Ok((method, path, headers, body)) => {
-            handle_federation_request(&method, &path, &headers, &body, state, paths)
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = stream
+                .write_all(json_response(400, &json!({"ok": false, "error": err})).as_bytes());
+            return;
         }
-        Err(err) => json_response(400, &json!({"ok": false, "error": err})),
     };
+    let (method, path, headers, body) = request;
+    if method == "GET"
+        && path == "/federation/slaves/stream"
+        && headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        match websocket_upgrade_response(&headers) {
+            Ok(response) => {
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    handle_federation_push_connection(stream, state);
+                }
+            }
+            Err(err) => {
+                let _ = stream
+                    .write_all(json_response(400, &json!({"ok": false, "error": err})).as_bytes());
+            }
+        }
+        return;
+    }
+    if method == "GET"
+        && path == "/federation/events"
+        && headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        match websocket_upgrade_response(&headers) {
+            Ok(response) => {
+                if stream.write_all(response.as_bytes()).is_ok() {
+                    handle_status_event_connection(stream, state);
+                }
+            }
+            Err(err) => {
+                let _ = stream
+                    .write_all(json_response(400, &json!({"ok": false, "error": err})).as_bytes());
+            }
+        }
+        return;
+    }
+    let response = handle_federation_request(&method, &path, &headers, &body, state, paths);
     let _ = stream.write_all(response.as_bytes());
+}
+
+fn websocket_upgrade_response(headers: &BTreeMap<String, String>) -> Result<String, String> {
+    let key = headers
+        .get("sec-websocket-key")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "missing sec-websocket-key".to_string())?;
+    let mut hasher = Sha1::new();
+    hasher.update(key.trim().as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let accept = BASE64_STANDARD.encode(hasher.finalize());
+    Ok(format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    ))
+}
+
+fn register_status_event_subscriber(
+    state: &Arc<Mutex<ServerState>>,
+) -> Result<(u64, mpsc::Receiver<Value>), String> {
+    let (sender, receiver) = mpsc::channel::<Value>();
+    let mut state = state
+        .lock()
+        .map_err(|_| "server state lock poisoned".to_string())?;
+    state.next_status_event_id = state.next_status_event_id.saturating_add(1);
+    let subscriber_id = state.next_status_event_id;
+    state.status_event_senders.insert(subscriber_id, sender);
+    Ok((subscriber_id, receiver))
+}
+
+fn unregister_status_event_subscriber(state: &Arc<Mutex<ServerState>>, subscriber_id: u64) {
+    if let Ok(mut state) = state.lock() {
+        state.status_event_senders.remove(&subscriber_id);
+    }
+}
+
+fn publish_status_event(state: &Arc<Mutex<ServerState>>, reason: &str) {
+    let event = json!({
+        "event": "status",
+        "reason": reason,
+        "at": now_millis(),
+    });
+    let senders = {
+        let Ok(state) = state.lock() else {
+            return;
+        };
+        state
+            .status_event_senders
+            .iter()
+            .map(|(id, sender)| (*id, sender.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut stale = Vec::new();
+    for (id, sender) in senders {
+        if sender.send(event.clone()).is_err() {
+            stale.push(id);
+        }
+    }
+    if !stale.is_empty()
+        && let Ok(mut state) = state.lock()
+    {
+        for id in stale {
+            state.status_event_senders.remove(&id);
+        }
+    }
+}
+
+fn handle_status_event_connection(mut stream: TcpStream, state: Arc<Mutex<ServerState>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(35)));
+    let Ok((subscriber_id, receiver)) = register_status_event_subscriber(&state) else {
+        return;
+    };
+    let _ = websocket_send_text_unmasked(
+        &mut stream,
+        &json!({"event":"ready","version":VERSION}).to_string(),
+    );
+    let _ = websocket_send_text_unmasked(
+        &mut stream,
+        &json!({"event":"status","reason":"initial","at":now_millis()}).to_string(),
+    );
+    let mut writer_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => {
+            unregister_status_event_subscriber(&state, subscriber_id);
+            return;
+        }
+    };
+    let writer = thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            if websocket_send_text_unmasked(&mut writer_stream, &event.to_string()).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match websocket_read_text(&mut stream) {
+            Ok(_) => {}
+            Err(err) if err.contains("timed out") || err.contains("WouldBlock") => {}
+            Err(_) => break,
+        }
+    }
+    unregister_status_event_subscriber(&state, subscriber_id);
+    let _ = writer.join();
+}
+
+fn handle_federation_push_connection(mut stream: TcpStream, state: Arc<Mutex<ServerState>>) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(35)));
+    let hello = match websocket_read_text(&mut stream)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    {
+        Some(value) if value.get("event").and_then(Value::as_str) == Some("hello") => value,
+        _ => return,
+    };
+    let Some(slave_id) = hello
+        .get("slave_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let slave_id = slave_id.to_string();
+    let (sender, receiver) = mpsc::channel::<Value>();
+    let pending = {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        state
+            .federation_push_senders
+            .insert(slave_id.clone(), sender.clone());
+        let now = now_secs();
+        let slave = state
+            .slaves
+            .entry(slave_id.clone())
+            .or_insert_with(|| SlaveInfo {
+                id: slave_id.clone(),
+                host: None,
+                version: String::new(),
+                pid: 0,
+                last_seen_at: now,
+                status: "online".to_string(),
+                commands: Vec::new(),
+                latest_status: None,
+            });
+        slave.host = hello
+            .get("host")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        slave.version = hello
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        slave.pid = hello.get("pid").and_then(Value::as_u64).unwrap_or_default() as u32;
+        slave.last_seen_at = now;
+        slave.status = "online".to_string();
+        let mut pending = Vec::new();
+        for record in &mut slave.commands {
+            if record.status == "pending" {
+                record.status = "running".to_string();
+                record.started_at = Some(now);
+                pending.push(record.command.clone());
+            }
+        }
+        pending
+    };
+    let _ = websocket_send_text_unmasked(
+        &mut stream,
+        &json!({"event":"hello_ack","slave_id":slave_id}).to_string(),
+    );
+    for command in pending {
+        let _ = sender.send(json!({"event":"command","command":command}));
+    }
+    let mut writer_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    let writer = thread::spawn(move || {
+        while let Ok(event) = receiver.recv() {
+            if websocket_send_text_unmasked(&mut writer_stream, &event.to_string()).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let Ok(text) = websocket_read_text(&mut stream) else {
+            break;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match value.get("event").and_then(Value::as_str) {
+            Some("result") => {
+                if let Ok(result) = serde_json::from_value::<SlaveResultRequest>(value.clone()) {
+                    record_slave_result(&state, result);
+                }
+            }
+            Some("status") => {
+                if let Ok(mut state) = state.lock() {
+                    if let Some(slave) = state.slaves.get_mut(&slave_id) {
+                        slave.latest_status = value.get("status").cloned();
+                        slave.last_seen_at = now_secs();
+                    }
+                }
+                publish_status_event(&state, "slave-status");
+            }
+            Some("heartbeat") => {
+                if let Ok(mut state) = state.lock() {
+                    if let Some(slave) = state.slaves.get_mut(&slave_id) {
+                        slave.last_seen_at = now_secs();
+                        slave.status = "online".to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(mut state) = state.lock() {
+        state.federation_push_senders.remove(&slave_id);
+        if let Some(slave) = state.slaves.get_mut(&slave_id) {
+            slave.status = "offline".to_string();
+        }
+    }
+    drop(sender);
+    let _ = writer.join();
 }
 
 fn handle_federation_request(
@@ -3294,6 +5510,7 @@ fn poll_slave_command(
             last_seen_at: now,
             status: "online".to_string(),
             commands: Vec::new(),
+            latest_status: None,
         });
     slave.host = request.host;
     slave.version = request.version;
@@ -3316,7 +5533,7 @@ fn enqueue_slave_command(
     command: SlaveCommand,
 ) -> SlaveCommandRecord {
     let now = now_secs();
-    let record = SlaveCommandRecord {
+    let mut record = SlaveCommandRecord {
         command,
         status: "pending".to_string(),
         created_at: now,
@@ -3324,7 +5541,9 @@ fn enqueue_slave_command(
         finished_at: None,
         result: None,
     };
+    let mut push_sender = None;
     if let Ok(mut state) = state.lock() {
+        let existing_push_sender = state.federation_push_senders.get(slave_id).cloned();
         let slave = state
             .slaves
             .entry(slave_id.to_string())
@@ -3336,8 +5555,17 @@ fn enqueue_slave_command(
                 last_seen_at: 0,
                 status: "unknown".to_string(),
                 commands: Vec::new(),
+                latest_status: None,
             });
+        if let Some(sender) = existing_push_sender {
+            record.status = "running".to_string();
+            record.started_at = Some(now);
+            push_sender = Some(sender);
+        }
         slave.commands.push(record.clone());
+    }
+    if let Some(sender) = push_sender {
+        let _ = sender.send(json!({"event":"command","command":record.command}));
     }
     record
 }
@@ -3361,6 +5589,144 @@ fn record_slave_result(state: &Arc<Mutex<ServerState>>, request: SlaveResultRequ
     }
 }
 
+fn federation_master_socket(base_url: &str) -> Result<(String, u16), String> {
+    let authority = base_url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "YOLO_MASTER_URL has no host".to_string())?;
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return Ok((host.trim_matches(['[', ']']).to_string(), port));
+    }
+    Ok((authority.to_string(), 80))
+}
+
+fn connect_federation_push(
+    master_url: &str,
+    slave_id: &str,
+    version: &str,
+    bearer_token: Option<&str>,
+) -> Result<TcpStream, String> {
+    let (host, port) = federation_master_socket(master_url)?;
+    let mut addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|err| format!("resolve federation master: {err}"))?;
+    let address = addresses
+        .next()
+        .ok_or_else(|| "federation master has no addresses".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|err| format!("connect federation push: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(35)))
+        .map_err(|err| format!("set federation push read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("set federation push write timeout: {err}"))?;
+    let mut request = format!(
+        "GET /federation/slaves/stream HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: eW9sby1mZWRlcmF0aW9uLXB1c2g=\r\nSec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(token) = bearer_token.filter(|token| !token.trim().is_empty()) {
+        request.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("write federation push handshake: {err}"))?;
+    let response = read_http_headers(&mut stream)?;
+    if !response.starts_with("HTTP/1.1 101") && !response.starts_with("HTTP/1.0 101") {
+        return Err(format!(
+            "federation push handshake failed: {}",
+            response.lines().next().unwrap_or_default()
+        ));
+    }
+    websocket_send_text(
+        &mut stream,
+        &json!({
+            "event": "hello",
+            "slave_id": slave_id,
+            "version": version,
+            "pid": std::process::id(),
+            "host": hostname(),
+        })
+        .to_string(),
+    )?;
+    let hello_ack = websocket_read_text(&mut stream)?;
+    let ack = serde_json::from_str::<Value>(&hello_ack)
+        .map_err(|err| format!("decode federation push hello_ack: {err}"))?;
+    if ack.get("event").and_then(Value::as_str) != Some("hello_ack") {
+        return Err("federation push master did not acknowledge hello".to_string());
+    }
+    Ok(stream)
+}
+
+fn run_federation_push_session(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    master_url: &str,
+    bearer_token: Option<&str>,
+    slave_id: &str,
+) -> Result<(), String> {
+    let mut stream = connect_federation_push(master_url, slave_id, VERSION, bearer_token)?;
+    loop {
+        let text = match websocket_read_text(&mut stream) {
+            Ok(text) => text,
+            Err(err) if err.contains("timed out waiting") => {
+                websocket_send_text(
+                    &mut stream,
+                    &json!({"event":"heartbeat","slave_id":slave_id,"at":now_millis()}).to_string(),
+                )?;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|err| format!("decode federation push event: {err}"))?;
+        if value.get("event").and_then(Value::as_str) != Some("command") {
+            continue;
+        }
+        let Some(command_value) = value.get("command") else {
+            continue;
+        };
+        let command = serde_json::from_value::<SlaveCommand>(command_value.clone())
+            .map_err(|err| format!("decode federation push command: {err}"))?;
+        let command_id = command.id.clone();
+        let result = execute_slave_command(
+            Arc::clone(&state),
+            &paths,
+            master_url,
+            bearer_token,
+            slave_id,
+            &command,
+        );
+        websocket_send_text(
+            &mut stream,
+            &json!({
+                "event": "result",
+                "slave_id": slave_id,
+                "command_id": command_id,
+                "ok": result.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "result": result,
+            })
+            .to_string(),
+        )?;
+        let status = server_info(&state, &paths);
+        websocket_send_text(
+            &mut stream,
+            &json!({
+                "event": "status",
+                "slave_id": slave_id,
+                "status": status,
+            })
+            .to_string(),
+        )?;
+    }
+}
+
 fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
     let Ok(master_url) = env::var("YOLO_MASTER_URL") else {
         return;
@@ -3376,6 +5742,18 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
     thread::spawn(move || {
         let mut pending_result: Option<SlaveResultRequest> = None;
         loop {
+            match run_federation_push_session(
+                Arc::clone(&state),
+                paths.clone(),
+                &master_url,
+                bearer_token.as_deref(),
+                &slave_id,
+            ) {
+                Ok(()) => continue,
+                Err(err) => eprintln!(
+                    "yolo slave connector: push unavailable: {err}; using polling fallback"
+                ),
+            }
             if let Some(result) = pending_result.take() {
                 let _ = federation_post_json(
                     &master_url,
@@ -3482,7 +5860,7 @@ fn execute_slave_command(
                     "error": "configure-clients command requires a configure request"
                 });
             };
-            match configure_clients_when_idle(state, paths, request) {
+            match configure_clients(state, paths, request) {
                 Ok(value) => value,
                 Err(err) => json!({"ok": false, "error": err}),
             }
@@ -3509,6 +5887,28 @@ fn execute_slave_command(
             };
             match refresh_resume_permissions_clients(state, paths, request) {
                 Ok(value) => value,
+                Err(err) => json!({"ok": false, "error": err}),
+            }
+        }
+        "turns" | "thread-turns" => {
+            let Some(thread_id) = command
+                .thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return json!({
+                    "ok": false,
+                    "error": "turns command requires a thread_id"
+                });
+            };
+            let limit = command.limit.unwrap_or(20).clamp(1, MAX_TELEMETRY_TURNS);
+            match app_server_thread_history(paths, thread_id, limit) {
+                Ok(turns) => json!({
+                    "ok": true,
+                    "thread_id": thread_id,
+                    "turns": turns,
+                }),
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
@@ -3663,6 +6063,7 @@ fn refresh_resume_permissions_clients(
         ) {
             Ok(()) => {
                 note_client_permissions_update(&state, &client.id);
+                publish_status_event(&state, "client-permissions-updated");
                 updated_thread_ids.insert(thread_id.to_string());
                 updated.push(json!({
                     "client_id": client.id,
@@ -3844,7 +6245,8 @@ fn handle_api_request(
     paths: RuntimePaths,
     stream: &mut UnixStream,
 ) -> String {
-    match (method, path) {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    match (method, route) {
         ("GET", "/status") => {
             let info = server_info(&state, &paths);
             json_response(200, &info)
@@ -3852,6 +6254,125 @@ fn handle_api_request(
         ("GET", "/clients") => {
             let info = server_info(&state, &paths);
             json_response(200, &info)
+        }
+        ("GET", "/agents") | ("GET", "/subagents") => {
+            let snapshot = state
+                .lock()
+                .map(|state| state.telemetry.snapshot())
+                .unwrap_or_else(|_| TelemetrySnapshot {
+                    generated_at: now_secs(),
+                    summary: TelemetrySummary::default(),
+                    agents: Vec::new(),
+                    tool_calls: Vec::new(),
+                    hook_runs: Vec::new(),
+                });
+            let agents = if route == "/subagents" {
+                snapshot
+                    .agents
+                    .into_iter()
+                    .filter(|agent| agent.is_subagent)
+                    .collect::<Vec<_>>()
+            } else {
+                snapshot.agents
+            };
+            json_response(
+                200,
+                &json!({
+                    "ok": true,
+                    "generated_at": snapshot.generated_at,
+                    "summary": snapshot.summary,
+                    "agents": agents
+                }),
+            )
+        }
+        ("GET", "/telemetry") => {
+            let snapshot = state
+                .lock()
+                .map(|state| state.telemetry.snapshot())
+                .unwrap_or_else(|_| TelemetrySnapshot {
+                    generated_at: now_secs(),
+                    summary: TelemetrySummary::default(),
+                    agents: Vec::new(),
+                    tool_calls: Vec::new(),
+                    hook_runs: Vec::new(),
+                });
+            json_response(200, &json!({"ok": true, "telemetry": snapshot}))
+        }
+        ("GET", "/turns") => {
+            let thread_id = query_parameter(query, "thread_id");
+            let limit = query_parameter(query, "limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, MAX_TELEMETRY_TURNS);
+            let snapshot = state
+                .lock()
+                .map(|state| state.telemetry.turns_snapshot(thread_id.as_deref(), limit))
+                .unwrap_or_else(|_| TurnArchiveSnapshot {
+                    generated_at: now_secs(),
+                    turns: Vec::new(),
+                });
+            json_response(
+                200,
+                &json!({
+                    "ok": true,
+                    "generated_at": snapshot.generated_at,
+                    "turns": snapshot.turns,
+                }),
+            )
+        }
+        ("GET", "/turns/history") => {
+            let Some(thread_id) = query_parameter(query, "thread_id")
+                .filter(|thread_id| !thread_id.trim().is_empty())
+            else {
+                return json_response(400, &json!({"ok": false, "error": "thread_id is required"}));
+            };
+            let limit = query_parameter(query, "limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(20)
+                .clamp(1, MAX_TELEMETRY_TURNS);
+            match app_server_thread_history(&paths, &thread_id, limit) {
+                Ok(turns) => {
+                    if let Ok(mut state) = state.lock() {
+                        state.telemetry.merge_turn_infos(turns.clone());
+                        persist_turn_archive(&paths.turn_archive, &state.telemetry);
+                    }
+                    json_response(
+                        200,
+                        &json!({"ok": true, "thread_id": thread_id, "turns": turns}),
+                    )
+                }
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+            }
+        }
+        ("POST", "/turns/input") => {
+            let parsed = serde_json::from_str::<Value>(body);
+            match parsed {
+                Ok(value) => {
+                    let thread_id = value
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let turn_id = value.get("turn_id").and_then(Value::as_str);
+                    let prompt = value
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if thread_id.trim().is_empty() || prompt.trim().is_empty() {
+                        return json_response(
+                            400,
+                            &json!({"ok": false, "error": "thread_id and prompt are required"}),
+                        );
+                    }
+                    if let Ok(mut state) = state.lock() {
+                        state
+                            .telemetry
+                            .record_turn_input(thread_id, turn_id, prompt);
+                        persist_turn_archive(&paths.turn_archive, &state.telemetry);
+                    }
+                    json_response(202, &json!({"ok": true, "captured": true}))
+                }
+                Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
         }
         ("POST", "/clients/register") => match serde_json::from_str::<ClientInfo>(body) {
             Ok(client) => {
@@ -3930,12 +6451,32 @@ fn handle_api_request(
         },
         ("POST", "/clients/configure") => {
             match serde_json::from_str::<ConfigureClientsRequest>(body) {
-                Ok(request) => {
-                    match configure_clients_when_idle(Arc::clone(&state), &paths, request) {
-                        Ok(value) => json_response(200, &value),
-                        Err(err) => json_response(500, &json!({"ok": false, "error": err})),
-                    }
+                Ok(request) if request.queue => {
+                    let job_id = format!("configure-{}", now_millis());
+                    let worker_state = Arc::clone(&state);
+                    let worker_paths = paths.clone();
+                    let worker_request = request;
+                    let worker_job_id = job_id.clone();
+                    thread::spawn(move || {
+                        match configure_clients(worker_state, &worker_paths, worker_request) {
+                            Ok(value) => eprintln!(
+                                "yolo configure job {worker_job_id} completed: {}",
+                                value
+                                    .get("updated")
+                                    .and_then(Value::as_array)
+                                    .map_or(0, Vec::len)
+                            ),
+                            Err(err) => {
+                                eprintln!("yolo configure job {worker_job_id} failed: {err}")
+                            }
+                        }
+                    });
+                    json_response(202, &json!({"ok": true, "queued": true, "job_id": job_id}))
                 }
+                Ok(request) => match configure_clients(Arc::clone(&state), &paths, request) {
+                    Ok(value) => json_response(200, &value),
+                    Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+                },
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
             }
         }
@@ -4115,16 +6656,31 @@ fn run_thread_status_event_listener(
         subscribe_running_client_threads(state, &mut client, &mut subscribed_thread_ids)?;
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         match client.read_message_value() {
-            Ok(value) => {
-                if let Some(snapshot) = parse_app_server_thread_response(&value) {
-                    apply_single_thread_snapshot(state, &snapshot);
-                } else if let Some(update) = parse_app_server_status_notification(&value) {
-                    apply_thread_status_update(state, &update);
-                }
-            }
+            Ok(value) => observe_app_server_message(state, &value, paths),
             Err(err) if is_app_server_read_timeout(&err) => {}
             Err(err) => return Err(err),
         }
+    }
+}
+
+fn observe_app_server_message(
+    state: &Arc<Mutex<ServerState>>,
+    value: &Value,
+    paths: &RuntimePaths,
+) {
+    if let Some(snapshot) = parse_app_server_thread_response(value) {
+        apply_single_thread_snapshot(state, &snapshot);
+    }
+    if let Some(update) = parse_app_server_status_notification(value) {
+        apply_thread_status_update(state, &update);
+    }
+    let changed = if let Ok(mut state) = state.lock() {
+        state.telemetry.record_app_server_event(value)
+    } else {
+        false
+    };
+    if changed && let Ok(state) = state.lock() {
+        persist_turn_archive(&paths.turn_archive, &state.telemetry);
     }
 }
 
@@ -4133,7 +6689,8 @@ fn subscribe_running_client_threads(
     client: &mut AppServerRpcClient,
     subscribed_thread_ids: &mut BTreeSet<String>,
 ) -> Result<(), String> {
-    let target_thread_ids = known_running_client_thread_ids(state);
+    let mut target_thread_ids = known_running_client_thread_ids(state);
+    target_thread_ids.extend(known_running_agent_thread_ids(state));
     for thread_id in target_thread_ids {
         if subscribed_thread_ids.contains(&thread_id) {
             continue;
@@ -4162,6 +6719,19 @@ fn known_running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<
         .map(str::trim)
         .filter(|thread_id| !thread_id.is_empty())
         .map(ToString::to_string)
+        .collect()
+}
+
+fn known_running_agent_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<String> {
+    let Ok(state) = state.lock() else {
+        return BTreeSet::new();
+    };
+    state
+        .telemetry
+        .threads
+        .values()
+        .filter(|thread| is_active_agent_status(&thread.status))
+        .map(|thread| thread.thread_id.clone())
         .collect()
 }
 
@@ -4240,6 +6810,11 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 reasoning_effort: launch_cfg.reasoning_effort,
                 fast: is_fast_tier(service_tier.as_deref()),
                 thread_id: thread_id_from_args_strs(&args),
+                thread_id_source: if thread_id_from_args_strs(&args).is_some() {
+                    "resume_arg".to_string()
+                } else {
+                    "unresolved".to_string()
+                },
                 started_at: now,
                 updated_at: now,
                 ended_at: None,
@@ -4254,11 +6829,73 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
     }
 }
 
-fn apply_initial_app_server_thread_snapshot(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) {
-    match app_server_thread_snapshot(paths, None) {
-        Ok(snapshot) => apply_thread_snapshot(state, &snapshot),
+fn spawn_initial_app_server_thread_snapshot(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+    thread::spawn(move || match app_server_thread_snapshot(&paths, None) {
+        Ok(snapshot) => apply_thread_snapshot(&state, &snapshot),
         Err(err) => eprintln!("yolo server: initial app-server thread snapshot failed: {err}"),
+    });
+}
+
+fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+    thread::spawn(move || {
+        loop {
+            match app_server_agent_thread_inventory(&paths) {
+                Ok(threads) => {
+                    if let Ok(mut state) = state.lock() {
+                        for thread in threads {
+                            state.telemetry.record_thread_value(&thread);
+                        }
+                    }
+                }
+                Err(err) => eprintln!("yolo server: agent telemetry inventory failed: {err}"),
+            }
+            thread::sleep(APP_SERVER_TELEMETRY_REFRESH_INTERVAL);
+        }
+    });
+}
+
+fn app_server_agent_thread_inventory(paths: &RuntimePaths) -> Result<Vec<Value>, String> {
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.initialize()?;
+    let mut cursor: Option<String> = None;
+    let mut threads = Vec::new();
+    for _ in 0..16 {
+        let mut params = json!({
+            "limit": 200,
+            "sortKey": "updated_at",
+            "useStateDbOnly": true,
+            "sourceKinds": [
+                "cli",
+                "vscode",
+                "exec",
+                "appServer",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown"
+            ]
+        });
+        if let Some(cursor_value) = cursor.as_deref() {
+            params["cursor"] = Value::String(cursor_value.to_string());
+        }
+        let result = client.request("thread/list", params)?;
+        let data = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("thread/list missing data: {result}"))?;
+        threads.extend(data.iter().cloned());
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if cursor.is_none() {
+            break;
+        }
     }
+    Ok(threads)
 }
 
 #[derive(Debug)]
@@ -4387,27 +7024,19 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
     let Ok(mut state) = state.lock() else {
         return;
     };
+    bind_unique_active_legacy_clients(&mut state, snapshot);
     clear_conflicting_inferred_thread_ids(&mut state);
-    let claimed_thread_ids = claimed_client_thread_ids(&state);
 
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
             continue;
         }
 
-        let matched = match client.thread_id.as_deref() {
-            Some(thread_id) => snapshot.iter().find(|thread| thread.id == thread_id),
-            None => snapshot
-                .iter()
-                .filter(|thread| !claimed_thread_ids.contains(&thread.id))
-                .find(|thread| thread.cwd == client.cwd && thread.status == "active")
-                .or_else(|| {
-                    snapshot
-                        .iter()
-                        .filter(|thread| !claimed_thread_ids.contains(&thread.id))
-                        .find(|thread| thread.cwd == client.cwd)
-                }),
-        };
+        let matched = client
+            .thread_id
+            .as_deref()
+            .filter(|_| client_thread_id_is_authoritative(client))
+            .and_then(|thread_id| snapshot.iter().find(|thread| thread.id == thread_id));
 
         let Some(thread) = matched else {
             client.codex_status = None;
@@ -4425,19 +7054,24 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         } else {
             parse_codex_launch_config(&client.args)
         };
-        if let Some(model) = launch_cfg.model.or_else(|| thread.model.clone()) {
+        // A resumed thread may outlive the yolo process and carry a newer
+        // setting than the launch command line. Treat app-server state as the
+        // source of truth and use launch arguments only as a fallback.
+        if let Some(model) = thread.model.clone().or_else(|| launch_cfg.model) {
             client.model = Some(model);
         }
-        if let Some(service_tier) = launch_cfg
+        if let Some(service_tier) = thread
             .service_tier
-            .or_else(|| thread.service_tier.clone())
+            .clone()
+            .or_else(|| launch_cfg.service_tier)
         {
             client.service_tier = Some(service_tier);
             client.fast = is_fast_tier(client.service_tier.as_deref());
         }
-        if let Some(reasoning_effort) = launch_cfg
+        if let Some(reasoning_effort) = thread
             .reasoning_effort
-            .or_else(|| thread.reasoning_effort.clone())
+            .clone()
+            .or_else(|| launch_cfg.reasoning_effort)
         {
             client.reasoning_effort = Some(reasoning_effort);
         }
@@ -4450,21 +7084,14 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
         return;
     };
     clear_conflicting_inferred_thread_ids(&mut state);
-    let claimed_thread_ids = claimed_client_thread_ids(&state);
 
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
             continue;
         }
 
-        let matched = match client.thread_id.as_deref() {
-            Some(thread_id) => thread.id == thread_id,
-            None => {
-                !claimed_thread_ids.contains(&thread.id)
-                    && thread.cwd == client.cwd
-                    && thread.status == "active"
-            }
-        };
+        let matched = client_thread_id_is_authoritative(client)
+            && client.thread_id.as_deref() == Some(thread.id.as_str());
         if !matched {
             continue;
         }
@@ -4479,19 +7106,24 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
         } else {
             parse_codex_launch_config(&client.args)
         };
-        if let Some(model) = launch_cfg.model.or_else(|| thread.model.clone()) {
+        // A resumed thread may outlive the yolo process and carry a newer
+        // setting than the launch command line. Treat app-server state as the
+        // source of truth and use launch arguments only as a fallback.
+        if let Some(model) = thread.model.clone().or_else(|| launch_cfg.model) {
             client.model = Some(model);
         }
-        if let Some(service_tier) = launch_cfg
+        if let Some(service_tier) = thread
             .service_tier
-            .or_else(|| thread.service_tier.clone())
+            .clone()
+            .or_else(|| launch_cfg.service_tier)
         {
             client.service_tier = Some(service_tier);
             client.fast = is_fast_tier(client.service_tier.as_deref());
         }
-        if let Some(reasoning_effort) = launch_cfg
+        if let Some(reasoning_effort) = thread
             .reasoning_effort
-            .or_else(|| thread.reasoning_effort.clone())
+            .clone()
+            .or_else(|| launch_cfg.reasoning_effort)
         {
             client.reasoning_effort = Some(reasoning_effort);
         }
@@ -4499,56 +7131,88 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
 }
 
 fn clear_conflicting_inferred_thread_ids(state: &mut ServerState) {
-    let explicit_thread_ids = state
-        .clients
-        .values()
-        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
-        .filter_map(|client| thread_id_from_args_strs(&client.args))
-        .collect::<BTreeSet<_>>();
-    let mut inferred_thread_id_counts = BTreeMap::<String, usize>::new();
-
-    for client in state.clients.values() {
-        if !matches!(client.status.as_str(), "running" | "restarting") {
-            continue;
-        }
-        let Some(thread_id) = client.thread_id.as_deref() else {
-            continue;
-        };
-        if thread_id_from_args_strs(&client.args)
-            .as_deref()
-            .is_some_and(|explicit_thread_id| explicit_thread_id == thread_id)
-        {
-            continue;
-        }
-        *inferred_thread_id_counts
-            .entry(thread_id.to_string())
-            .or_default() += 1;
-    }
-
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
             continue;
         }
-        let Some(thread_id) = client.thread_id.clone() else {
-            continue;
-        };
         let explicit_for_client = thread_id_from_args_strs(&client.args);
         if let Some(explicit_thread_id) = explicit_for_client {
-            if explicit_thread_id != thread_id {
+            if client.thread_id.as_deref() != Some(explicit_thread_id.as_str()) {
                 client.thread_id = Some(explicit_thread_id);
+                client.thread_id_source = "resume_arg".to_string();
                 clear_client_codex_thread_status(client);
             }
             continue;
         }
-        let duplicated_inferred = inferred_thread_id_counts
-            .get(&thread_id)
-            .copied()
-            .unwrap_or_default()
-            > 1;
-        if explicit_thread_ids.contains(&thread_id) || duplicated_inferred {
+
+        if !client_thread_id_is_authoritative(client) {
             client.thread_id = None;
+            client.thread_id_source = "unresolved".to_string();
             clear_client_codex_thread_status(client);
         }
+    }
+}
+
+fn client_thread_id_is_authoritative(client: &ClientInfo) -> bool {
+    matches!(
+        client.thread_id_source.as_str(),
+        "resume_arg" | "proxy" | "legacy_active_unique"
+    ) && client
+        .thread_id
+        .as_deref()
+        .is_some_and(|thread_id| !thread_id.trim().is_empty())
+}
+
+fn bind_unique_active_legacy_clients(state: &mut ServerState, snapshot: &[AppThreadSnapshot]) {
+    let claimed = state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| client_thread_id_is_authoritative(client))
+        .filter_map(|client| client.thread_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let unresolved_by_cwd = state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| !client_thread_id_is_authoritative(client))
+        .fold(
+            BTreeMap::<String, Vec<String>>::new(),
+            |mut groups, client| {
+                groups
+                    .entry(client.cwd.clone())
+                    .or_default()
+                    .push(client.id.clone());
+                groups
+            },
+        );
+
+    for (cwd, client_ids) in unresolved_by_cwd {
+        if client_ids.len() != 1 {
+            continue;
+        }
+        let candidates = snapshot
+            .iter()
+            .filter(|thread| thread.cwd == cwd && thread.status == "active")
+            .filter(|thread| !claimed.contains(&thread.id))
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&client_ids[0]) else {
+            continue;
+        };
+        client.thread_id = Some(candidates[0].id.clone());
+        client.thread_id_source = "legacy_active_unique".to_string();
+        client.codex_status = Some(candidates[0].status.clone());
+        client.codex_active_flags = candidates[0].active_flags.clone();
+        client.codex_status_updated_at = Some(now_secs());
+        client.updated_at = now_secs();
+        eprintln!(
+            "yolo server: rebound legacy client {} to unique active thread {}",
+            client.id, candidates[0].id
+        );
     }
 }
 
@@ -4556,15 +7220,6 @@ fn clear_client_codex_thread_status(client: &mut ClientInfo) {
     client.codex_status = None;
     client.codex_active_flags.clear();
     client.codex_status_updated_at = Some(now_secs());
-}
-
-fn claimed_client_thread_ids(state: &ServerState) -> BTreeSet<String> {
-    state
-        .clients
-        .values()
-        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
-        .filter_map(|client| client.thread_id.clone())
-        .collect()
 }
 
 fn apply_thread_status_update(state: &Arc<Mutex<ServerState>>, update: &AppThreadStatusUpdate) {
@@ -4751,44 +7406,56 @@ fn upgrade_wait_thread_ids(
     Some(ids)
 }
 
-fn configure_clients_when_idle(
+fn configure_clients(
     state: Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
     request: ConfigureClientsRequest,
 ) -> Result<Value, String> {
-    let timeout = request
-        .timeout_secs
-        .map(Duration::from_secs)
-        .unwrap_or_else(upgrade_idle_wait_timeout);
     let selected_ids = select_configure_clients(&state, &request)?;
     if selected_ids.is_empty() {
         return Err("no matching yolo clients".to_string());
     }
 
-    let start = SystemTime::now();
-    loop {
-        let target_thread_ids = selected_thread_ids_for_snapshot(&state, &selected_ids);
-        let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
-        apply_thread_snapshot(&state, &snapshot);
-        let working = working_selected_clients_for_snapshot(&state, &snapshot, &selected_ids);
-        if working.is_empty() {
-            break;
-        }
-        if start.elapsed().unwrap_or_default() >= timeout {
-            return Err(format!(
-                "timed out waiting for selected Codex clients to become idle: {}",
-                working.join(", ")
-            ));
-        }
-        eprintln!(
-            "yolo: waiting for selected Codex clients to become idle before settings update: {}",
-            working.join(", ")
-        );
-        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
-    }
-
     let clients = selected_clients_with_threads(&state, &selected_ids)?;
+    // `thread/settings/update` is idempotent. A short-lived app-server stall
+    // must not turn a valid modal action into a permanent failure, but retries
+    // are bounded and never applied to a missing thread.
+    let mut last_error = None;
+    for attempt in 0..APP_SERVER_CONFIGURE_MAX_ATTEMPTS {
+        match configure_clients_once(&state, paths, &request, &clients) {
+            Ok(value) => return Ok(value),
+            Err(err) if is_retryable_app_server_error(&err) => {
+                last_error = Some(err.clone());
+                if attempt + 1 < APP_SERVER_CONFIGURE_MAX_ATTEMPTS {
+                    let delay =
+                        APP_SERVER_CONFIGURE_RETRY_DELAY.saturating_mul((attempt + 1) as u32);
+                    eprintln!(
+                        "yolo configure: app-server attempt {}/{} failed: {err}; retrying in {:?}",
+                        attempt + 1,
+                        APP_SERVER_CONFIGURE_MAX_ATTEMPTS,
+                        delay
+                    );
+                    thread::sleep(delay);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "app-server configure failed".to_string()))
+}
+
+fn configure_clients_once(
+    state: &Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    request: &ConfigureClientsRequest,
+    clients: &[(String, String)],
+) -> Result<Value, String> {
+    // Background inventory/history/snapshot RPCs share the same app-server
+    // process. Control updates get priority so a UI setting change cannot sit
+    // behind telemetry work or another configuration request.
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control);
     let mut rpc = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    rpc.set_rpc_timeout(configure_rpc_timeout(request));
     rpc.initialize()?;
     let mut updated = Vec::new();
     for (client_id, thread_id) in clients {
@@ -4808,21 +7475,19 @@ fn configure_clients_when_idle(
         }
         rpc.request("thread/settings/update", Value::Object(params))?;
         note_client_settings_update(
-            &state,
-            &client_id,
+            state,
+            client_id,
             request.model.clone(),
             request.fast,
             request.reasoning_effort.clone(),
         );
+        publish_status_event(state, "client-settings-updated");
         updated.push(json!({
             "client_id": client_id,
             "thread_id": thread_id,
         }));
     }
 
-    let target_thread_ids = selected_thread_ids_for_snapshot(&state, &selected_ids);
-    let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
-    apply_thread_snapshot(&state, &snapshot);
     Ok(json!({
         "ok": true,
         "updated": updated,
@@ -4830,6 +7495,23 @@ fn configure_clients_when_idle(
         "fast": request.fast,
         "reasoning_effort": request.reasoning_effort,
     }))
+}
+
+fn is_retryable_app_server_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    !lower.contains("thread not found")
+        && !lower.contains("invalid")
+        && (lower.contains("timed out")
+            || lower.contains("resource temporarily unavailable")
+            || lower.contains("connection reset")
+            || lower.contains("connection refused")
+            || lower.contains("websocket closed")
+            || lower.contains("broken pipe")
+            || lower.contains("app-server"))
+}
+
+fn configure_rpc_timeout(request: &ConfigureClientsRequest) -> Duration {
+    Duration::from_secs(request.timeout_secs.unwrap_or(10).clamp(5, 30))
 }
 
 fn note_client_settings_update(
@@ -4918,64 +7600,6 @@ fn selected_clients_with_threads(
         .collect()
 }
 
-fn selected_thread_ids_for_snapshot(
-    state: &Arc<Mutex<ServerState>>,
-    selected_ids: &BTreeSet<String>,
-) -> Option<BTreeSet<String>> {
-    let Ok(state) = state.lock() else {
-        return None;
-    };
-    let mut ids = BTreeSet::new();
-    let mut has_selected_without_thread = false;
-    for id in selected_ids {
-        let Some(client) = state.clients.get(id) else {
-            continue;
-        };
-        if let Some(thread_id) = client.thread_id.as_deref() {
-            if !thread_id.trim().is_empty() {
-                ids.insert(thread_id.to_string());
-            }
-        } else {
-            has_selected_without_thread = true;
-        }
-    }
-    if has_selected_without_thread {
-        return None;
-    }
-    Some(ids)
-}
-
-fn working_selected_clients_for_snapshot(
-    state: &Arc<Mutex<ServerState>>,
-    snapshot: &[AppThreadSnapshot],
-    selected_ids: &BTreeSet<String>,
-) -> Vec<String> {
-    let Ok(state) = state.lock() else {
-        return Vec::new();
-    };
-    state
-        .clients
-        .values()
-        .filter(|client| selected_ids.contains(&client.id))
-        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
-        .filter_map(|client| {
-            let is_active = match client.thread_id.as_deref() {
-                Some(thread_id) => snapshot
-                    .iter()
-                    .any(|thread| thread.id == thread_id && thread.status == "active"),
-                None => snapshot
-                    .iter()
-                    .any(|thread| thread.cwd == client.cwd && thread.status == "active"),
-            };
-            if is_active {
-                Some(format!("{} cwd={}", client.id, client.cwd))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 fn upgrade_idle_wait_timeout() -> Duration {
     env::var("YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS")
         .ok()
@@ -4998,6 +7622,7 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         clients: state.clients.values().cloned().collect(),
         slaves: state.slaves.values().cloned().collect(),
         tmux_panes: collect_tmux_panes(),
+        telemetry_summary: state.telemetry.summary(),
     }
 }
 
@@ -5012,7 +7637,7 @@ fn collect_tmux_panes() -> Vec<TmuxPaneInfo> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}",
+            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{pane_current_command}",
         ])
         .output();
     let Ok(output) = output else {
@@ -5034,8 +7659,10 @@ fn parse_tmux_pane_line(line: &str, socket_name: &str) -> Option<TmuxPaneInfo> {
     let window_index = parts.next().and_then(|value| value.parse::<u32>().ok());
     let pane_index = parts.next().and_then(|value| value.parse::<u32>().ok());
     let pane_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let pane_tty = nonempty_string(parts.next());
     let cwd = nonempty_string(parts.next());
     let command = nonempty_string(parts.next());
+    let yolo_pid = pane_tty.as_deref().and_then(yolo_pid_for_tty);
     let codex_ui_status = if matches!(command.as_deref(), Some("yolo" | "codex")) {
         session_name
             .as_ref()
@@ -5052,10 +7679,29 @@ fn parse_tmux_pane_line(line: &str, socket_name: &str) -> Option<TmuxPaneInfo> {
         window_index,
         pane_index,
         pane_pid,
+        yolo_pid,
         cwd,
         command,
         codex_ui_status,
     })
+}
+
+fn yolo_pid_for_tty(tty: &str) -> Option<u32> {
+    let tty = tty.strip_prefix("/dev/").unwrap_or(tty);
+    let output = Command::new("ps")
+        .args(["-t", tty, "-o", "pid=,comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            (fields.next()? == "yolo").then_some(pid)
+        })
 }
 
 fn nonempty_string(value: Option<&str>) -> Option<String> {
@@ -5095,27 +7741,43 @@ fn capture_codex_ui_status(
 
 fn extract_codex_ui_status(text: &str) -> Option<CodexUiStatus> {
     for line in text.lines().rev() {
+        if !line.contains('·') && !line.contains('•') {
+            continue;
+        }
         let words = line.split_whitespace().collect::<Vec<_>>();
-        for pair in words.windows(2) {
-            let model = pair[0].trim();
-            let effort = pair[1].trim().to_ascii_lowercase();
-            if !model.starts_with("gpt-") {
+        for (index, model) in words.iter().enumerate() {
+            let model = model.trim();
+            if !model.starts_with("gpt-")
+                || !model
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+            {
                 continue;
             }
+            let status_words = words[index + 1..]
+                .iter()
+                .map(|word| word.trim_matches(|ch: char| matches!(ch, ',' | '.' | '、' | '。')))
+                .take_while(|word| !matches!(*word, "·" | "•" | "|" | "context" | "Context"))
+                .map(str::to_ascii_lowercase)
+                .take(5)
+                .collect::<Vec<_>>();
             if !matches!(
-                effort.as_str(),
-                "fast" | "medium" | "high" | "xhigh" | "default"
+                status_words.first().map(String::as_str),
+                Some("low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "default" | "fast")
             ) {
                 continue;
             }
+            let effort = status_words.iter().find(|word| {
+                matches!(
+                    word.as_str(),
+                    "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "default"
+                )
+            });
+            let fast = status_words.iter().any(|word| word == "fast");
             return Some(CodexUiStatus {
                 model: Some(model.to_string()),
-                effort: if effort == "default" {
-                    None
-                } else {
-                    Some(effort.clone())
-                },
-                fast: Some(effort == "fast"),
+                effort: effort.filter(|value| value.as_str() != "default").cloned(),
+                fast: Some(fast),
             });
         }
     }
@@ -5126,6 +7788,7 @@ fn app_server_thread_snapshot(
     paths: &RuntimePaths,
     target_thread_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<AppThreadSnapshot>, String> {
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
     let loaded = client.request(
@@ -5176,11 +7839,130 @@ fn app_server_thread_snapshot(
     Ok(threads)
 }
 
+fn app_server_thread_history(
+    paths: &RuntimePaths,
+    thread_id: &str,
+    limit: usize,
+) -> Result<Vec<TurnInfo>, String> {
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.initialize()?;
+    let response = client.request(
+        "thread/read",
+        json!({
+            "threadId": thread_id,
+            "includeTurns": true
+        }),
+    )?;
+    let thread = response
+        .get("thread")
+        .ok_or_else(|| format!("thread/read missing thread: {response}"))?;
+    Ok(parse_thread_history(thread, limit))
+}
+
+fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
+    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut output = turns
+        .iter()
+        .rev()
+        .take(limit.clamp(1, MAX_TELEMETRY_TURNS))
+        .filter_map(|turn| {
+            let turn_id = turn.get("id").and_then(Value::as_str)?.trim();
+            if turn_id.is_empty() {
+                return None;
+            }
+            let thread_id = thread.get("id").and_then(Value::as_str)?.trim();
+            if thread_id.is_empty() {
+                return None;
+            }
+            let mut prompt = None;
+            let mut last_assistant = None;
+            let mut final_report = None;
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items {
+                    let Some(text) = extract_message_text(item) else {
+                        continue;
+                    };
+                    if is_user_message_item(item) {
+                        append_turn_text(&mut prompt, &text);
+                    } else if is_assistant_message_item(item) {
+                        last_assistant = Some(text.clone());
+                        if item.get("phase").and_then(Value::as_str) == Some("final_answer") {
+                            final_report = Some(text);
+                        }
+                    }
+                }
+            }
+            let started_at_ms = turn_timestamp_ms(turn, "startedAt", "startedAtMs");
+            let completed_at_ms = turn_timestamp_ms(turn, "completedAt", "completedAtMs");
+            let updated_at = completed_at_ms
+                .or(started_at_ms)
+                .map(|value| value / 1000)
+                .unwrap_or_else(now_secs);
+            let status = turn
+                .get("status")
+                .and_then(|status| {
+                    status
+                        .as_str()
+                        .or_else(|| status.get("type").and_then(Value::as_str))
+                })
+                .unwrap_or("unknown")
+                .to_string();
+            Some(TurnInfo {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                status,
+                started_at_ms,
+                completed_at_ms,
+                prompt,
+                report: final_report.or(last_assistant),
+                updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    output.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.turn_id.cmp(&right.turn_id))
+    });
+    output
+}
+
+fn turn_timestamp_ms(turn: &Value, seconds_key: &str, millis_key: &str) -> Option<u64> {
+    turn.get(millis_key)
+        .or_else(|| turn.get(seconds_key))
+        .and_then(Value::as_u64)
+        .map(|value| {
+            if value < 10_000_000_000 {
+                value.saturating_mul(1000)
+            } else {
+                value
+            }
+        })
+}
+
+fn append_turn_text(target: &mut Option<String>, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(existing) = target.as_mut() {
+        existing.push('\n');
+        existing.push_str(text.trim());
+        *existing = bounded_turn_text(existing);
+    } else {
+        *target = Some(bounded_turn_text(text));
+    }
+}
+
 fn update_app_server_resume_thread_settings(
     socket: &Path,
     thread_id: &str,
     cwd: &str,
 ) -> Result<(), String> {
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control);
     let mut client = AppServerRpcClient::connect(socket)?;
     client.initialize()?;
     client.request(
@@ -5245,6 +8027,7 @@ fn parse_app_thread_snapshot(thread: &Value) -> Option<AppThreadSnapshot> {
 struct AppServerRpcClient {
     stream: UnixStream,
     next_id: u64,
+    rpc_timeout: Duration,
 }
 
 impl AppServerRpcClient {
@@ -5278,7 +8061,11 @@ impl AppServerRpcClient {
             ));
         }
 
-        Ok(Self { stream, next_id: 1 })
+        Ok(Self {
+            stream,
+            next_id: 1,
+            rpc_timeout: APP_SERVER_RPC_READ_RETRY_TIMEOUT,
+        })
     }
 
     fn initialize(&mut self) -> Result<(), String> {
@@ -5303,6 +8090,10 @@ impl AppServerRpcClient {
         self.stream
             .set_read_timeout(timeout)
             .map_err(|err| format!("set app-server read timeout: {err}"))
+    }
+
+    fn set_rpc_timeout(&mut self, timeout: Duration) {
+        self.rpc_timeout = timeout;
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -5350,13 +8141,13 @@ impl AppServerRpcClient {
     }
 
     fn read_message_value(&mut self) -> Result<Value, String> {
-        let message = websocket_read_text(&mut self.stream)?;
+        let message = websocket_read_text_with_timeout(&mut self.stream, self.rpc_timeout)?;
         serde_json::from_str(&message)
             .map_err(|err| format!("decode app-server message: {err}: {message}"))
     }
 }
 
-fn read_http_headers(stream: &mut UnixStream) -> Result<String, String> {
+fn read_http_headers<R: Read>(stream: &mut R) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
@@ -5371,7 +8162,261 @@ fn read_http_headers(stream: &mut UnixStream) -> Result<String, String> {
     String::from_utf8(buf).map_err(|err| format!("decode websocket handshake: {err}"))
 }
 
-fn websocket_send_text(stream: &mut UnixStream, text: &str) -> Result<(), String> {
+fn spawn_client_thread_proxy(
+    paths: &RuntimePaths,
+    client_id: &str,
+    upstream_remote: &str,
+    event_tx: mpsc::Sender<ClientEvent>,
+) -> Result<ClientThreadProxy, String> {
+    let upstream_socket = upstream_remote
+        .strip_prefix("unix://")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("unsupported non-unix YOLO_REMOTE: {upstream_remote}"))?;
+    if !upstream_socket.is_absolute() {
+        return Err(format!(
+            "YOLO_REMOTE socket path must be absolute: {}",
+            upstream_socket.display()
+        ));
+    }
+
+    let proxy_dir = paths.dir.join(CLIENT_PROXY_DIR_NAME);
+    fs::create_dir_all(&proxy_dir).map_err(|err| {
+        format!(
+            "create client proxy directory {}: {err}",
+            proxy_dir.display()
+        )
+    })?;
+    let socket_path = proxy_dir.join(format!("{client_id}.sock"));
+    remove_socket_if_present(&socket_path)?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|err| format!("bind client proxy {}: {err}", socket_path.display()))?;
+
+    thread::spawn(move || {
+        let Ok((mut client_stream, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(mut upstream_stream) = UnixStream::connect(&upstream_socket) else {
+            return;
+        };
+
+        let request = match read_http_headers(&mut client_stream) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if upstream_stream.write_all(request.as_bytes()).is_err() {
+            return;
+        }
+        let response = match read_http_headers(&mut upstream_stream) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if client_stream.write_all(response.as_bytes()).is_err() {
+            return;
+        }
+
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+        let Ok(mut client_read) = client_stream.try_clone() else {
+            return;
+        };
+        let Ok(mut upstream_write) = upstream_stream.try_clone() else {
+            return;
+        };
+        let client_tracker = Arc::clone(&tracker);
+        let client_to_server = thread::spawn(move || {
+            relay_client_websocket_frames(&mut client_read, &mut upstream_write, &client_tracker);
+        });
+        relay_server_websocket_frames(&mut upstream_stream, &mut client_stream, &tracker);
+        let _ = client_to_server.join();
+    });
+
+    Ok(ClientThreadProxy {
+        remote: format!("unix://{}", socket_path.display()),
+        socket_path,
+    })
+}
+
+fn relay_client_websocket_frames(
+    source: &mut UnixStream,
+    target: &mut UnixStream,
+    tracker: &Arc<Mutex<ThreadBindingTracker>>,
+) {
+    while let Ok(frame) = read_websocket_frame(source) {
+        if target.write_all(&frame.raw).is_err() {
+            return;
+        }
+        if frame.opcode != 0x1 {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&frame.payload) else {
+            continue;
+        };
+        observe_client_app_server_request(tracker, &value);
+    }
+}
+
+fn relay_server_websocket_frames(
+    source: &mut UnixStream,
+    target: &mut UnixStream,
+    tracker: &Arc<Mutex<ThreadBindingTracker>>,
+) {
+    while let Ok(frame) = read_websocket_frame(source) {
+        if target.write_all(&frame.raw).is_err() {
+            return;
+        }
+        if frame.opcode != 0x1 {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&frame.payload) else {
+            continue;
+        };
+        observe_app_server_response(tracker, &value);
+    }
+}
+
+fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = value.get("params").unwrap_or(&Value::Null);
+    let explicit_thread_id = params.get("threadId").and_then(Value::as_str);
+    if matches!(
+        method,
+        "thread/resume" | "turn/start" | "thread/settings/update"
+    ) && let Some(thread_id) = explicit_thread_id
+    {
+        note_tracked_thread_id(tracker, thread_id);
+    }
+    if method == "turn/start"
+        && let Some(prompt) = extract_turn_prompt(params)
+    {
+        let tracked_thread_id = explicit_thread_id.map(ToString::to_string).or_else(|| {
+            tracker
+                .lock()
+                .ok()
+                .and_then(|tracker| tracker.current_thread_id.clone())
+        });
+        if let Some(thread_id) = tracked_thread_id {
+            let turn_id = params
+                .get("turnId")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("turn_id").and_then(Value::as_str))
+                .map(ToString::to_string);
+            if let Ok(tracker) = tracker.lock() {
+                let _ = tracker.event_tx.send(ClientEvent::TurnInput {
+                    thread_id,
+                    turn_id,
+                    prompt,
+                });
+            }
+        }
+    }
+    if matches!(method, "thread/start" | "thread/fork")
+        && let Some(id) = value.get("id").and_then(Value::as_u64)
+        && let Ok(mut tracker) = tracker.lock()
+    {
+        tracker.pending_create_request_ids.insert(id);
+    }
+}
+
+fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
+    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+        return;
+    };
+    let should_track = tracker
+        .lock()
+        .map(|mut tracker| tracker.pending_create_request_ids.remove(&id))
+        .unwrap_or(false);
+    if !should_track {
+        return;
+    }
+    let Some(thread_id) = value
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    note_tracked_thread_id(tracker, thread_id);
+}
+
+fn note_tracked_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id: &str) {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let Ok(mut tracker) = tracker.lock() else {
+        return;
+    };
+    if tracker.current_thread_id.as_deref() == Some(thread_id) {
+        return;
+    }
+    tracker.current_thread_id = Some(thread_id.to_string());
+    let _ = tracker
+        .event_tx
+        .send(ClientEvent::ThreadBound(thread_id.to_string()));
+}
+
+fn read_websocket_frame<R: Read>(stream: &mut R) -> Result<WebsocketFrame, String> {
+    let mut header = [0u8; 2];
+    stream
+        .read_exact(&mut header)
+        .map_err(|err| format!("read websocket frame header: {err}"))?;
+    let opcode = header[0] & 0x0f;
+    let masked = (header[1] & 0x80) != 0;
+    let mut raw = header.to_vec();
+    let mut len = (header[1] & 0x7f) as u64;
+    if len == 126 {
+        let mut bytes = [0u8; 2];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read websocket frame length: {err}"))?;
+        len = u16::from_be_bytes(bytes) as u64;
+        raw.extend_from_slice(&bytes);
+    } else if len == 127 {
+        let mut bytes = [0u8; 8];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read websocket frame length: {err}"))?;
+        len = u64::from_be_bytes(bytes);
+        raw.extend_from_slice(&bytes);
+    }
+    if len > 16 * 1024 * 1024 {
+        return Err("websocket frame too large".to_string());
+    }
+    let mask = if masked {
+        let mut bytes = [0u8; 4];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("read websocket frame mask: {err}"))?;
+        raw.extend_from_slice(&bytes);
+        Some(bytes)
+    } else {
+        None
+    };
+    let mut payload = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|err| format!("read websocket frame payload: {err}"))?;
+    raw.extend_from_slice(&payload);
+    if let Some(mask) = mask {
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[idx % 4];
+        }
+    }
+    Ok(WebsocketFrame {
+        raw,
+        opcode,
+        payload,
+    })
+}
+
+fn websocket_send_text<W: Write>(stream: &mut W, text: &str) -> Result<(), String> {
     let payload = text.as_bytes();
     let mut frame = Vec::with_capacity(payload.len() + 14);
     frame.push(0x81);
@@ -5397,8 +8442,34 @@ fn websocket_send_text(stream: &mut UnixStream, text: &str) -> Result<(), String
         .map_err(|err| format!("write websocket frame: {err}"))
 }
 
-fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
-    let deadline = Instant::now() + APP_SERVER_RPC_READ_RETRY_TIMEOUT;
+fn websocket_send_text_unmasked<W: Write>(stream: &mut W, text: &str) -> Result<(), String> {
+    let payload = text.as_bytes();
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x81);
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream
+        .write_all(&frame)
+        .map_err(|err| format!("write unmasked websocket frame: {err}"))
+}
+
+fn websocket_read_text<S: Read + Write>(stream: &mut S) -> Result<String, String> {
+    websocket_read_text_with_timeout(stream, APP_SERVER_RPC_READ_RETRY_TIMEOUT)
+}
+
+fn websocket_read_text_with_timeout<S: Read + Write>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
     loop {
         let mut header = [0u8; 2];
         read_exact_retry(stream, &mut header, "read websocket frame header", deadline)?;
@@ -5450,8 +8521,8 @@ fn websocket_read_text(stream: &mut UnixStream) -> Result<String, String> {
     }
 }
 
-fn read_exact_retry(
-    stream: &mut UnixStream,
+fn read_exact_retry<R: Read>(
+    stream: &mut R,
     mut buf: &mut [u8],
     context: &str,
     deadline: Instant,
@@ -5480,7 +8551,7 @@ fn read_exact_retry(
     Ok(())
 }
 
-fn websocket_send_pong(stream: &mut UnixStream, payload: &[u8]) -> Result<(), String> {
+fn websocket_send_pong<W: Write>(stream: &mut W, payload: &[u8]) -> Result<(), String> {
     let mut frame = Vec::with_capacity(payload.len() + 6);
     frame.push(0x8A);
     frame.push(0x80 | payload.len() as u8);
@@ -5639,6 +8710,13 @@ fn read_http_request<R: Read>(
     Ok((method, path, headers, body))
 }
 
+fn query_parameter(query: &str, wanted: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == wanted).then(|| value.to_string())
+    })
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -5657,6 +8735,55 @@ fn json_response<T: Serialize>(status: u16, body: &T) -> String {
         body.len(),
         body
     )
+}
+
+fn load_turn_archive(path: &Path, telemetry: &mut AgentTelemetry) {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines() {
+        let Ok(info) = serde_json::from_str::<TurnInfo>(line) else {
+            continue;
+        };
+        let record = turn_record_from_info(info);
+        telemetry.turns.insert(record.key.clone(), record);
+    }
+    telemetry.trim_turns();
+}
+
+fn persist_turn_archive(path: &Path, telemetry: &AgentTelemetry) {
+    if !turn_capture_enabled() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(err) = fs::create_dir_all(parent) {
+        eprintln!(
+            "yolo: create turn archive directory {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+    let snapshot = telemetry.turns_snapshot(None, MAX_TELEMETRY_TURNS);
+    let mut contents = String::new();
+    for turn in snapshot.turns {
+        let Ok(line) = serde_json::to_string(&turn) else {
+            continue;
+        };
+        contents.push_str(&line);
+        contents.push('\n');
+    }
+    let temporary = path.with_extension("jsonl.tmp");
+    if let Err(err) = fs::write(&temporary, contents) {
+        eprintln!("yolo: write turn archive {}: {err}", temporary.display());
+        return;
+    }
+    let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    if let Err(err) = fs::rename(&temporary, path) {
+        eprintln!("yolo: replace turn archive {}: {err}", path.display());
+        let _ = fs::remove_file(&temporary);
+    }
 }
 
 #[derive(Debug)]
@@ -5820,6 +8947,7 @@ fn runtime_paths() -> Result<RuntimePaths, String> {
         app_server_socket: dir.join("app-server").join(APP_SERVER_SOCKET_NAME),
         pid_file: dir.join(PID_FILE_NAME),
         log_file: dir.join("server.log"),
+        turn_archive: dir.join(TURN_ARCHIVE_FILE_NAME),
         dir,
     })
 }
@@ -5878,6 +9006,7 @@ Usage:
   yolo refresh-permissions --all|--client ID|--thread THREAD_ID|--cwd DIR
   yolo server [--daemon|--foreground] [--federation-listen ADDR]
   yolo status
+  yolo turns [--thread THREAD_ID] [--limit N] [--history]
   yolo stop
 
 Default client command:
@@ -5910,6 +9039,9 @@ generation revive that same session.
 
 API:
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
+  curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock 'http://yolo/turns?limit=20'
+  yolo turns --thread THREAD_ID --limit 20
+  yolo turns --history --thread THREAD_ID --limit 20
   curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-all
 
 Federation:
@@ -5931,6 +9063,7 @@ Environment:
   YOLO_CODEX_PREFIX Managed Codex npm prefix
   YOLO_REMOTE       Override app-server endpoint for the client
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
+  YOLO_TURN_CAPTURE Enable turn prompt/report capture (default: on; set off to disable)
   YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS
                     Max seconds to wait for working clients before upgrade
   YOLO_FEDERATION_LISTEN

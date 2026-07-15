@@ -85,6 +85,38 @@ The `/clients` response includes:
 - service tier
 - fast flag
 - lifecycle status and timestamps
+- `telemetry_summary` with the known thread, subagent, active tool, running hook,
+  and captured turn counts
+
+The app-server event aggregator is also available through:
+
+```sh
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" http://yolo/telemetry
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" http://yolo/agents
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" http://yolo/subagents
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" 'http://yolo/turns?limit=20'
+curl --unix-socket "$XDG_RUNTIME_DIR/yolo/api.sock" \
+  'http://yolo/turns/history?thread_id=THREAD_ID&limit=20'
+```
+
+`/agents` returns known threads with `parent_thread_id`, direct
+`subagent_count`, `active_subagent_count`, and recursive descendant counts.
+`/subagents` filters that list to child agents. `/telemetry` additionally
+returns bounded recent `tool_calls` and `hook_runs`. Tool calls expose their
+`pre`/`post` lifecycle phase, type, status, timing, success, and spawned child
+thread IDs; command arguments and tool output are intentionally omitted.
+Hook runs expose lifecycle events such as `preToolUse`, `postToolUse`, and
+`subagentStart`/`subagentStop` when those hooks are configured and trusted in
+Codex.
+
+Turn capture records the prompt submitted at turn start and the latest
+completed assistant message as `report`. The live collector observes both the
+app-server item lifecycle and the yolo client proxy's `turn/start` request.
+`/turns` returns the bounded local archive; `/turns/history` reads a requested
+thread from app-server and imports the selected recent turns. The archive is
+stored as mode-0600 `turns.jsonl` in the yolo runtime directory and is capped
+at 512 turns with 16 KiB per prompt/report. Set `YOLO_TURN_CAPTURE=off` to stop
+new capture while retaining the existing local archive for reference.
 
 ## Master/slave federation
 
@@ -128,6 +160,18 @@ curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   --data '{"action":"yolo-upgrade","yolo_version":"0.5.0"}' \
   http://127.0.0.1:47040/federation/slaves/mars/commands
 ```
+
+The local master also exposes a WebSocket status stream for trusted local
+consumers such as websh:
+
+```text
+ws://127.0.0.1:47040/federation/events
+```
+
+The stream emits a `status` event after local client settings or permissions
+change and whenever a slave pushes a fresh status. It sends an initial event
+when connected, so consumers can refresh once per event instead of polling the
+federation API.
 
 `codex-upgrade-resume` waits until slave Codex clients become idle, installs the
 requested `@openai/codex` version into yolo's managed user-writable npm prefix,
