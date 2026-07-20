@@ -2141,6 +2141,10 @@ fn run_client(args: Vec<OsString>) {
         .as_ref()
         .map(|proxy| proxy.remote.clone())
         .unwrap_or_else(|| upstream_remote.clone());
+    // Register the endpoint Codex actually uses. Keeping the upstream URL
+    // here made a newly launched, pre-thread client look like a legacy direct
+    // connection until a later process scan reconstructed its command line.
+    info.remote = remote.clone();
     let heartbeat_event_tx = event_tx.clone();
     let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
