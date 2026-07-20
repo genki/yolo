@@ -1572,6 +1572,7 @@ fn json_enum_string(value: &Value) -> Option<String> {
 enum ClientEvent {
     RestartRequested,
     ThreadBound(String),
+    PendingSettingsApplied(PendingClientSettings),
     TurnInput {
         thread_id: String,
         turn_id: Option<String>,
@@ -2226,6 +2227,7 @@ fn run_client(args: Vec<OsString>) {
     });
     drop(event_tx);
 
+    let mut pending_settings_applied = None;
     loop {
         match event_rx.recv() {
             Ok(ClientEvent::RestartRequested) => {
@@ -2249,6 +2251,22 @@ fn run_client(args: Vec<OsString>) {
                         "/clients/register",
                         &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
                     );
+                }
+                if let Some(settings) = pending_settings_applied.take() {
+                    sync_applied_pending_settings(&client_id, &settings);
+                }
+            }
+            Ok(ClientEvent::PendingSettingsApplied(settings)) => {
+                apply_pending_settings_to_client_info(&mut info, &settings);
+                pending_settings_applied = Some(settings);
+                let _ = api_post_json(
+                    "/clients/register",
+                    &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                );
+                if info.thread_id.is_some()
+                    && let Some(settings) = pending_settings_applied.take()
+                {
+                    sync_applied_pending_settings(&client_id, &settings);
                 }
             }
             Ok(ClientEvent::TurnInput {
@@ -3342,9 +3360,9 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&PendingClientSettings {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-5.6-luna".to_string()),
                 fast: Some(false),
-                reasoning_effort: Some("low".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
             })
             .unwrap(),
         )
@@ -3360,9 +3378,10 @@ mod tests {
             }
         });
 
-        assert!(apply_pending_settings_to_turn_start(&mut request, &path));
-        assert_eq!(request["params"]["model"], "gpt-5.6-sol");
-        assert_eq!(request["params"]["effort"], "low");
+        let applied = apply_pending_settings_to_turn_start(&mut request, &path).unwrap();
+        assert_eq!(applied.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(request["params"]["model"], "gpt-5.6-luna");
+        assert_eq!(request["params"]["effort"], "xhigh");
         assert_eq!(request["params"]["serviceTier"], "default");
         let _ = fs::remove_file(path);
     }
@@ -3375,7 +3394,7 @@ mod tests {
         ])));
         let request = ConfigureClientsRequest {
             client_id: Some("selected".to_string()),
-            model: Some("gpt-5.6-sol".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
             ..ConfigureClientsRequest::default()
         };
 
@@ -7910,27 +7929,67 @@ fn persist_pending_client_settings(
     })
 }
 
-fn apply_pending_settings_to_turn_start(value: &mut Value, path: &Path) -> bool {
+fn apply_pending_settings_to_client_info(
+    client: &mut ClientInfo,
+    settings: &PendingClientSettings,
+) {
+    if let Some(model) = settings.model.as_ref() {
+        client.model = Some(model.clone());
+    }
+    if let Some(effort) = settings.reasoning_effort.as_ref() {
+        client.reasoning_effort = Some(effort.clone());
+    }
+    if let Some(fast) = settings.fast {
+        client.fast = fast;
+        client.service_tier = Some(if fast { "priority" } else { "default" }.to_string());
+    }
+    client.settings_updated_at = Some(now_secs());
+    client.updated_at = now_secs();
+}
+
+fn sync_applied_pending_settings(client_id: &str, settings: &PendingClientSettings) {
+    let body = json!({
+        "client_id": client_id,
+        "model": settings.model,
+        "reasoning_effort": settings.reasoning_effort,
+        "fast": settings.fast,
+        "timeout_secs": 10,
+        "queue": false,
+    });
+    if let Err(err) = api_post_json("/clients/configure", &body) {
+        eprintln!("yolo: sync applied first-turn settings for {client_id}: {err}");
+    }
+}
+
+fn apply_pending_settings_to_turn_start(
+    value: &mut Value,
+    path: &Path,
+) -> Option<PendingClientSettings> {
     if value.get("method").and_then(Value::as_str) != Some("turn/start") {
-        return false;
+        return None;
     }
     let Ok(contents) = fs::read(path) else {
-        return false;
+        return None;
     };
     let Ok(settings) = serde_json::from_slice::<PendingClientSettings>(&contents) else {
-        return false;
+        return None;
     };
     let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) else {
-        return false;
+        return None;
     };
-    if let Some(model) = settings.model.filter(|model| !model.trim().is_empty()) {
-        params.insert("model".to_string(), Value::String(model));
+    if let Some(model) = settings
+        .model
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        params.insert("model".to_string(), Value::String(model.clone()));
     }
     if let Some(effort) = settings
         .reasoning_effort
+        .as_ref()
         .filter(|effort| !effort.trim().is_empty())
     {
-        params.insert("effort".to_string(), Value::String(effort));
+        params.insert("effort".to_string(), Value::String(effort.clone()));
     }
     if let Some(fast) = settings.fast {
         params.insert(
@@ -7938,7 +7997,7 @@ fn apply_pending_settings_to_turn_start(value: &mut Value, path: &Path) -> bool 
             Value::String(if fast { "priority" } else { "default" }.to_string()),
         );
     }
-    true
+    Some(settings)
 }
 
 fn select_configure_clients(
@@ -8663,9 +8722,9 @@ fn relay_client_websocket_frames(
             }
             continue;
         };
-        let pending_applied =
+        let pending_settings =
             apply_pending_settings_to_turn_start(&mut value, pending_settings_path);
-        if pending_applied {
+        if let Some(settings) = pending_settings {
             let Ok(text) = serde_json::to_string(&value) else {
                 return;
             };
@@ -8676,6 +8735,11 @@ fn relay_client_websocket_frames(
             // first turn has been forwarded, later in-TUI model changes must
             // remain authoritative instead of being overwritten by YOLO.
             let _ = fs::remove_file(pending_settings_path);
+            if let Ok(tracker) = tracker.lock() {
+                let _ = tracker
+                    .event_tx
+                    .send(ClientEvent::PendingSettingsApplied(settings));
+            }
         } else if target.write_all(&frame.raw).is_err() {
             return;
         }
