@@ -3715,13 +3715,18 @@ mod tests {
 
     #[test]
     fn scanned_codex_args_preserve_managed_remote() {
+        let remote = remote_from_codex_args(&[
+            "codex".to_string(),
+            "--remote".to_string(),
+            "unix:///run/user/1000/yolo/client-proxies/client.sock".to_string(),
+        ]);
         assert_eq!(
-            remote_from_codex_args(&[
-                "codex".to_string(),
-                "--remote".to_string(),
-                "unix:///run/user/1000/yolo/client-proxies/client.sock".to_string(),
-            ]),
+            remote,
             "unix:///run/user/1000/yolo/client-proxies/client.sock"
+        );
+        assert_eq!(
+            client_id_from_managed_proxy_remote(&remote).as_deref(),
+            Some("client")
         );
     }
 
@@ -7067,7 +7072,12 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         if !is_yolo_client_args(&args) {
             continue;
         }
-        let id = format!("{}-scanned", process.pid);
+        let remote = child_codex_by_parent
+            .get(&process.pid)
+            .map(|(_, remote)| remote.clone())
+            .unwrap_or_default();
+        let id = client_id_from_managed_proxy_remote(&remote)
+            .unwrap_or_else(|| format!("{}-scanned", process.pid));
         if state
             .clients
             .values()
@@ -7086,10 +7096,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 codex_pid: child_codex_by_parent.get(&process.pid).map(|(pid, _)| *pid),
                 cwd: process.cwd.unwrap_or_else(|| String::from("")),
                 args: args.clone(),
-                remote: child_codex_by_parent
-                    .get(&process.pid)
-                    .map(|(_, remote)| remote.clone())
-                    .unwrap_or_default(),
+                remote,
                 model: launch_cfg.model.or(cfg.model),
                 service_tier: service_tier.clone(),
                 reasoning_effort: launch_cfg.reasoning_effort,
@@ -7124,6 +7131,23 @@ fn remote_from_codex_args(args: &[String]) -> String {
             arg.strip_prefix("--remote=").map(ToString::to_string)
         })
         .unwrap_or_default()
+}
+
+fn client_id_from_managed_proxy_remote(remote: &str) -> Option<String> {
+    let socket_path = remote.strip_prefix("unix://")?;
+    let path = Path::new(socket_path);
+    if path.parent()?.file_name()?.to_str()? != CLIENT_PROXY_DIR_NAME {
+        return None;
+    }
+    let client_id = path.file_stem()?.to_str()?;
+    if client_id.is_empty()
+        || !client_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return None;
+    }
+    Some(client_id.to_string())
 }
 
 fn spawn_initial_app_server_thread_snapshot(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
