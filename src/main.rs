@@ -43,6 +43,7 @@ const RESUME_PERMISSIONS_REINFORCE_INTERVAL: Duration = Duration::from_secs(2);
 const APP_SERVER_SELF_HEAL_STABLE_AFTER: Duration = Duration::from_secs(60);
 const APP_SERVER_SELF_HEAL_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLIENT_PROXY_DIR_NAME: &str = "client-proxies";
+const CLIENT_PENDING_SETTINGS_DIR_NAME: &str = "client-pending-settings";
 const TURN_ARCHIVE_FILE_NAME: &str = "turns.jsonl";
 const APP_SERVER_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_TELEMETRY_THREADS: usize = 2048;
@@ -1623,6 +1624,16 @@ struct ConfigureClientsRequest {
     timeout_secs: Option<u64>,
     #[serde(default)]
     queue: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PendingClientSettings {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    fast: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -3315,6 +3326,57 @@ mod tests {
             ClientEvent::TurnInput { thread_id, prompt, .. }
                 if thread_id == "root" && prompt == "Run the requested check"
         ));
+    }
+
+    #[test]
+    fn pending_client_settings_override_the_first_turn_start() {
+        let path = env::temp_dir().join(format!(
+            "yolo-pending-settings-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(&PendingClientSettings {
+                model: Some("gpt-5.6-sol".to_string()),
+                fast: Some(false),
+                reasoning_effort: Some("low".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut request = json!({
+            "id": "first-turn",
+            "method": "turn/start",
+            "params": {
+                "threadId": "new-thread",
+                "model": "gpt-old",
+                "effort": "high",
+                "serviceTier": "priority"
+            }
+        });
+
+        assert!(apply_pending_settings_to_turn_start(&mut request, &path));
+        assert_eq!(request["params"]["model"], "gpt-5.6-sol");
+        assert_eq!(request["params"]["effort"], "low");
+        assert_eq!(request["params"]["serviceTier"], "default");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_id_configuration_does_not_select_other_unresolved_clients() {
+        let state = Arc::new(Mutex::new(test_state(vec![
+            test_client("selected", &[], "/home/vagrant/head", None),
+            test_client("other", &[], "/home/vagrant/moon", None),
+        ])));
+        let request = ConfigureClientsRequest {
+            client_id: Some("selected".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            ..ConfigureClientsRequest::default()
+        };
+
+        let selected = select_configure_clients(&state, &request).unwrap();
+        assert_eq!(selected, BTreeSet::from(["selected".to_string()]));
     }
 
     #[test]
@@ -7624,14 +7686,46 @@ fn configure_clients(
         return Err("no matching yolo clients".to_string());
     }
 
-    let clients = selected_clients_with_threads(&state, &selected_ids)?;
+    let (clients, pending_clients) = selected_clients_by_thread_state(&state, &selected_ids)?;
+    let mut pending = Vec::new();
+    for client_id in pending_clients {
+        persist_pending_client_settings(paths, &client_id, &request)?;
+        note_client_settings_update(
+            &state,
+            &client_id,
+            request.model.clone(),
+            request.fast,
+            request.reasoning_effort.clone(),
+        );
+        pending.push(json!({
+            "client_id": client_id,
+            "thread_id": Value::Null,
+            "pending_first_turn": true,
+        }));
+    }
+    if !pending.is_empty() {
+        publish_status_event(&state, "client-settings-pending");
+    }
+    if clients.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "updated": [],
+            "pending": pending,
+            "model": request.model,
+            "fast": request.fast,
+            "reasoning_effort": request.reasoning_effort,
+        }));
+    }
     // `thread/settings/update` is idempotent. A short-lived app-server stall
     // must not turn a valid modal action into a permanent failure, but retries
     // are bounded and never applied to a missing thread.
     let mut last_error = None;
     for attempt in 0..APP_SERVER_CONFIGURE_MAX_ATTEMPTS {
         match configure_clients_once(&state, paths, &request, &clients) {
-            Ok(value) => return Ok(value),
+            Ok(mut value) => {
+                value["pending"] = Value::Array(pending);
+                return Ok(value);
+            }
             Err(err) if is_retryable_app_server_error(&err) => {
                 last_error = Some(err.clone());
                 if attempt + 1 < APP_SERVER_CONFIGURE_MAX_ATTEMPTS {
@@ -7762,6 +7856,87 @@ fn note_client_permissions_update(state: &Arc<Mutex<ServerState>>, client_id: &s
     client.updated_at = now;
 }
 
+fn pending_client_settings_path(paths: &RuntimePaths, client_id: &str) -> Result<PathBuf, String> {
+    if client_id.is_empty()
+        || !client_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!(
+            "invalid client id for pending settings: {client_id}"
+        ));
+    }
+    Ok(paths
+        .dir
+        .join(CLIENT_PENDING_SETTINGS_DIR_NAME)
+        .join(format!("{client_id}.json")))
+}
+
+fn persist_pending_client_settings(
+    paths: &RuntimePaths,
+    client_id: &str,
+    request: &ConfigureClientsRequest,
+) -> Result<(), String> {
+    let path = pending_client_settings_path(paths, client_id)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("pending settings path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create pending settings directory {}: {err}",
+            parent.display()
+        )
+    })?;
+    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    let settings = PendingClientSettings {
+        model: request.model.clone(),
+        fast: request.fast,
+        reasoning_effort: request.reasoning_effort.clone(),
+    };
+    let contents = serde_json::to_vec(&settings)
+        .map_err(|err| format!("encode pending settings for {client_id}: {err}"))?;
+    let temporary =
+        path.with_extension(format!("json.{}.{}.tmp", std::process::id(), now_millis()));
+    fs::write(&temporary, contents)
+        .map_err(|err| format!("write pending settings {}: {err}", temporary.display()))?;
+    let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    fs::rename(&temporary, &path).map_err(|err| {
+        let _ = fs::remove_file(&temporary);
+        format!("replace pending settings {}: {err}", path.display())
+    })
+}
+
+fn apply_pending_settings_to_turn_start(value: &mut Value, path: &Path) -> bool {
+    if value.get("method").and_then(Value::as_str) != Some("turn/start") {
+        return false;
+    }
+    let Ok(contents) = fs::read(path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_slice::<PendingClientSettings>(&contents) else {
+        return false;
+    };
+    let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if let Some(model) = settings.model.filter(|model| !model.trim().is_empty()) {
+        params.insert("model".to_string(), Value::String(model));
+    }
+    if let Some(effort) = settings
+        .reasoning_effort
+        .filter(|effort| !effort.trim().is_empty())
+    {
+        params.insert("effort".to_string(), Value::String(effort));
+    }
+    if let Some(fast) = settings.fast {
+        params.insert(
+            "serviceTier".to_string(),
+            Value::String(if fast { "priority" } else { "default" }.to_string()),
+        );
+    }
+    true
+}
+
 fn select_configure_clients(
     state: &Arc<Mutex<ServerState>>,
     request: &ConfigureClientsRequest,
@@ -7776,7 +7951,10 @@ fn select_configure_clients(
         }
         let matched = request.all
             || request.client_id.as_deref() == Some(client.id.as_str())
-            || request.thread_id.as_deref() == client.thread_id.as_deref()
+            || request
+                .thread_id
+                .as_deref()
+                .is_some_and(|thread_id| client.thread_id.as_deref() == Some(thread_id))
             || request.cwd.as_deref() == Some(client.cwd.as_str());
         if matched {
             ids.insert(client.id.clone());
@@ -7785,27 +7963,35 @@ fn select_configure_clients(
     Ok(ids)
 }
 
-fn selected_clients_with_threads(
+fn selected_clients_by_thread_state(
     state: &Arc<Mutex<ServerState>>,
     selected_ids: &BTreeSet<String>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let state = state
         .lock()
         .map_err(|_| "server state lock poisoned".to_string())?;
-    selected_ids
-        .iter()
-        .map(|id| {
-            let client = state
-                .clients
-                .get(id)
-                .ok_or_else(|| format!("selected client disappeared: {id}"))?;
-            let thread_id = client
-                .thread_id
-                .clone()
-                .ok_or_else(|| format!("client {id} has no app-server thread id yet"))?;
-            Ok((id.clone(), thread_id))
-        })
-        .collect()
+    let mut with_threads = Vec::new();
+    let mut pending = Vec::new();
+    for id in selected_ids {
+        let client = state
+            .clients
+            .get(id)
+            .ok_or_else(|| format!("selected client disappeared: {id}"))?;
+        if let Some(thread_id) = client
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.trim().is_empty())
+        {
+            with_threads.push((id.clone(), thread_id.to_string()));
+        } else if client_uses_managed_proxy(client) {
+            pending.push(id.clone());
+        } else {
+            return Err(format!(
+                "client {id} has no app-server thread id and is not using a managed proxy"
+            ));
+        }
+    }
+    Ok((with_threads, pending))
 }
 
 fn upgrade_idle_wait_timeout() -> Duration {
@@ -8396,6 +8582,7 @@ fn spawn_client_thread_proxy(
         )
     })?;
     let socket_path = proxy_dir.join(format!("{client_id}.sock"));
+    let pending_settings_path = pending_client_settings_path(paths, client_id)?;
     remove_socket_if_present(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("bind client proxy {}: {err}", socket_path.display()))?;
@@ -8436,7 +8623,12 @@ fn spawn_client_thread_proxy(
         };
         let client_tracker = Arc::clone(&tracker);
         let client_to_server = thread::spawn(move || {
-            relay_client_websocket_frames(&mut client_read, &mut upstream_write, &client_tracker);
+            relay_client_websocket_frames(
+                &mut client_read,
+                &mut upstream_write,
+                &client_tracker,
+                &pending_settings_path,
+            );
         });
         relay_server_websocket_frames(&mut upstream_stream, &mut client_stream, &tracker);
         let _ = client_to_server.join();
@@ -8452,17 +8644,37 @@ fn relay_client_websocket_frames(
     source: &mut UnixStream,
     target: &mut UnixStream,
     tracker: &Arc<Mutex<ThreadBindingTracker>>,
+    pending_settings_path: &Path,
 ) {
     while let Ok(frame) = read_websocket_frame(source) {
-        if target.write_all(&frame.raw).is_err() {
-            return;
-        }
         if frame.opcode != 0x1 {
+            if target.write_all(&frame.raw).is_err() {
+                return;
+            }
             continue;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&frame.payload) else {
+        let Ok(mut value) = serde_json::from_slice::<Value>(&frame.payload) else {
+            if target.write_all(&frame.raw).is_err() {
+                return;
+            }
             continue;
         };
+        let pending_applied =
+            apply_pending_settings_to_turn_start(&mut value, pending_settings_path);
+        if pending_applied {
+            let Ok(text) = serde_json::to_string(&value) else {
+                return;
+            };
+            if websocket_send_text(target, &text).is_err() {
+                return;
+            }
+            // The pending configuration is deliberately one-shot. Once the
+            // first turn has been forwarded, later in-TUI model changes must
+            // remain authoritative instead of being overwritten by YOLO.
+            let _ = fs::remove_file(pending_settings_path);
+        } else if target.write_all(&frame.raw).is_err() {
+            return;
+        }
         observe_client_app_server_request(tracker, &value);
     }
 }
