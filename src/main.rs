@@ -1591,7 +1591,7 @@ struct WebsocketFrame {
 }
 
 struct ThreadBindingTracker {
-    pending_create_request_ids: BTreeSet<u64>,
+    pending_create_request_ids: BTreeSet<String>,
     current_thread_id: Option<String>,
     event_tx: mpsc::Sender<ClientEvent>,
 }
@@ -3625,6 +3625,18 @@ mod tests {
     }
 
     #[test]
+    fn scanned_codex_args_preserve_managed_remote() {
+        assert_eq!(
+            remote_from_codex_args(&[
+                "codex".to_string(),
+                "--remote".to_string(),
+                "unix:///run/user/1000/yolo/client-proxies/client.sock".to_string(),
+            ]),
+            "unix:///run/user/1000/yolo/client-proxies/client.sock"
+        );
+    }
+
+    #[test]
     fn app_server_pid_detection_collapses_node_native_pair() {
         let socket = "/run/user/1000/yolo/app-server/codex-app-server.sock";
         let processes = vec![
@@ -3893,6 +3905,116 @@ mod tests {
             event_rx.recv_timeout(Duration::from_millis(50)),
             Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-created"
         ));
+    }
+
+    #[test]
+    fn websocket_thread_started_notification_binds_the_proxy_client() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+
+        observe_app_server_response(
+            &tracker,
+            &json!({
+                "method": "thread/started",
+                "params": { "thread": { "id": "thread-notified" } }
+            }),
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-notified"
+        ));
+    }
+
+    #[test]
+    fn websocket_string_request_id_binds_thread_start_response() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: None,
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({ "id": "create-9", "method": "thread/start", "params": {} }),
+        );
+        observe_app_server_response(
+            &tracker,
+            &json!({
+                "id": "create-9",
+                "result": { "thread": { "id": "thread-string-id" } }
+            }),
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-string-id"
+        ));
+    }
+
+    #[test]
+    fn thread_started_binds_one_unresolved_managed_client_for_cwd() {
+        let mut state = test_state(vec![test_client(
+            "new-client",
+            &[],
+            "/home/vagrant/head",
+            None,
+        )]);
+        state.clients.get_mut("new-client").unwrap().remote =
+            "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+        let state = Arc::new(Mutex::new(state));
+
+        bind_thread_started_to_unique_managed_client(
+            &state,
+            &json!({
+                "method": "thread/started",
+                "params": {
+                    "thread": { "id": "thread-new", "cwd": "/home/vagrant/head" }
+                }
+            }),
+        );
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.clients["new-client"].thread_id.as_deref(),
+            Some("thread-new")
+        );
+        assert_eq!(
+            state.clients["new-client"].thread_id_source,
+            "app_server_started"
+        );
+    }
+
+    #[test]
+    fn thread_started_does_not_guess_between_managed_clients() {
+        let mut first = test_client("first", &[], "/home/vagrant/head", None);
+        first.remote = "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+        let mut second = test_client("second", &[], "/home/vagrant/head", None);
+        second.remote = "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+        let state = Arc::new(Mutex::new(test_state(vec![first, second])));
+
+        bind_thread_started_to_unique_managed_client(
+            &state,
+            &json!({
+                "method": "thread/started",
+                "params": {
+                    "thread": { "id": "thread-ambiguous", "cwd": "/home/vagrant/head" }
+                }
+            }),
+        );
+
+        let state = state.lock().unwrap();
+        assert!(
+            state
+                .clients
+                .values()
+                .all(|client| client.thread_id.is_none())
+        );
     }
 
     #[test]
@@ -6668,6 +6790,7 @@ fn observe_app_server_message(
     value: &Value,
     paths: &RuntimePaths,
 ) {
+    bind_thread_started_to_unique_managed_client(state, value);
     if let Some(snapshot) = parse_app_server_thread_response(value) {
         apply_single_thread_snapshot(state, &snapshot);
     }
@@ -6682,6 +6805,73 @@ fn observe_app_server_message(
     if changed && let Ok(state) = state.lock() {
         persist_turn_archive(&paths.turn_archive, &state.telemetry);
     }
+}
+
+fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>, value: &Value) {
+    if value.get("method").and_then(Value::as_str) != Some("thread/started") {
+        return;
+    }
+    let Some(thread) = value.get("params").and_then(|params| params.get("thread")) else {
+        return;
+    };
+    let Some(thread_id) = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(cwd) = thread
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    if state.clients.values().any(|client| {
+        client_thread_id_is_authoritative(client) && client.thread_id.as_deref() == Some(thread_id)
+    }) {
+        return;
+    }
+    let candidates = state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| !client_thread_id_is_authoritative(client))
+        // Only clients launched through a managed app-server proxy are safe
+        // to associate from a contemporaneous thread/started notification.
+        .filter(|client| client_uses_managed_proxy(client) && client.cwd == cwd)
+        .map(|client| client.id.clone())
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return;
+    }
+    let client_id = &candidates[0];
+    let Some(client) = state.clients.get_mut(client_id) else {
+        return;
+    };
+    client.thread_id = Some(thread_id.to_string());
+    client.thread_id_source = "app_server_started".to_string();
+    client.updated_at = now_secs();
+    eprintln!(
+        "yolo server: bound managed client {} to newly started thread {}",
+        client.id, thread_id
+    );
+}
+
+fn client_uses_managed_proxy(client: &ClientInfo) -> bool {
+    if !client.remote.trim().is_empty() {
+        return true;
+    }
+    let Some(codex_pid) = client.codex_pid else {
+        return false;
+    };
+    read_proc_cmdline(PathBuf::from(format!("/proc/{codex_pid}/cmdline")))
+        .iter()
+        .any(|arg| arg.contains("/yolo/client-proxies/") || arg.contains("/yolo/client-proxies"))
 }
 
 fn subscribe_running_client_threads(
@@ -6748,7 +6938,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
     };
     let now = now_secs();
     let current_pid = std::process::id();
-    let mut child_codex_by_parent: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut child_codex_by_parent: BTreeMap<u32, (u32, String)> = BTreeMap::new();
     let mut live_client_pids: BTreeSet<u32> = BTreeSet::new();
     for process in &processes {
         if process.cmdline.iter().any(|arg| arg.contains("codex"))
@@ -6757,7 +6947,10 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
                 .iter()
                 .any(|arg| arg.contains("--remote") || arg.contains("codex-app-server.sock"))
         {
-            child_codex_by_parent.insert(process.ppid, process.pid);
+            child_codex_by_parent.insert(
+                process.ppid,
+                (process.pid, remote_from_codex_args(&process.cmdline)),
+            );
         }
         if process.pid != current_pid
             && is_yolo_process(process)
@@ -6801,10 +6994,13 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
             ClientInfo {
                 id,
                 yolo_pid: process.pid,
-                codex_pid: child_codex_by_parent.get(&process.pid).copied(),
+                codex_pid: child_codex_by_parent.get(&process.pid).map(|(pid, _)| *pid),
                 cwd: process.cwd.unwrap_or_else(|| String::from("")),
                 args: args.clone(),
-                remote: String::new(),
+                remote: child_codex_by_parent
+                    .get(&process.pid)
+                    .map(|(_, remote)| remote.clone())
+                    .unwrap_or_default(),
                 model: launch_cfg.model.or(cfg.model),
                 service_tier: service_tier.clone(),
                 reasoning_effort: launch_cfg.reasoning_effort,
@@ -6827,6 +7023,18 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
             },
         );
     }
+}
+
+fn remote_from_codex_args(args: &[String]) -> String {
+    args.iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if arg == "--remote" {
+                return args.get(index + 1).cloned();
+            }
+            arg.strip_prefix("--remote=").map(ToString::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn spawn_initial_app_server_thread_snapshot(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
@@ -7156,7 +7364,7 @@ fn clear_conflicting_inferred_thread_ids(state: &mut ServerState) {
 fn client_thread_id_is_authoritative(client: &ClientInfo) -> bool {
     matches!(
         client.thread_id_source.as_str(),
-        "resume_arg" | "proxy" | "legacy_active_unique"
+        "resume_arg" | "proxy" | "app_server_started" | "legacy_active_unique"
     ) && client
         .thread_id
         .as_deref()
@@ -8316,7 +8524,7 @@ fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>,
         }
     }
     if matches!(method, "thread/start" | "thread/fork")
-        && let Some(id) = value.get("id").and_then(Value::as_u64)
+        && let Some(id) = app_server_message_id(value)
         && let Ok(mut tracker) = tracker.lock()
     {
         tracker.pending_create_request_ids.insert(id);
@@ -8324,7 +8532,18 @@ fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>,
 }
 
 fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
-    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+    if value.get("method").and_then(Value::as_str) == Some("thread/started") {
+        if let Some(thread_id) = value
+            .get("params")
+            .and_then(|params| params.get("thread"))
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+        {
+            note_tracked_thread_id(tracker, thread_id);
+        }
+        return;
+    }
+    let Some(id) = app_server_message_id(value) else {
         return;
     };
     let should_track = tracker
@@ -8343,6 +8562,14 @@ fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value
         return;
     };
     note_tracked_thread_id(tracker, thread_id);
+}
+
+fn app_server_message_id(value: &Value) -> Option<String> {
+    let id = value.get("id")?;
+    if !id.is_number() && !id.is_string() {
+        return None;
+    }
+    serde_json::to_string(id).ok()
 }
 
 fn note_tracked_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id: &str) {
