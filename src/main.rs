@@ -1583,6 +1583,7 @@ enum ClientEvent {
 
 struct ClientThreadProxy {
     socket_path: PathBuf,
+    pending_settings_path: PathBuf,
     remote: String,
 }
 
@@ -2233,6 +2234,7 @@ fn run_client(args: Vec<OsString>) {
             Ok(ClientEvent::RestartRequested) => {
                 if let Some(proxy) = client_proxy.as_ref() {
                     let _ = remove_socket_if_present(&proxy.socket_path);
+                    let _ = fs::remove_file(&proxy.pending_settings_path);
                 }
                 terminate_pid_tree(child_pid, Duration::from_secs(5));
                 reexec_client_for_resume(&original_args, &client_id);
@@ -2286,6 +2288,7 @@ fn run_client(args: Vec<OsString>) {
             Ok(ClientEvent::CodexExited(Ok(status))) => {
                 if let Some(proxy) = client_proxy.as_ref() {
                     let _ = remove_socket_if_present(&proxy.socket_path);
+                    let _ = fs::remove_file(&proxy.pending_settings_path);
                 }
                 if should_reexec_after_codex_exit(
                     status.success(),
@@ -2307,6 +2310,7 @@ fn run_client(args: Vec<OsString>) {
             Ok(ClientEvent::CodexExited(Err(err))) => {
                 if let Some(proxy) = client_proxy.as_ref() {
                     let _ = remove_socket_if_present(&proxy.socket_path);
+                    let _ = fs::remove_file(&proxy.pending_settings_path);
                 }
                 eprintln!("yolo: failed to wait for codex: {err}");
                 std::process::exit(1);
@@ -8646,6 +8650,7 @@ fn spawn_client_thread_proxy(
     })?;
     let socket_path = proxy_dir.join(format!("{client_id}.sock"));
     let pending_settings_path = pending_client_settings_path(paths, client_id)?;
+    let relay_pending_settings_path = pending_settings_path.clone();
     remove_socket_if_present(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("bind client proxy {}: {err}", socket_path.display()))?;
@@ -8690,7 +8695,7 @@ fn spawn_client_thread_proxy(
                 &mut client_read,
                 &mut upstream_write,
                 &client_tracker,
-                &pending_settings_path,
+                &relay_pending_settings_path,
             );
         });
         relay_server_websocket_frames(&mut upstream_stream, &mut client_stream, &tracker);
@@ -8700,6 +8705,7 @@ fn spawn_client_thread_proxy(
     Ok(ClientThreadProxy {
         remote: format!("unix://{}", socket_path.display()),
         socket_path,
+        pending_settings_path,
     })
 }
 
