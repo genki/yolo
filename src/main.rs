@@ -2075,6 +2075,7 @@ fn run_client(args: Vec<OsString>) {
             std::process::exit(2);
         }
     };
+    let resolved_args = with_new_session_defaults(resolved_args);
     let original_args = resolved_args.clone();
     ensure_codex_project_trusted(&codex_cwd);
     let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
@@ -2084,7 +2085,11 @@ fn run_client(args: Vec<OsString>) {
         .collect::<Vec<_>>();
 
     let initial_config = read_codex_config();
-    let initial_service_tier = initial_config.service_tier.clone();
+    let launch_config = parse_codex_launch_config(&string_args);
+    let initial_service_tier = launch_config
+        .service_tier
+        .clone()
+        .or(initial_config.service_tier);
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
     let thread_id = thread_id_from_args(&resolved_args);
     let resume_thread_id = thread_id.clone();
@@ -2108,9 +2113,9 @@ fn run_client(args: Vec<OsString>) {
         cwd: cwd.clone(),
         args: string_args,
         remote: upstream_remote.clone(),
-        model: initial_config.model,
+        model: launch_config.model.or(initial_config.model),
         service_tier: initial_service_tier,
-        reasoning_effort: None,
+        reasoning_effort: launch_config.reasoning_effort,
         fast: initial_fast,
         thread_id,
         thread_id_source: if resume_thread_id.is_some() {
@@ -4273,6 +4278,43 @@ mod tests {
         assert_eq!(fast.effort.as_deref(), Some("xhigh"));
         assert_eq!(fast.fast, Some(true));
         assert!(extract_codex_ui_status("example: gpt-5.6-sol / medium / normal").is_none());
+    }
+
+    #[test]
+    fn new_session_defaults_do_not_inherit_global_codex_mode() {
+        let args = with_new_session_defaults(os_args(&[]));
+        let strings = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let config = parse_codex_launch_config(&strings);
+
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(config.service_tier.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn new_session_defaults_preserve_explicit_mode_and_skip_resume() {
+        let explicit = with_new_session_defaults(os_args(&[
+            "-m",
+            "gpt-5.6-sol",
+            "-c",
+            "model_reasoning_effort=low",
+            "-c",
+            "service_tier=priority",
+        ]));
+        let strings = explicit
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let config = parse_codex_launch_config(&strings);
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(config.service_tier.as_deref(), Some("priority"));
+
+        let resume = os_args(&["resume", "thread-1"]);
+        assert_eq!(with_new_session_defaults(resume.clone()), resume);
     }
 }
 
@@ -9394,6 +9436,43 @@ fn parse_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
         }
     }
     config
+}
+
+const DEFAULT_NEW_SESSION_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_NEW_SESSION_REASONING_EFFORT: &str = "low";
+
+fn with_new_session_defaults(args: Vec<OsString>) -> Vec<OsString> {
+    if resume_target_from_args(&args).is_some() {
+        return args;
+    }
+    let strings = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let config = parse_codex_launch_config(&strings);
+    let mut defaults = Vec::new();
+    if config.model.is_none() {
+        defaults.extend([
+            OsString::from("-c"),
+            OsString::from(format!("model=\"{DEFAULT_NEW_SESSION_MODEL}\"")),
+        ]);
+    }
+    if config.reasoning_effort.is_none() {
+        defaults.extend([
+            OsString::from("-c"),
+            OsString::from(format!(
+                "model_reasoning_effort=\"{DEFAULT_NEW_SESSION_REASONING_EFFORT}\""
+            )),
+        ]);
+    }
+    if config.service_tier.is_none() {
+        defaults.extend([
+            OsString::from("-c"),
+            OsString::from("service_tier=\"default\""),
+        ]);
+    }
+    defaults.extend(args);
+    defaults
 }
 
 fn unquote_config_value(value: &str) -> String {
