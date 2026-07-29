@@ -669,7 +669,17 @@ impl AgentTelemetry {
 
     fn merge_turn_infos(&mut self, infos: Vec<TurnInfo>) {
         for info in infos {
-            let record = turn_record_from_info(info);
+            let mut record = turn_record_from_info(info);
+            if let Some(existing) = self.turns.get(&record.key) {
+                if record.status == "unknown" && existing.status != "unknown" {
+                    record.status = existing.status.clone();
+                }
+                record.started_at_ms = record.started_at_ms.or(existing.started_at_ms);
+                record.completed_at_ms = record.completed_at_ms.or(existing.completed_at_ms);
+                record.prompt = record.prompt.or_else(|| existing.prompt.clone());
+                record.result = record.result.or_else(|| existing.result.clone());
+                record.updated_at = record.updated_at.max(existing.updated_at);
+            }
             self.turns.insert(record.key.clone(), record);
         }
         self.trim_turns();
@@ -1210,11 +1220,11 @@ impl AgentTelemetry {
             }
             "turn/started" => {
                 if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
-                    if let Some(turn_id) = params.get("turnId").and_then(Value::as_str) {
+                    if let Some(turn_id) = app_server_turn_id(params) {
                         self.record_turn_started(
                             thread_id,
                             turn_id,
-                            params.get("startedAtMs").and_then(Value::as_u64),
+                            app_server_turn_timestamp_ms(params, "startedAt", "startedAtMs"),
                         );
                     }
                     self.record_thread_status(thread_id, "active", Vec::new());
@@ -1223,16 +1233,13 @@ impl AgentTelemetry {
             }
             "turn/completed" => {
                 if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
-                    if let Some(turn_id) = params.get("turnId").and_then(Value::as_str) {
-                        let status = params
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or("completed");
+                    if let Some(turn_id) = app_server_turn_id(params) {
+                        let status = app_server_turn_status(params).unwrap_or("completed");
                         self.record_turn_completed(
                             thread_id,
                             turn_id,
                             status,
-                            params.get("completedAtMs").and_then(Value::as_u64),
+                            app_server_turn_timestamp_ms(params, "completedAt", "completedAtMs"),
                         );
                     }
                     self.record_thread_status(thread_id, "idle", Vec::new());
@@ -1351,7 +1358,11 @@ fn turn_info(turn: &TurnRecord) -> TurnInfo {
     TurnInfo {
         thread_id: turn.thread_id.clone(),
         turn_id: turn.turn_id.clone(),
-        status: turn.status.clone(),
+        status: if turn.status == "unknown" && turn.result.is_some() {
+            "saved".to_string()
+        } else {
+            turn.status.clone()
+        },
         started_at_ms: turn.started_at_ms,
         completed_at_ms: turn.completed_at_ms,
         prompt: turn.prompt.clone(),
@@ -1440,6 +1451,32 @@ fn extract_turn_prompt(params: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn app_server_turn_id(params: &Value) -> Option<&str> {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("turn")?.get("id")?.as_str())
+}
+
+fn app_server_turn_timestamp_ms(params: &Value, camel_key: &str, ms_key: &str) -> Option<u64> {
+    let turn = params.get("turn").unwrap_or(&Value::Null);
+    params
+        .get(ms_key)
+        .and_then(Value::as_u64)
+        .or_else(|| turn.get(ms_key).and_then(Value::as_u64))
+        .or_else(|| params.get(camel_key).and_then(Value::as_u64))
+        .or_else(|| turn.get(camel_key).and_then(Value::as_u64))
+}
+
+fn app_server_turn_status(params: &Value) -> Option<&str> {
+    let status = params
+        .get("status")
+        .or_else(|| params.get("turn").and_then(|turn| turn.get("status")))?;
+    status
+        .as_str()
+        .or_else(|| status.get("type").and_then(Value::as_str))
 }
 
 fn is_user_message_item(item: &Value) -> bool {
@@ -3320,6 +3357,34 @@ mod tests {
             Some("Work completed")
         );
         assert!(serialized.get("report").is_none());
+    }
+
+    #[test]
+    fn telemetry_accepts_nested_turn_lifecycle_notifications() {
+        let mut telemetry = AgentTelemetry::default();
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "root",
+                "turn": {"id": "turn-nested", "startedAtMs": 1200}
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "root",
+                "turn": {
+                    "id": "turn-nested",
+                    "status": {"type": "completed"},
+                    "completedAtMs": 2400
+                }
+            }
+        }));
+        let snapshot = telemetry.turns_snapshot(Some("root"), 10);
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(snapshot.turns[0].status, "completed");
+        assert_eq!(snapshot.turns[0].started_at_ms, Some(1200));
+        assert_eq!(snapshot.turns[0].completed_at_ms, Some(2400));
     }
 
     #[test]
