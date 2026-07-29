@@ -382,8 +382,8 @@ struct TurnRecord {
     completed_at_ms: Option<u64>,
     #[serde(default)]
     prompt: Option<String>,
-    #[serde(default)]
-    report: Option<String>,
+    #[serde(default, alias = "report")]
+    result: Option<String>,
     updated_at: u64,
 }
 
@@ -401,7 +401,8 @@ struct TurnInfo {
     started_at_ms: Option<u64>,
     completed_at_ms: Option<u64>,
     prompt: Option<String>,
-    report: Option<String>,
+    #[serde(default, alias = "report")]
+    result: Option<String>,
     updated_at: u64,
 }
 
@@ -521,7 +522,7 @@ impl AgentTelemetry {
             captured_report_count: self
                 .turns
                 .values()
-                .filter(|turn| turn.report.is_some())
+                .filter(|turn| turn.result.is_some())
                 .count(),
             last_event_at: self.last_event_at,
         }
@@ -812,7 +813,7 @@ impl AgentTelemetry {
             record.prompt = Some(text.clone());
         }
         if is_assistant_message_item(item) {
-            record.report = Some(text);
+            record.result = Some(text);
         }
         record.updated_at = now_secs();
         self.last_event_at = Some(now_secs());
@@ -1354,7 +1355,7 @@ fn turn_info(turn: &TurnRecord) -> TurnInfo {
         started_at_ms: turn.started_at_ms,
         completed_at_ms: turn.completed_at_ms,
         prompt: turn.prompt.clone(),
-        report: turn.report.clone(),
+        result: turn.result.clone(),
         updated_at: turn.updated_at,
     }
 }
@@ -1369,7 +1370,7 @@ fn turn_record_from_info(info: TurnInfo) -> TurnRecord {
         started_at_ms: info.started_at_ms,
         completed_at_ms: info.completed_at_ms,
         prompt: info.prompt,
-        report: info.report,
+        result: info.result,
         updated_at: info.updated_at,
     }
 }
@@ -3293,11 +3294,32 @@ mod tests {
             Some("Investigate the failing service")
         );
         assert_eq!(
-            turn.report.as_deref(),
+            turn.result.as_deref(),
             Some("The service was restored and verified.")
         );
         assert_eq!(telemetry.summary().captured_prompt_count, 1);
         assert_eq!(telemetry.summary().captured_report_count, 1);
+    }
+
+    #[test]
+    fn turn_result_serialization_migrates_legacy_report_field() {
+        let legacy = json!({
+            "thread_id": "root",
+            "turn_id": "turn-1",
+            "status": "completed",
+            "prompt": "Do the work",
+            "report": "Work completed",
+            "updated_at": 100
+        });
+        let turn: TurnInfo =
+            serde_json::from_value(legacy).expect("legacy turn should deserialize");
+        assert_eq!(turn.result.as_deref(), Some("Work completed"));
+        let serialized = serde_json::to_value(turn).expect("turn should serialize");
+        assert_eq!(
+            serialized.get("result").and_then(Value::as_str),
+            Some("Work completed")
+        );
+        assert!(serialized.get("report").is_none());
     }
 
     #[test]
@@ -3323,7 +3345,7 @@ mod tests {
         let turns = parse_thread_history(&history, 10);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].prompt.as_deref(), Some("What changed?"));
-        assert_eq!(turns[0].report.as_deref(), Some("The change is complete."));
+        assert_eq!(turns[0].result.as_deref(), Some("The change is complete."));
         assert_eq!(turns[0].started_at_ms, Some(100_000));
         assert_eq!(turns[0].completed_at_ms, Some(110_000));
     }
@@ -8444,7 +8466,7 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
                 started_at_ms,
                 completed_at_ms,
                 prompt,
-                report: final_report.or(last_assistant),
+                result: final_report.or(last_assistant),
                 updated_at,
             })
         })
