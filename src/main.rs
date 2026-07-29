@@ -30,7 +30,7 @@ const THREAD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RESUME_GENERATION_GRACE: Duration = Duration::from_secs(20);
 const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const APP_SERVER_RPC_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const APP_SERVER_CONFIGURE_MAX_ATTEMPTS: usize = 3;
@@ -6069,12 +6069,22 @@ fn spawn_slave_connector_if_configured(state: Arc<Mutex<ServerState>>, paths: Ru
                                     &slave_id,
                                     &command,
                                 );
-                                pending_result = Some(SlaveResultRequest {
+                                let completed = SlaveResultRequest {
                                     slave_id: slave_id.clone(),
                                     command_id: command.id,
                                     ok: result.get("ok").and_then(Value::as_bool).unwrap_or(false),
                                     result,
-                                });
+                                };
+                                if federation_post_json(
+                                    &master_url,
+                                    "/federation/slaves/result",
+                                    bearer_token.as_deref(),
+                                    &serde_json::to_value(&completed).unwrap_or_else(|_| json!({})),
+                                )
+                                .is_err()
+                                {
+                                    pending_result = Some(completed);
+                                }
                             }
                             Err(err) => {
                                 eprintln!("yolo slave connector: invalid command: {err}");
@@ -6183,14 +6193,19 @@ fn execute_slave_command(
                 });
             };
             let limit = command.limit.unwrap_or(20).clamp(1, MAX_TELEMETRY_TURNS);
-            match app_server_thread_history(paths, thread_id, limit) {
-                Ok(turns) => json!({
-                    "ok": true,
-                    "thread_id": thread_id,
-                    "turns": turns,
-                }),
-                Err(err) => json!({"ok": false, "error": err}),
-            }
+            let snapshot = state
+                .lock()
+                .map(|state| state.telemetry.turns_snapshot(Some(thread_id), limit))
+                .unwrap_or_else(|_| TurnArchiveSnapshot {
+                    generated_at: now_secs(),
+                    turns: Vec::new(),
+                });
+            json!({
+                "ok": true,
+                "thread_id": thread_id,
+                "generated_at": snapshot.generated_at,
+                "turns": snapshot.turns,
+            })
         }
         "status" | "clients" | "local-status" | "local-clients" => {
             let info = server_info(&state, paths);
