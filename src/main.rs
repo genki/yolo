@@ -44,6 +44,9 @@ const APP_SERVER_SELF_HEAL_STABLE_AFTER: Duration = Duration::from_secs(60);
 const APP_SERVER_SELF_HEAL_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLIENT_PROXY_DIR_NAME: &str = "client-proxies";
 const CLIENT_PENDING_SETTINGS_DIR_NAME: &str = "client-pending-settings";
+const ACTIVE_SESSIONS_FILE_NAME: &str = "active-sessions.json";
+const ACTIVE_SESSIONS_FILE_VERSION: u32 = 1;
+const DEFAULT_CONFIGURATION_FILE_NAME: &str = "default-configuration.json";
 const TURN_ARCHIVE_FILE_NAME: &str = "turns.jsonl";
 const APP_SERVER_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_TELEMETRY_THREADS: usize = 2048;
@@ -62,6 +65,8 @@ struct RuntimePaths {
     pid_file: PathBuf,
     log_file: PathBuf,
     turn_archive: PathBuf,
+    active_sessions: PathBuf,
+    default_configuration: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +108,47 @@ struct ClientResumeSettings {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ActiveSessionRecord {
+    client_id: String,
+    cwd: String,
+    args: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    fast: bool,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    thread_id_source: String,
+    started_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ActiveSessionsFile {
+    #[serde(default = "active_sessions_file_version")]
+    version: u32,
+    #[serde(default)]
+    saved_at: u64,
+    #[serde(default)]
+    sessions: Vec<ActiveSessionRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct YoloDefaultConfiguration {
+    model: String,
+    reasoning_effort: String,
+    fast: bool,
+}
+
+fn active_sessions_file_version() -> u32 {
+    ACTIVE_SESSIONS_FILE_VERSION
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerInfo {
     version: String,
@@ -115,11 +161,15 @@ struct ServerInfo {
     app_server_socket: String,
     clients: Vec<ClientInfo>,
     #[serde(default)]
+    saved_sessions: Vec<ActiveSessionRecord>,
+    #[serde(default)]
     slaves: Vec<SlaveInfo>,
     #[serde(default)]
     tmux_panes: Vec<TmuxPaneInfo>,
     #[serde(default)]
     telemetry_summary: TelemetrySummary,
+    #[serde(default)]
+    default_configuration: Option<YoloDefaultConfiguration>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -150,6 +200,8 @@ struct ServerState {
     app_server_generation: u64,
     resume_generation: u64,
     clients: BTreeMap<String, ClientInfo>,
+    active_sessions: BTreeMap<String, ActiveSessionRecord>,
+    default_configuration: Option<YoloDefaultConfiguration>,
     slaves: BTreeMap<String, SlaveInfo>,
     telemetry: AgentTelemetry,
     #[allow(dead_code)]
@@ -272,6 +324,8 @@ struct SlaveCommand {
     #[serde(default)]
     configure: Option<ConfigureClientsRequest>,
     #[serde(default)]
+    default_configuration: Option<YoloDefaultConfiguration>,
+    #[serde(default)]
     thread_id: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
@@ -314,6 +368,7 @@ struct AgentTelemetry {
     tool_calls: BTreeMap<String, ToolCallRecord>,
     hook_runs: BTreeMap<String, HookRunRecord>,
     turns: BTreeMap<String, TurnRecord>,
+    agent_message_phases: BTreeMap<String, String>,
     pending_turn_inputs: BTreeMap<String, VecDeque<PendingTurnInput>>,
     last_event_at: Option<u64>,
 }
@@ -371,6 +426,14 @@ struct HookRunRecord {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TraceEntry {
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct TurnRecord {
     key: String,
     thread_id: String,
@@ -384,6 +447,30 @@ struct TurnRecord {
     prompt: Option<String>,
     #[serde(default, alias = "report")]
     result: Option<String>,
+    /// User-visible assistant progress (agent messages with phase=commentary).
+    #[serde(default)]
+    commentary: Option<String>,
+    /// Individual commentary items/delta streams, in capture order.
+    #[serde(default)]
+    commentary_entries: Vec<TraceEntry>,
+    /// Public reasoning summaries emitted by Codex, when the model provides them.
+    #[serde(default)]
+    reasoning_summary: Option<String>,
+    /// Individual reasoning summary items/delta streams, in capture order.
+    #[serde(default)]
+    reasoning_summary_entries: Vec<TraceEntry>,
+    /// Raw reasoning text emitted by Codex, when the model provides it.
+    #[serde(default)]
+    reasoning_raw: Option<String>,
+    /// Individual raw reasoning items/delta streams, in capture order.
+    #[serde(default)]
+    reasoning_raw_entries: Vec<TraceEntry>,
+    /// Codex plan snapshots/items emitted during the turn, in capture order.
+    #[serde(default)]
+    plan: Option<String>,
+    /// Individual plan snapshots/items/delta streams, in capture order.
+    #[serde(default)]
+    plan_entries: Vec<TraceEntry>,
     updated_at: u64,
 }
 
@@ -403,6 +490,22 @@ struct TurnInfo {
     prompt: Option<String>,
     #[serde(default, alias = "report")]
     result: Option<String>,
+    #[serde(default)]
+    commentary: Option<String>,
+    #[serde(default)]
+    commentary_entries: Vec<TraceEntry>,
+    #[serde(default)]
+    reasoning_summary: Option<String>,
+    #[serde(default)]
+    reasoning_summary_entries: Vec<TraceEntry>,
+    #[serde(default)]
+    reasoning_raw: Option<String>,
+    #[serde(default)]
+    reasoning_raw_entries: Vec<TraceEntry>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    plan_entries: Vec<TraceEntry>,
     updated_at: u64,
 }
 
@@ -422,6 +525,11 @@ struct TelemetrySummary {
     turn_count: usize,
     captured_prompt_count: usize,
     captured_report_count: usize,
+    captured_commentary_count: usize,
+    captured_reasoning_summary_count: usize,
+    captured_reasoning_raw_count: usize,
+    #[serde(default)]
+    captured_plan_count: usize,
     last_event_at: Option<u64>,
 }
 
@@ -523,6 +631,26 @@ impl AgentTelemetry {
                 .turns
                 .values()
                 .filter(|turn| turn.result.is_some())
+                .count(),
+            captured_commentary_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.commentary.is_some())
+                .count(),
+            captured_reasoning_summary_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.reasoning_summary.is_some())
+                .count(),
+            captured_reasoning_raw_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.reasoning_raw.is_some())
+                .count(),
+            captured_plan_count: self
+                .turns
+                .values()
+                .filter(|turn| turn.plan.is_some())
                 .count(),
             last_event_at: self.last_event_at,
         }
@@ -678,6 +806,31 @@ impl AgentTelemetry {
                 record.completed_at_ms = record.completed_at_ms.or(existing.completed_at_ms);
                 record.prompt = record.prompt.or_else(|| existing.prompt.clone());
                 record.result = record.result.or_else(|| existing.result.clone());
+                let existing_commentary = trace_entries_with_legacy(
+                    &existing.commentary_entries,
+                    existing.commentary.as_ref(),
+                );
+                merge_trace_entries(&mut record.commentary_entries, &existing_commentary);
+                record.commentary = trace_entries_text(&record.commentary_entries);
+                let existing_reasoning_summary = trace_entries_with_legacy(
+                    &existing.reasoning_summary_entries,
+                    existing.reasoning_summary.as_ref(),
+                );
+                merge_trace_entries(
+                    &mut record.reasoning_summary_entries,
+                    &existing_reasoning_summary,
+                );
+                record.reasoning_summary = trace_entries_text(&record.reasoning_summary_entries);
+                let existing_reasoning_raw = trace_entries_with_legacy(
+                    &existing.reasoning_raw_entries,
+                    existing.reasoning_raw.as_ref(),
+                );
+                merge_trace_entries(&mut record.reasoning_raw_entries, &existing_reasoning_raw);
+                record.reasoning_raw = trace_entries_text(&record.reasoning_raw_entries);
+                let existing_plan_entries =
+                    trace_entries_with_legacy(&existing.plan_entries, existing.plan.as_ref());
+                merge_trace_entries(&mut record.plan_entries, &existing_plan_entries);
+                record.plan = trace_entries_text(&record.plan_entries);
                 record.updated_at = record.updated_at.max(existing.updated_at);
             }
             self.turns.insert(record.key.clone(), record);
@@ -819,15 +972,165 @@ impl AgentTelemetry {
             return;
         };
         let record = self.ensure_turn(thread_id, &turn_id);
+        ensure_turn_trace_entries(record);
         if is_user_message_item(item) {
             record.prompt = Some(text.clone());
-        }
-        if is_assistant_message_item(item) {
+        } else if is_commentary_message_item(item) {
+            let item_id = item.get("id").and_then(Value::as_str);
+            set_trace_entry(&mut record.commentary_entries, item_id, &text);
+            sync_legacy_trace(&mut record.commentary, &record.commentary_entries);
+        } else if is_assistant_message_item(item) {
             record.result = Some(text);
         }
         record.updated_at = now_secs();
         self.last_event_at = Some(now_secs());
         self.trim_turns();
+    }
+
+    fn record_reasoning_item(&mut self, thread_id: &str, turn_id: &str, item: &Value) -> bool {
+        if !turn_capture_enabled() {
+            return false;
+        }
+        let item_id = item.get("id").and_then(Value::as_str);
+        let summary = item
+            .get("summary")
+            .and_then(extract_message_text)
+            .filter(|text| !text.is_empty());
+        let raw = item
+            .get("content")
+            .and_then(extract_message_text)
+            .filter(|text| !text.is_empty());
+        if summary.is_none() && raw.is_none() {
+            return false;
+        }
+        let record = self.ensure_turn(thread_id, turn_id);
+        ensure_turn_trace_entries(record);
+        if let Some(summary) = summary {
+            set_trace_entry(&mut record.reasoning_summary_entries, item_id, &summary);
+            sync_legacy_trace(
+                &mut record.reasoning_summary,
+                &record.reasoning_summary_entries,
+            );
+        }
+        if let Some(raw) = raw {
+            set_trace_entry(&mut record.reasoning_raw_entries, item_id, &raw);
+            sync_legacy_trace(&mut record.reasoning_raw, &record.reasoning_raw_entries);
+        }
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+        true
+    }
+
+    fn record_reasoning_delta(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: Option<&str>,
+        field: TraceField,
+        delta: &str,
+    ) -> bool {
+        if !turn_capture_enabled() || delta.trim().is_empty() {
+            return false;
+        }
+        let record = self.ensure_turn(thread_id, turn_id);
+        ensure_turn_trace_entries(record);
+        match field {
+            TraceField::Commentary => {
+                append_trace_entry(&mut record.commentary_entries, item_id, delta);
+                sync_legacy_trace(&mut record.commentary, &record.commentary_entries);
+            }
+            TraceField::ReasoningSummary => {
+                append_trace_entry(&mut record.reasoning_summary_entries, item_id, delta);
+                sync_legacy_trace(
+                    &mut record.reasoning_summary,
+                    &record.reasoning_summary_entries,
+                );
+            }
+            TraceField::ReasoningRaw => {
+                append_trace_entry(&mut record.reasoning_raw_entries, item_id, delta);
+                sync_legacy_trace(&mut record.reasoning_raw, &record.reasoning_raw_entries);
+            }
+        }
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+        true
+    }
+
+    fn record_plan_update(&mut self, params: &Value) -> bool {
+        if !turn_capture_enabled() {
+            return false;
+        }
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(turn_id) = params.get("turnId").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(text) = format_plan_update_text(params) else {
+            return false;
+        };
+        let record = self.ensure_turn(thread_id, turn_id);
+        ensure_turn_trace_entries(record);
+        let item_id = format!("plan-update-{}", record.plan_entries.len() + 1);
+        append_trace_entry(&mut record.plan_entries, Some(&item_id), &text);
+        sync_legacy_trace(&mut record.plan, &record.plan_entries);
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+        true
+    }
+
+    fn record_plan_delta(&mut self, params: &Value) -> bool {
+        if !turn_capture_enabled() || params.get("delta").and_then(Value::as_str).is_none() {
+            return false;
+        }
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(turn_id) = params.get("turnId").and_then(Value::as_str) else {
+            return false;
+        };
+        let item_id = params.get("itemId").and_then(Value::as_str);
+        let delta = params
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.trim().is_empty() {
+            return false;
+        }
+        let record = self.ensure_turn(thread_id, turn_id);
+        ensure_turn_trace_entries(record);
+        append_trace_entry(&mut record.plan_entries, item_id, delta);
+        sync_legacy_trace(&mut record.plan, &record.plan_entries);
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+        true
+    }
+
+    fn record_plan_item(&mut self, thread_id: &str, turn_id: &str, item: &Value) -> bool {
+        if !turn_capture_enabled() {
+            return false;
+        }
+        let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(bounded_turn_text)
+            .filter(|text| !text.is_empty())
+        else {
+            return false;
+        };
+        let item_id = item.get("id").and_then(Value::as_str);
+        let record = self.ensure_turn(thread_id, turn_id);
+        ensure_turn_trace_entries(record);
+        set_trace_entry(&mut record.plan_entries, item_id, &text);
+        sync_legacy_trace(&mut record.plan, &record.plan_entries);
+        record.updated_at = now_secs();
+        self.last_event_at = Some(now_secs());
+        self.trim_turns();
+        true
     }
 
     fn ensure_turn(&mut self, thread_id: &str, turn_id: &str) -> &mut TurnRecord {
@@ -854,7 +1157,11 @@ impl AgentTelemetry {
             else {
                 break;
             };
-            self.turns.remove(&candidate);
+            if let Some(record) = self.turns.remove(&candidate) {
+                let item_prefix = format!("{}:{}:", record.thread_id, record.turn_id);
+                self.agent_message_phases
+                    .retain(|key, _| !key.starts_with(&item_prefix));
+            }
         }
     }
 
@@ -983,22 +1290,30 @@ impl AgentTelemetry {
 
         self.record_minimal_thread(thread_id, None, Some("active"));
         self.record_subagent_item(thread_id, item);
+        self.record_agent_message_phase(thread_id, turn_id, item);
         if item_type == "collabAgentToolCall" {
             self.record_collab_agent_states(thread_id, item);
         }
+        let captures_reasoning = item_type == "reasoning"
+            && !turn_id.is_empty()
+            && self.record_reasoning_item(thread_id, turn_id, item);
+        let captures_plan = item_type == "plan"
+            && !turn_id.is_empty()
+            && self.record_plan_item(thread_id, turn_id, item);
         let captures_turn_text =
             is_user_message_item(item) || (completed && is_assistant_message_item(item));
         if captures_turn_text {
             self.record_turn_message(thread_id, Some(turn_id), item);
         }
+        let captured_output = captures_turn_text || captures_reasoning || captures_plan;
         if !is_tracked_tool_call_type(item_type) {
             self.last_event_at = Some(now_secs());
             self.trim_turns();
-            return captures_turn_text;
+            return captured_output;
         }
 
         let Some(item_id) = item.get("id").and_then(Value::as_str) else {
-            return captures_turn_text;
+            return captured_output;
         };
         let key = format!("{thread_id}:{turn_id}:{item_id}");
         let item_updated_at = if completed {
@@ -1089,7 +1404,7 @@ impl AgentTelemetry {
         }
         self.last_event_at = Some(now_secs());
         self.trim_tool_calls();
-        captures_turn_text
+        captured_output
     }
 
     fn record_subagent_item(&mut self, parent_thread_id: &str, item: &Value) {
@@ -1246,6 +1561,7 @@ impl AgentTelemetry {
                 }
                 true
             }
+            "turn/plan/updated" => self.record_plan_update(params),
             "thread/closed" => {
                 if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
                     self.record_thread_status(thread_id, "notLoaded", Vec::new());
@@ -1254,6 +1570,12 @@ impl AgentTelemetry {
             }
             "item/started" => self.record_item_event(params, false),
             "item/completed" => self.record_item_event(params, true),
+            "item/agentMessage/delta" => self.record_text_delta(params, TraceField::Commentary),
+            "item/plan/delta" => self.record_plan_delta(params),
+            "item/reasoning/summaryTextDelta" => {
+                self.record_text_delta(params, TraceField::ReasoningSummary)
+            }
+            "item/reasoning/textDelta" => self.record_text_delta(params, TraceField::ReasoningRaw),
             "hook/started" => {
                 self.record_hook_event(params, false);
                 false
@@ -1264,6 +1586,75 @@ impl AgentTelemetry {
             }
             _ => false,
         }
+    }
+
+    fn record_text_delta(&mut self, params: &Value, field: TraceField) -> bool {
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(turn_id) = params.get("turnId").and_then(Value::as_str) else {
+            return false;
+        };
+        let item_id = params
+            .get("itemId")
+            .and_then(Value::as_str)
+            .or_else(|| params.get("item_id").and_then(Value::as_str))
+            .or_else(|| {
+                params
+                    .get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(Value::as_str)
+            });
+        if matches!(field, TraceField::Commentary) {
+            let explicit_phase = params.get("phase").and_then(Value::as_str).or_else(|| {
+                params
+                    .get("item")
+                    .and_then(|item| item.get("phase"))
+                    .and_then(Value::as_str)
+            });
+            let mapped_phase = params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("item_id").and_then(Value::as_str))
+                .or_else(|| {
+                    params
+                        .get("item")
+                        .and_then(|item| item.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .and_then(|item_id| {
+                    self.agent_message_phases
+                        .get(&agent_message_key(thread_id, turn_id, item_id))
+                        .map(String::as_str)
+                });
+            if explicit_phase.or(mapped_phase) != Some("commentary") {
+                return false;
+            }
+        }
+        let Some(delta) = params
+            .get("delta")
+            .and_then(Value::as_str)
+            .or_else(|| params.get("text").and_then(Value::as_str))
+        else {
+            return false;
+        };
+        self.record_reasoning_delta(thread_id, turn_id, item_id, field, delta)
+    }
+
+    fn record_agent_message_phase(&mut self, thread_id: &str, turn_id: &str, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+            return;
+        }
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(phase) = item.get("phase").and_then(Value::as_str) else {
+            return;
+        };
+        self.agent_message_phases.insert(
+            agent_message_key(thread_id, turn_id, item_id),
+            phase.to_string(),
+        );
     }
 
     fn trim_threads(&mut self) {
@@ -1354,6 +1745,10 @@ fn turn_key(thread_id: &str, turn_id: &str) -> String {
     format!("{thread_id}:{turn_id}")
 }
 
+fn agent_message_key(thread_id: &str, turn_id: &str, item_id: &str) -> String {
+    format!("{thread_id}:{turn_id}:{item_id}")
+}
+
 fn turn_info(turn: &TurnRecord) -> TurnInfo {
     TurnInfo {
         thread_id: turn.thread_id.clone(),
@@ -1367,12 +1762,29 @@ fn turn_info(turn: &TurnRecord) -> TurnInfo {
         completed_at_ms: turn.completed_at_ms,
         prompt: turn.prompt.clone(),
         result: turn.result.clone(),
+        commentary: turn.commentary.clone(),
+        commentary_entries: turn.commentary_entries.clone(),
+        reasoning_summary: turn.reasoning_summary.clone(),
+        reasoning_summary_entries: turn.reasoning_summary_entries.clone(),
+        reasoning_raw: turn.reasoning_raw.clone(),
+        reasoning_raw_entries: turn.reasoning_raw_entries.clone(),
+        plan: turn.plan.clone(),
+        plan_entries: turn.plan_entries.clone(),
         updated_at: turn.updated_at,
     }
 }
 
 fn turn_record_from_info(info: TurnInfo) -> TurnRecord {
     let key = turn_key(&info.thread_id, &info.turn_id);
+    let commentary_entries =
+        trace_entries_with_legacy(&info.commentary_entries, info.commentary.as_ref());
+    let reasoning_summary_entries = trace_entries_with_legacy(
+        &info.reasoning_summary_entries,
+        info.reasoning_summary.as_ref(),
+    );
+    let reasoning_raw_entries =
+        trace_entries_with_legacy(&info.reasoning_raw_entries, info.reasoning_raw.as_ref());
+    let plan_entries = trace_entries_with_legacy(&info.plan_entries, info.plan.as_ref());
     TurnRecord {
         key,
         thread_id: info.thread_id,
@@ -1382,6 +1794,14 @@ fn turn_record_from_info(info: TurnInfo) -> TurnRecord {
         completed_at_ms: info.completed_at_ms,
         prompt: info.prompt,
         result: info.result,
+        commentary: trace_entries_text(&commentary_entries),
+        commentary_entries,
+        reasoning_summary: trace_entries_text(&reasoning_summary_entries),
+        reasoning_summary_entries,
+        reasoning_raw: trace_entries_text(&reasoning_raw_entries),
+        reasoning_raw_entries,
+        plan: trace_entries_text(&plan_entries),
+        plan_entries,
         updated_at: info.updated_at,
     }
 }
@@ -1422,7 +1842,16 @@ fn collect_message_text(value: &Value, output: &mut Vec<String>, depth: usize) {
                 }
                 return;
             }
-            for key in ["content", "input", "message", "prompt", "items"] {
+            for key in [
+                "content",
+                "input",
+                "message",
+                "prompt",
+                "items",
+                "parts",
+                "summary",
+                "summaryText",
+            ] {
                 if let Some(value) = object.get(key) {
                     collect_message_text(value, output, depth + 1);
                 }
@@ -1479,9 +1908,63 @@ fn app_server_turn_status(params: &Value) -> Option<&str> {
         .or_else(|| status.get("type").and_then(Value::as_str))
 }
 
+fn format_plan_update_text(params: &Value) -> Option<String> {
+    let plan = params.get("plan").and_then(Value::as_array)?;
+    let mut lines = vec!["Updated Plan".to_string()];
+    if let Some(explanation) = params
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("  {explanation}"));
+    }
+    for (index, step) in plan.iter().enumerate() {
+        let Some(text) = step
+            .get("step")
+            .and_then(Value::as_str)
+            .or_else(|| step.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let status = step
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "");
+        let marker = match status.as_str() {
+            "completed" | "complete" | "done" => "☑",
+            "inprogress" | "running" | "active" => "◐",
+            _ => "□",
+        };
+        let branch = if index + 1 == plan.len() {
+            "└"
+        } else {
+            "├"
+        };
+        lines.push(format!("  {branch} {marker} {text}"));
+    }
+    (lines.len() > 1).then(|| bounded_turn_text(&lines.join("\n")))
+}
+
 fn is_user_message_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("userMessage")
         || item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+#[derive(Clone, Copy)]
+enum TraceField {
+    Commentary,
+    ReasoningSummary,
+    ReasoningRaw,
+}
+
+fn is_commentary_message_item(item: &Value) -> bool {
+    is_assistant_message_item(item)
+        && item.get("phase").and_then(Value::as_str) == Some("commentary")
 }
 
 fn is_assistant_message_item(item: &Value) -> bool {
@@ -1489,6 +1972,174 @@ fn is_assistant_message_item(item: &Value) -> bool {
         item.get("type").and_then(Value::as_str),
         Some("agentMessage" | "assistantMessage")
     ) || item.get("role").and_then(Value::as_str) == Some("assistant")
+}
+
+fn trace_entries_with_legacy(entries: &[TraceEntry], legacy: Option<&String>) -> Vec<TraceEntry> {
+    let entries = entries
+        .iter()
+        .filter(|entry| !entry.text.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !entries.is_empty() {
+        return entries;
+    }
+    legacy
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| {
+            vec![TraceEntry {
+                item_id: None,
+                text: bounded_turn_text(text),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn trace_entries_text(entries: &[TraceEntry]) -> Option<String> {
+    let mut text = String::new();
+    for entry in entries {
+        if entry.text.trim().is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&entry.text);
+    }
+    (!text.is_empty()).then(|| bounded_trace_text(&text))
+}
+
+fn sync_legacy_trace(target: &mut Option<String>, entries: &[TraceEntry]) {
+    *target = trace_entries_text(entries);
+}
+
+fn trace_item_id_matches(entry: &TraceEntry, item_id: Option<&str>) -> bool {
+    match (entry.item_id.as_deref(), item_id) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn append_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, delta: &str) {
+    if delta.trim().is_empty() {
+        return;
+    }
+    if let Some(entry) = entries
+        .iter_mut()
+        .rev()
+        .find(|entry| trace_item_id_matches(entry, item_id))
+    {
+        entry.text = bounded_trace_text(&format!("{}{}", entry.text, delta));
+        return;
+    }
+    entries.push(TraceEntry {
+        item_id: item_id
+            .map(str::trim)
+            .filter(|item_id| !item_id.is_empty())
+            .map(ToString::to_string),
+        text: bounded_trace_text(delta),
+    });
+}
+
+fn set_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, text: &str) {
+    let text = bounded_turn_text(text);
+    if text.is_empty() {
+        return;
+    }
+    let normalized_item_id = item_id
+        .map(str::trim)
+        .filter(|item_id| !item_id.is_empty())
+        .map(ToString::to_string);
+    if let Some(entry) = entries.iter_mut().find(|entry| {
+        normalized_item_id.is_some() && entry.item_id.as_deref() == normalized_item_id.as_deref()
+    }) {
+        entry.text = text;
+        return;
+    }
+    if let Some(entry) = entries.iter_mut().rev().find(|entry| {
+        entry.item_id.is_none()
+            && (entry.text == text
+                || entry.text.starts_with(&text)
+                || text.starts_with(entry.text.as_str()))
+    }) {
+        entry.item_id = normalized_item_id;
+        entry.text = text;
+        return;
+    }
+    entries.push(TraceEntry {
+        item_id: normalized_item_id,
+        text,
+    });
+}
+
+fn merge_trace_entries(target: &mut Vec<TraceEntry>, incoming: &[TraceEntry]) {
+    for entry in incoming {
+        if entry.text.trim().is_empty() {
+            continue;
+        }
+        let item_id = entry.item_id.as_deref();
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|existing| item_id.is_some() && existing.item_id.as_deref() == item_id)
+        {
+            if existing.text == entry.text || existing.text.starts_with(&entry.text) {
+                continue;
+            }
+            if entry.text.starts_with(existing.text.as_str()) {
+                existing.text = bounded_turn_text(&entry.text);
+            } else {
+                existing.text = bounded_trace_text(&format!("{}{}", existing.text, entry.text));
+            }
+            continue;
+        }
+        if item_id.is_none()
+            && target.iter().any(|existing| {
+                existing.item_id.is_none()
+                    && (existing.text == entry.text
+                        || existing.text.starts_with(&entry.text)
+                        || entry.text.starts_with(existing.text.as_str()))
+            })
+        {
+            continue;
+        }
+        target.push(TraceEntry {
+            item_id: entry.item_id.clone(),
+            text: bounded_trace_text(&entry.text),
+        });
+    }
+}
+
+fn ensure_turn_trace_entries(record: &mut TurnRecord) {
+    if record.commentary_entries.is_empty() {
+        record.commentary_entries =
+            trace_entries_with_legacy(&record.commentary_entries, record.commentary.as_ref());
+    }
+    if record.reasoning_summary_entries.is_empty() {
+        record.reasoning_summary_entries = trace_entries_with_legacy(
+            &record.reasoning_summary_entries,
+            record.reasoning_summary.as_ref(),
+        );
+    }
+    if record.reasoning_raw_entries.is_empty() {
+        record.reasoning_raw_entries =
+            trace_entries_with_legacy(&record.reasoning_raw_entries, record.reasoning_raw.as_ref());
+    }
+    if record.plan_entries.is_empty() {
+        record.plan_entries = trace_entries_with_legacy(&record.plan_entries, record.plan.as_ref());
+    }
+}
+
+fn bounded_trace_text(value: &str) -> String {
+    if value.len() <= MAX_TURN_TEXT_BYTES {
+        return value.to_string();
+    }
+    let suffix = "\n[truncated]";
+    let max_body = MAX_TURN_TEXT_BYTES.saturating_sub(suffix.len());
+    let mut end = max_body.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], suffix)
 }
 
 fn is_tracked_tool_call_type(item_type: &str) -> bool {
@@ -1700,6 +2351,274 @@ struct RefreshResumeRequest {
     all: bool,
 }
 
+fn active_session_record_from_client(client: &ClientInfo) -> ActiveSessionRecord {
+    ActiveSessionRecord {
+        client_id: client.id.clone(),
+        cwd: client.cwd.clone(),
+        args: client.args.clone(),
+        model: client.model.clone(),
+        service_tier: client.service_tier.clone(),
+        reasoning_effort: client.reasoning_effort.clone(),
+        fast: client.fast,
+        thread_id: client.thread_id.clone(),
+        thread_id_source: client.thread_id_source.clone(),
+        started_at: client.started_at,
+    }
+}
+
+fn active_session_record_matches_client(record: &ActiveSessionRecord, client: &ClientInfo) -> bool {
+    record.client_id == client.id
+        || record
+            .thread_id
+            .as_deref()
+            .zip(client.thread_id.as_deref())
+            .is_some_and(|(left, right)| !left.is_empty() && left == right)
+}
+
+fn remove_active_session_matches_client(
+    active_sessions: &mut BTreeMap<String, ActiveSessionRecord>,
+    client: &ClientInfo,
+) -> bool {
+    let ids = active_sessions
+        .iter()
+        .filter(|(_, record)| active_session_record_matches_client(record, client))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let changed = !ids.is_empty();
+    for id in ids {
+        active_sessions.remove(&id);
+    }
+    changed
+}
+
+fn remove_active_sessions_for_yolo_pid(
+    active_sessions: &mut BTreeMap<String, ActiveSessionRecord>,
+    yolo_pid: u32,
+) -> bool {
+    let prefix = format!("{yolo_pid}-");
+    let ids = active_sessions
+        .keys()
+        .filter(|id| id.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed = !ids.is_empty();
+    for id in ids {
+        active_sessions.remove(&id);
+    }
+    changed
+}
+
+fn upsert_active_session_locked(state: &mut ServerState, client: &ClientInfo) -> bool {
+    if client.status != "running" {
+        return remove_active_session_matches_client(&mut state.active_sessions, client);
+    }
+    let record = active_session_record_from_client(client);
+    let changed = state
+        .active_sessions
+        .get(&client.id)
+        .is_none_or(|current| current != &record);
+    state.active_sessions.insert(client.id.clone(), record);
+    changed
+}
+
+fn reconcile_registered_client_process(state: &mut ServerState, client: &ClientInfo) -> bool {
+    let stale_clients = state
+        .clients
+        .values()
+        .filter(|existing| existing.id != client.id && existing.yolo_pid == client.yolo_pid)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for stale_client in stale_clients {
+        changed |= remove_active_session_matches_client(&mut state.active_sessions, &stale_client);
+    }
+    state
+        .clients
+        .retain(|id, existing| id == &client.id || existing.yolo_pid != client.yolo_pid);
+    changed
+}
+
+fn persist_active_sessions_snapshot(
+    path: &Path,
+    sessions: &BTreeMap<String, ActiveSessionRecord>,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "active sessions path has no parent: {}",
+            path.display()
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create active sessions directory {}: {err}",
+            parent.display()
+        )
+    })?;
+    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+
+    let file = ActiveSessionsFile {
+        version: ACTIVE_SESSIONS_FILE_VERSION,
+        saved_at: now_secs(),
+        sessions: sessions.values().cloned().collect(),
+    };
+    let contents = serde_json::to_vec_pretty(&file)
+        .map_err(|err| format!("encode active sessions {}: {err}", path.display()))?;
+    let temporary =
+        path.with_extension(format!("json.{}.{}.tmp", std::process::id(), now_millis()));
+    let mut file = fs::File::create(&temporary)
+        .map_err(|err| format!("create active sessions {}: {err}", temporary.display()))?;
+    file.write_all(&contents)
+        .map_err(|err| format!("write active sessions {}: {err}", temporary.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync active sessions {}: {err}", temporary.display()))?;
+    drop(file);
+    let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    if let Err(err) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("replace active sessions {}: {err}", path.display()));
+    }
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn persist_active_sessions(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) {
+    let Ok(state) = state.lock() else {
+        return;
+    };
+    if let Err(err) =
+        persist_active_sessions_snapshot(&paths.active_sessions, &state.active_sessions)
+    {
+        eprintln!("yolo: failed to persist active sessions: {err}");
+    }
+}
+
+fn load_active_sessions(path: &Path) -> BTreeMap<String, ActiveSessionRecord> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(file) = serde_json::from_str::<ActiveSessionsFile>(&contents) else {
+        eprintln!(
+            "yolo: ignoring invalid active sessions file {}",
+            path.display()
+        );
+        return BTreeMap::new();
+    };
+    if file.version > ACTIVE_SESSIONS_FILE_VERSION {
+        eprintln!(
+            "yolo: active sessions file {} has unsupported version {}; ignoring",
+            path.display(),
+            file.version
+        );
+        return BTreeMap::new();
+    }
+    file.sessions
+        .into_iter()
+        .filter(|session| !session.client_id.trim().is_empty() && !session.cwd.trim().is_empty())
+        .map(|session| (session.client_id.clone(), session))
+        .collect()
+}
+
+fn load_yolo_default_configuration(path: &Path) -> Option<YoloDefaultConfiguration> {
+    let contents = fs::read_to_string(path).ok()?;
+    let configuration = serde_json::from_str::<YoloDefaultConfiguration>(&contents).ok()?;
+    if configuration.model.trim().is_empty() || configuration.reasoning_effort.trim().is_empty() {
+        return None;
+    }
+    Some(configuration)
+}
+
+fn persist_yolo_default_configuration(
+    path: &Path,
+    configuration: &YoloDefaultConfiguration,
+) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "default configuration path has no parent: {}",
+            path.display()
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create default configuration directory {}: {err}",
+            parent.display()
+        )
+    })?;
+    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    let contents = serde_json::to_vec_pretty(configuration)
+        .map_err(|err| format!("encode default configuration {}: {err}", path.display()))?;
+    let temporary =
+        path.with_extension(format!("json.{}.{}.tmp", std::process::id(), now_millis()));
+    let mut file = fs::File::create(&temporary).map_err(|err| {
+        format!(
+            "create default configuration {}: {err}",
+            temporary.display()
+        )
+    })?;
+    file.write_all(&contents)
+        .map_err(|err| format!("write default configuration {}: {err}", temporary.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("sync default configuration {}: {err}", temporary.display()))?;
+    drop(file);
+    let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    if let Err(err) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "replace default configuration {}: {err}",
+            path.display()
+        ));
+    }
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn set_yolo_default_configuration(
+    state: &Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    configuration: YoloDefaultConfiguration,
+) -> Result<Value, String> {
+    if configuration.model.trim().is_empty() || configuration.reasoning_effort.trim().is_empty() {
+        return Err("default configuration values are required".to_string());
+    }
+    let changed = {
+        let mut state = state
+            .lock()
+            .map_err(|_| "server state lock poisoned".to_string())?;
+        let changed = state.default_configuration.as_ref() != Some(&configuration);
+        state.default_configuration = Some(configuration.clone());
+        changed
+    };
+    persist_yolo_default_configuration(&paths.default_configuration, &configuration)?;
+    if changed {
+        publish_status_event(state, "default-configuration-updated");
+    }
+    Ok(json!({"ok": true, "configuration": configuration}))
+}
+
+fn sync_active_sessions_for_client_ids(
+    state: &Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    client_ids: &[String],
+) {
+    let changed = if let Ok(mut state) = state.lock() {
+        let mut changed = false;
+        for client_id in client_ids {
+            if let Some(client) = state.clients.get(client_id).cloned() {
+                changed |= upsert_active_session_locked(&mut state, &client);
+            }
+        }
+        changed
+    } else {
+        false
+    };
+    if changed {
+        persist_active_sessions(state, paths);
+    }
+}
+
 fn main() {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
 
@@ -1723,6 +2642,12 @@ fn main() {
         Some("status") | Some("clients") => {
             if let Err(err) = print_status() {
                 eprintln!("yolo status: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("saved-sessions") | Some("active-sessions") => {
+            if let Err(err) = print_saved_sessions() {
+                eprintln!("yolo saved-sessions: {err}");
                 std::process::exit(1);
             }
         }
@@ -1819,12 +2744,32 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
 
     let mut telemetry = AgentTelemetry::default();
     load_turn_archive(&paths.turn_archive, &mut telemetry);
+    let active_sessions = load_active_sessions(&paths.active_sessions);
+    if !active_sessions.is_empty() {
+        eprintln!(
+            "yolo: loaded {} saved active sessions from {}",
+            active_sessions.len(),
+            paths.active_sessions.display()
+        );
+    }
+    let default_configuration = load_yolo_default_configuration(&paths.default_configuration);
+    if let Some(configuration) = &default_configuration {
+        eprintln!(
+            "yolo: loaded widget defaults {} / {} / {} from {}",
+            configuration.model,
+            configuration.reasoning_effort,
+            if configuration.fast { "fast" } else { "normal" },
+            paths.default_configuration.display()
+        );
+    }
     let state = Arc::new(Mutex::new(ServerState {
         started_at: now_secs(),
         app_server_pid: None,
         app_server_generation: 0,
         resume_generation: 0,
         clients: BTreeMap::new(),
+        active_sessions,
+        default_configuration,
         slaves: BTreeMap::new(),
         telemetry,
         federation_push_senders: BTreeMap::new(),
@@ -1832,7 +2777,7 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         next_status_event_id: 0,
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
-    scan_existing_yolo_clients(&state);
+    scan_existing_yolo_clients(&state, &paths);
     spawn_initial_app_server_thread_snapshot(Arc::clone(&state), paths.clone());
     spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
     spawn_agent_telemetry_snapshot_monitor(Arc::clone(&state), paths.clone());
@@ -2113,8 +3058,12 @@ fn run_client(args: Vec<OsString>) {
             std::process::exit(2);
         }
     };
-    let resolved_args = with_new_session_defaults(resolved_args);
-    let original_args = resolved_args.clone();
+    let original_args = strip_conflicting_yolo_options(resolved_args.clone());
+    let default_configuration = yolo_default_configuration_from_server();
+    let resolved_args = strip_conflicting_yolo_options(with_yolo_session_defaults(
+        resolved_args,
+        default_configuration.as_ref(),
+    ));
     ensure_codex_project_trusted(&codex_cwd);
     let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
     let string_args = resolved_args
@@ -2227,8 +3176,7 @@ fn run_client(args: Vec<OsString>) {
         .current_dir(&cwd)
         .arg("--remote")
         .arg(&remote)
-        .arg("--search")
-        .arg("--dangerously-bypass-approvals-and-sandbox");
+        .args(yolo_mode_cli_args());
     if resume_target_from_args(&resolved_args).is_some() {
         command.arg("-c").arg("include_environment_context=false");
     }
@@ -2378,12 +3326,14 @@ fn run_native_codex_passthrough(args: Vec<OsString>) -> ! {
     };
     ensure_codex_project_trusted(&codex_cwd);
     repair_resume_session_cwd(&resolved_args, &codex_cwd);
+    let default_configuration = yolo_default_configuration_from_server();
+    let resolved_args = strip_conflicting_yolo_options(with_yolo_session_defaults(
+        resolved_args,
+        default_configuration.as_ref(),
+    ));
     let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
     let mut command = Command::new(native_codex_executable());
-    command
-        .current_dir(&cwd)
-        .arg("--search")
-        .arg("--dangerously-bypass-approvals-and-sandbox");
+    command.current_dir(&cwd).args(yolo_mode_cli_args());
     if resume_target_from_args(&resolved_args).is_some() {
         command.arg("-c").arg("include_environment_context=false");
     }
@@ -3147,12 +4097,169 @@ mod tests {
                 .into_iter()
                 .map(|client| (client.id.clone(), client))
                 .collect(),
+            active_sessions: BTreeMap::new(),
+            default_configuration: None,
             slaves: BTreeMap::new(),
             telemetry: AgentTelemetry::default(),
             federation_push_senders: BTreeMap::new(),
             status_event_senders: BTreeMap::new(),
             next_status_event_id: 0,
         }
+    }
+
+    #[test]
+    fn active_sessions_round_trip_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "yolo-active-sessions-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let record = ActiveSessionRecord {
+            client_id: "client-1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            args: vec!["resume".to_string(), "thread-1".to_string()],
+            model: Some("gpt-5.6-sol".to_string()),
+            service_tier: Some("default".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            fast: false,
+            thread_id: Some("thread-1".to_string()),
+            thread_id_source: "resume_arg".to_string(),
+            started_at: 42,
+        };
+        let mut sessions = BTreeMap::new();
+        sessions.insert(record.client_id.clone(), record.clone());
+
+        persist_active_sessions_snapshot(&path, &sessions).expect("persist sessions");
+        let loaded = load_active_sessions(&path);
+        assert_eq!(loaded.get("client-1"), Some(&record));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(path).expect("remove test sessions file");
+    }
+
+    #[test]
+    fn widget_default_configuration_round_trip_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "yolo-default-configuration-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let configuration = YoloDefaultConfiguration {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "max".to_string(),
+            fast: true,
+        };
+        persist_yolo_default_configuration(&path, &configuration)
+            .expect("persist default configuration");
+        assert_eq!(load_yolo_default_configuration(&path), Some(configuration));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).expect("remove default configuration");
+    }
+
+    #[test]
+    fn active_session_upsert_replaces_old_thread_record() {
+        let client = test_client(
+            "client-2",
+            &["resume", "thread-2"],
+            "/tmp/project",
+            Some("thread-2"),
+        );
+        let mut state = test_state(Vec::new());
+        state.active_sessions.insert(
+            "old-client".to_string(),
+            ActiveSessionRecord {
+                client_id: "old-client".to_string(),
+                cwd: client.cwd.clone(),
+                args: vec!["resume".to_string(), "thread-2".to_string()],
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+                fast: false,
+                thread_id: client.thread_id.clone(),
+                thread_id_source: "resume_arg".to_string(),
+                started_at: 1,
+            },
+        );
+
+        assert!(remove_active_session_matches_client(
+            &mut state.active_sessions,
+            &client
+        ));
+        assert!(upsert_active_session_locked(&mut state, &client));
+        assert!(state.active_sessions.contains_key("client-2"));
+        assert!(!state.active_sessions.contains_key("old-client"));
+    }
+
+    #[test]
+    fn registered_client_reconciles_scan_duplicate_and_saved_record() {
+        let mut stale = test_client(
+            "client-3-scanned",
+            &["resume"],
+            "/tmp/project",
+            Some("thread-3"),
+        );
+        stale.yolo_pid = 303;
+        let mut state = test_state(vec![stale.clone()]);
+        state
+            .active_sessions
+            .insert(stale.id.clone(), active_session_record_from_client(&stale));
+
+        let mut registered = test_client(
+            "client-3",
+            &["resume", "thread-3"],
+            "/tmp/project",
+            Some("thread-3"),
+        );
+        registered.yolo_pid = stale.yolo_pid;
+
+        assert!(reconcile_registered_client_process(&mut state, &registered));
+        assert!(!state.clients.contains_key(&stale.id));
+        assert!(!state.active_sessions.contains_key(&stale.id));
+    }
+
+    #[test]
+    fn scanned_yolo_pid_replaces_stale_saved_records() {
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            "303-older".to_string(),
+            ActiveSessionRecord {
+                client_id: "303-older".to_string(),
+                cwd: "/tmp/project".to_string(),
+                args: vec!["resume".to_string()],
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+                fast: false,
+                thread_id: None,
+                thread_id_source: "unresolved".to_string(),
+                started_at: 1,
+            },
+        );
+        sessions.insert(
+            "404-keep".to_string(),
+            ActiveSessionRecord {
+                client_id: "404-keep".to_string(),
+                cwd: "/tmp/project".to_string(),
+                args: vec![],
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+                fast: false,
+                thread_id: None,
+                thread_id_source: "unresolved".to_string(),
+                started_at: 1,
+            },
+        );
+
+        assert!(remove_active_sessions_for_yolo_pid(&mut sessions, 303));
+        assert!(!sessions.contains_key("303-older"));
+        assert!(sessions.contains_key("404-keep"));
     }
 
     #[test]
@@ -3288,6 +4395,107 @@ mod tests {
             }
         }));
         telemetry.record_app_server_event(&json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "commentary-1",
+                    "phase": "commentary"
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "itemId": "commentary-1",
+                "delta": "I will "
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "itemId": "commentary-1",
+                "delta": "inspect the configuration."
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "commentary-1",
+                    "phase": "commentary",
+                    "text": "I will inspect the configuration."
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "assistant-1",
+                    "phase": "final_answer"
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "itemId": "assistant-1",
+                "delta": "The service was restored and verified."
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "delta": "The configuration appears "
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "delta": "to be the relevant boundary."
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/reasoning/textDelta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "delta": "Inspect config.toml"
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [{"text": "The configuration appears to be the relevant boundary."}],
+                    "content": [{"text": "Inspect config.toml"}]
+                }
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
             "method": "item/completed",
             "params": {
                 "threadId": "root",
@@ -3334,8 +4542,198 @@ mod tests {
             turn.result.as_deref(),
             Some("The service was restored and verified.")
         );
+        assert_eq!(
+            turn.commentary.as_deref(),
+            Some("I will inspect the configuration.")
+        );
+        assert_eq!(turn.commentary_entries.len(), 1);
+        assert_eq!(
+            turn.commentary_entries[0].text,
+            "I will inspect the configuration."
+        );
+        assert_eq!(
+            turn.reasoning_summary.as_deref(),
+            Some("The configuration appears to be the relevant boundary.")
+        );
+        assert_eq!(turn.reasoning_summary_entries.len(), 1);
+        assert_eq!(
+            turn.reasoning_summary_entries[0].text,
+            "The configuration appears to be the relevant boundary."
+        );
+        assert_eq!(turn.reasoning_raw.as_deref(), Some("Inspect config.toml"));
+        assert_eq!(turn.reasoning_raw_entries.len(), 1);
+        assert_eq!(turn.reasoning_raw_entries[0].text, "Inspect config.toml");
         assert_eq!(telemetry.summary().captured_prompt_count, 1);
         assert_eq!(telemetry.summary().captured_report_count, 1);
+        assert_eq!(telemetry.summary().captured_commentary_count, 1);
+        assert_eq!(telemetry.summary().captured_reasoning_summary_count, 1);
+        assert_eq!(telemetry.summary().captured_reasoning_raw_count, 1);
+    }
+
+    #[test]
+    fn telemetry_keeps_multiple_trace_items_without_delta_duplication() {
+        let mut telemetry = AgentTelemetry::default();
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/started",
+            "params": {"threadId": "root", "turnId": "turn-multi"}
+        }));
+        for (item_id, delta, text) in [
+            ("commentary-1", "First progress", "First progress"),
+            ("commentary-2", "Second progress", "Second progress"),
+        ] {
+            telemetry.record_app_server_event(&json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "root",
+                    "turnId": "turn-multi",
+                    "item": {"type": "agentMessage", "id": item_id, "phase": "commentary"}
+                }
+            }));
+            telemetry.record_app_server_event(&json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "root",
+                    "turnId": "turn-multi",
+                    "itemId": item_id,
+                    "delta": delta
+                }
+            }));
+            telemetry.record_app_server_event(&json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "root",
+                    "turnId": "turn-multi",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": item_id,
+                        "phase": "commentary",
+                        "text": text
+                    }
+                }
+            }));
+        }
+        telemetry.record_app_server_event(&json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-multi",
+                "itemId": "reasoning-1",
+                "delta": "Summary "
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-multi",
+                "item": {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [{"text": "Summary complete"}]
+                }
+            }
+        }));
+
+        let turns = telemetry.turns_snapshot(Some("root"), 10).turns;
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.commentary_entries.len(), 2);
+        assert_eq!(
+            turn.commentary_entries[0].item_id.as_deref(),
+            Some("commentary-1")
+        );
+        assert_eq!(turn.commentary_entries[0].text, "First progress");
+        assert_eq!(
+            turn.commentary_entries[1].item_id.as_deref(),
+            Some("commentary-2")
+        );
+        assert_eq!(turn.commentary_entries[1].text, "Second progress");
+        assert_eq!(
+            turn.commentary.as_deref(),
+            Some("First progress\nSecond progress")
+        );
+        assert_eq!(turn.reasoning_summary_entries.len(), 1);
+        assert_eq!(turn.reasoning_summary_entries[0].text, "Summary complete");
+        assert_eq!(turn.reasoning_summary.as_deref(), Some("Summary complete"));
+    }
+
+    #[test]
+    fn telemetry_captures_plan_updates_and_plan_items_as_separate_entries() {
+        let mut telemetry = AgentTelemetry::default();
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/started",
+            "params": {"threadId": "root", "turnId": "turn-plan"}
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-plan",
+                "explanation": null,
+                "plan": [{"step": "Inspect the source", "status": "inProgress"}]
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-plan",
+                "explanation": "The first check is complete.",
+                "plan": [
+                    {"step": "Inspect the source", "status": "completed"},
+                    {"step": "Apply the fix", "status": "pending"}
+                ]
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/plan/delta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-plan",
+                "itemId": "plan-item-1",
+                "delta": "Plan item "
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/plan/delta",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-plan",
+                "itemId": "plan-item-1",
+                "delta": "stream"
+            }
+        }));
+        telemetry.record_app_server_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "root",
+                "turnId": "turn-plan",
+                "item": {"type": "plan", "id": "plan-item-1", "text": "Final plan item"}
+            }
+        }));
+
+        let turns = telemetry.turns_snapshot(Some("root"), 10).turns;
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.plan_entries.len(), 3);
+        assert_eq!(
+            turn.plan_entries[0].item_id.as_deref(),
+            Some("plan-update-1")
+        );
+        assert!(turn.plan_entries[0].text.contains("Updated Plan"));
+        assert!(turn.plan_entries[0].text.contains("◐ Inspect the source"));
+        assert_eq!(
+            turn.plan_entries[1].item_id.as_deref(),
+            Some("plan-update-2")
+        );
+        assert!(
+            turn.plan_entries[1]
+                .text
+                .contains("The first check is complete.")
+        );
+        assert_eq!(turn.plan_entries[2].item_id.as_deref(), Some("plan-item-1"));
+        assert_eq!(turn.plan_entries[2].text, "Final plan item");
+        assert_eq!(telemetry.summary().captured_plan_count, 1);
     }
 
     #[test]
@@ -3402,6 +4800,8 @@ mod tests {
                         "content": [{"type": "text", "text": "What changed?"}]
                     },
                     {"type": "agentMessage", "phase": "commentary", "text": "I will inspect it."},
+                    {"type": "reasoning", "summary": [{"text": "I should inspect the diff."}], "content": [{"text": "Compare the changed files."}]},
+                    {"type": "plan", "id": "plan-1", "text": "Updated Plan\n  └ □ Inspect the diff."},
                     {"type": "agentMessage", "phase": "final_answer", "text": "The change is complete."}
                 ]
             }]
@@ -3411,6 +4811,23 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].prompt.as_deref(), Some("What changed?"));
         assert_eq!(turns[0].result.as_deref(), Some("The change is complete."));
+        assert_eq!(turns[0].commentary.as_deref(), Some("I will inspect it."));
+        assert_eq!(turns[0].commentary_entries.len(), 1);
+        assert_eq!(
+            turns[0].reasoning_summary.as_deref(),
+            Some("I should inspect the diff.")
+        );
+        assert_eq!(
+            turns[0].reasoning_raw.as_deref(),
+            Some("Compare the changed files.")
+        );
+        assert_eq!(turns[0].reasoning_summary_entries.len(), 1);
+        assert_eq!(turns[0].reasoning_raw_entries.len(), 1);
+        assert_eq!(
+            turns[0].plan.as_deref(),
+            Some("Updated Plan\n  └ □ Inspect the diff.")
+        );
+        assert_eq!(turns[0].plan_entries.len(), 1);
         assert_eq!(turns[0].started_at_ms, Some(100_000));
         assert_eq!(turns[0].completed_at_ms, Some(110_000));
     }
@@ -4368,29 +5785,45 @@ mod tests {
     }
 
     #[test]
-    fn new_session_defaults_do_not_inherit_global_codex_mode() {
-        let args = with_new_session_defaults(os_args(&[]));
+    fn yolo_session_defaults_follow_widget_configuration() {
+        let widget_configuration = YoloDefaultConfiguration {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "max".to_string(),
+            fast: true,
+        };
+        let args = with_yolo_session_defaults(os_args(&[]), Some(&widget_configuration));
         let strings = args
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
         let config = parse_codex_launch_config(&strings);
 
-        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(config.service_tier.as_deref(), Some("default"));
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(config.service_tier.as_deref(), Some("priority"));
+
+        let unchanged = with_yolo_session_defaults(os_args(&[]), None);
+        assert!(unchanged.is_empty());
     }
 
     #[test]
-    fn new_session_defaults_preserve_explicit_mode_and_skip_resume() {
-        let explicit = with_new_session_defaults(os_args(&[
-            "-m",
-            "gpt-5.6-sol",
-            "-c",
-            "model_reasoning_effort=low",
-            "-c",
-            "service_tier=priority",
-        ]));
+    fn yolo_session_defaults_preserve_explicit_mode_for_new_and_resume() {
+        let widget_configuration = YoloDefaultConfiguration {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "max".to_string(),
+            fast: true,
+        };
+        let explicit = with_yolo_session_defaults(
+            os_args(&[
+                "-m",
+                "gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=low",
+                "-c",
+                "service_tier=priority",
+            ]),
+            Some(&widget_configuration),
+        );
         let strings = explicit
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
@@ -4401,7 +5834,83 @@ mod tests {
         assert_eq!(config.service_tier.as_deref(), Some("priority"));
 
         let resume = os_args(&["resume", "thread-1"]);
-        assert_eq!(with_new_session_defaults(resume.clone()), resume);
+        let resume = with_yolo_session_defaults(resume, Some(&widget_configuration));
+        let strings = resume
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let config = parse_codex_launch_config(&strings);
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(config.service_tier.as_deref(), Some("priority"));
+
+        let explicit_resume = with_yolo_session_defaults(
+            os_args(&[
+                "-c",
+                "model=custom",
+                "-c",
+                "model_reasoning_effort=high",
+                "-c",
+                "service_tier=priority",
+                "resume",
+                "thread-1",
+            ]),
+            Some(&widget_configuration),
+        );
+        let strings = explicit_resume
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let config = parse_codex_launch_config(&strings);
+        assert_eq!(config.model.as_deref(), Some("custom"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(config.service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn yolo_mode_args_override_conflicting_user_permission_flags() {
+        let args = strip_conflicting_yolo_options(os_args(&[
+            "-s",
+            "read-only",
+            "--ask-for-approval=on-request",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            "approval_policy=on-request",
+            "-c",
+            "sandbox_mode=workspace-write",
+            "-c",
+            "model=gpt-5.5",
+            "resume",
+            "thread-1",
+        ]));
+        assert_eq!(
+            string_args(args),
+            vec!["-c", "model=gpt-5.5", "resume", "thread-1"]
+        );
+
+        let required = string_args(yolo_mode_cli_args());
+        assert!(required.contains(&"--search".to_string()));
+        assert!(required.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(
+            !required
+                .iter()
+                .any(|arg| arg == "-a" || arg == "--ask-for-approval")
+        );
+        assert!(
+            required
+                .windows(2)
+                .any(|pair| pair == ["-s", "danger-full-access"])
+        );
+        assert!(
+            required
+                .windows(2)
+                .any(|pair| pair == ["-c", "approval_policy=\"never\""])
+        );
+        assert!(
+            required
+                .windows(2)
+                .any(|pair| pair == ["-c", "check_for_update_on_startup=false"])
+        );
     }
 }
 
@@ -5380,6 +6889,13 @@ fn print_status() -> Result<(), String> {
     Ok(())
 }
 
+fn print_saved_sessions() -> Result<(), String> {
+    let value = api_get_json("/saved-sessions")?;
+    let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+    println!("{text}");
+    Ok(())
+}
+
 fn print_turns(args: Vec<OsString>) -> Result<(), String> {
     let mut thread_id = None;
     let mut limit = 100usize;
@@ -6208,6 +7724,18 @@ fn execute_slave_command(
                 Err(err) => json!({"ok": false, "error": err}),
             }
         }
+        "set-defaults" | "set-default-configuration" => {
+            let Some(configuration) = command.default_configuration.clone() else {
+                return json!({
+                    "ok": false,
+                    "error": "set-defaults command requires a default_configuration"
+                });
+            };
+            match set_yolo_default_configuration(&state, paths, configuration) {
+                Ok(value) => value,
+                Err(err) => json!({"ok": false, "error": err}),
+            }
+        }
         "configure-clients" | "clients-configure" | "configure" | "set" => {
             let Some(request) = command.configure.clone() else {
                 return json!({
@@ -6615,6 +8143,71 @@ fn handle_api_request(
             let info = server_info(&state, &paths);
             json_response(200, &info)
         }
+        ("GET", "/defaults") | ("GET", "/default-configuration") => {
+            let configuration = state
+                .lock()
+                .ok()
+                .and_then(|state| state.default_configuration.clone());
+            json_response(
+                200,
+                &json!({
+                    "ok": true,
+                    "configuration": configuration,
+                }),
+            )
+        }
+        ("POST", "/defaults") | ("POST", "/default-configuration") => {
+            let configuration = match serde_json::from_str::<YoloDefaultConfiguration>(body) {
+                Ok(configuration)
+                    if !configuration.model.trim().is_empty()
+                        && !configuration.reasoning_effort.trim().is_empty() =>
+                {
+                    configuration
+                }
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        &json!({"ok": false, "error": "default configuration values are required"}),
+                    );
+                }
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            let changed = if let Ok(mut state) = state.lock() {
+                let changed = state.default_configuration.as_ref() != Some(&configuration);
+                state.default_configuration = Some(configuration.clone());
+                changed
+            } else {
+                return json_response(
+                    500,
+                    &json!({"ok": false, "error": "server state lock poisoned"}),
+                );
+            };
+            if let Err(err) =
+                persist_yolo_default_configuration(&paths.default_configuration, &configuration)
+            {
+                return json_response(500, &json!({"ok": false, "error": err}));
+            }
+            if changed {
+                publish_status_event(&state, "default-configuration-updated");
+            }
+            json_response(200, &json!({"ok": true, "configuration": configuration}))
+        }
+        ("GET", "/saved-sessions") | ("GET", "/active-sessions") => {
+            let sessions = state
+                .lock()
+                .map(|state| state.active_sessions.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            json_response(
+                200,
+                &json!({
+                    "ok": true,
+                    "generated_at": now_secs(),
+                    "sessions": sessions,
+                }),
+            )
+        }
         ("GET", "/agents") | ("GET", "/subagents") => {
             let snapshot = state
                 .lock()
@@ -6736,13 +8329,18 @@ fn handle_api_request(
         }
         ("POST", "/clients/register") => match serde_json::from_str::<ClientInfo>(body) {
             Ok(client) => {
-                if let Ok(mut state) = state.lock() {
-                    let client_id = client.id.clone();
-                    let yolo_pid = client.yolo_pid;
-                    state
-                        .clients
-                        .retain(|id, existing| id == &client_id || existing.yolo_pid != yolo_pid);
+                let changed = if let Ok(mut state) = state.lock() {
+                    let mut changed = reconcile_registered_client_process(&mut state, &client);
+                    changed |=
+                        remove_active_session_matches_client(&mut state.active_sessions, &client);
+                    let changed = upsert_active_session_locked(&mut state, &client) || changed;
                     state.clients.insert(client.id.clone(), client);
+                    changed
+                } else {
+                    false
+                };
+                if changed {
+                    persist_active_sessions(&state, &paths);
                 }
                 json_response(200, &json!({"ok": true}))
             }
@@ -6802,8 +8400,14 @@ fn handle_api_request(
         }
         ("POST", "/clients/finish") => match serde_json::from_str::<ClientInfo>(body) {
             Ok(client) => {
-                if let Ok(mut state) = state.lock() {
-                    state.clients.insert(client.id.clone(), client);
+                let changed = if let Ok(mut state) = state.lock() {
+                    state.clients.insert(client.id.clone(), client.clone());
+                    remove_active_session_matches_client(&mut state.active_sessions, &client)
+                } else {
+                    false
+                };
+                if changed {
+                    persist_active_sessions(&state, &paths);
                 }
                 json_response(200, &json!({"ok": true}))
             }
@@ -7012,7 +8616,7 @@ fn run_thread_status_event_listener(
 
     let mut subscribed_thread_ids = BTreeSet::new();
     loop {
-        scan_existing_yolo_clients(state);
+        scan_existing_yolo_clients(state, paths);
         subscribe_running_client_threads(state, &mut client, &mut subscribed_thread_ids)?;
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         match client.read_message_value() {
@@ -7043,6 +8647,18 @@ fn observe_app_server_message(
     if changed && let Ok(state) = state.lock() {
         persist_turn_archive(&paths.turn_archive, &state.telemetry);
     }
+    let client_ids = state
+        .lock()
+        .map(|state| {
+            state
+                .clients
+                .values()
+                .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+                .map(|client| client.id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    sync_active_sessions_for_client_ids(state, paths, &client_ids);
 }
 
 fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>, value: &Value) {
@@ -7170,13 +8786,13 @@ fn is_app_server_read_timeout(err: &str) -> bool {
         || err.contains("Resource temporarily unavailable")
 }
 
-fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
+fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) {
     let Ok(processes) = read_process_table() else {
         return;
     };
     let now = now_secs();
     let current_pid = std::process::id();
-    let mut child_codex_by_parent: BTreeMap<u32, (u32, String)> = BTreeMap::new();
+    let mut child_codex_by_parent: BTreeMap<u32, (u32, String, Option<String>)> = BTreeMap::new();
     let mut live_client_pids: BTreeSet<u32> = BTreeSet::new();
     for process in &processes {
         if process.cmdline.iter().any(|arg| arg.contains("codex"))
@@ -7187,7 +8803,11 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         {
             child_codex_by_parent.insert(
                 process.ppid,
-                (process.pid, remote_from_codex_args(&process.cmdline)),
+                (
+                    process.pid,
+                    remote_from_codex_args(&process.cmdline),
+                    process_thread_id(process).map(ToString::to_string),
+                ),
             );
         }
         if process.pid != current_pid
@@ -7198,15 +8818,26 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         }
     }
 
-    let Ok(mut state) = state.lock() else {
+    let Ok(mut state_guard) = state.lock() else {
         return;
     };
-    for client in state.clients.values_mut() {
+    let mut persisted_sessions_changed = false;
+    let missing_clients = state_guard
+        .clients
+        .values()
+        .filter(|client| client.status == "running" && !live_client_pids.contains(&client.yolo_pid))
+        .cloned()
+        .collect::<Vec<_>>();
+    for client in state_guard.clients.values_mut() {
         if client.status == "running" && !live_client_pids.contains(&client.yolo_pid) {
             client.status = "exited".to_string();
             client.ended_at = Some(now);
             client.updated_at = now;
         }
+    }
+    for client in missing_clients {
+        persisted_sessions_changed |=
+            remove_active_session_matches_client(&mut state_guard.active_sessions, &client);
     }
     for process in processes {
         if process.pid == current_pid || !is_yolo_process(&process) {
@@ -7218,11 +8849,16 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         }
         let remote = child_codex_by_parent
             .get(&process.pid)
-            .map(|(_, remote)| remote.clone())
+            .map(|(_, remote, _)| remote.clone())
             .unwrap_or_default();
+        let yolo_thread_id = thread_id_from_args_strs(&args);
+        let codex_thread_id = child_codex_by_parent
+            .get(&process.pid)
+            .and_then(|(_, _, thread_id)| thread_id.clone());
+        let thread_id = yolo_thread_id.clone().or(codex_thread_id.clone());
         let id = client_id_from_managed_proxy_remote(&remote)
             .unwrap_or_else(|| format!("{}-scanned", process.pid));
-        if state
+        if state_guard
             .clients
             .values()
             .any(|client| client.yolo_pid == process.pid && client.status == "running")
@@ -7232,36 +8868,45 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>) {
         let cfg = read_codex_config();
         let launch_cfg = parse_codex_launch_config(&args);
         let service_tier = launch_cfg.service_tier.clone();
-        state.clients.insert(
-            id.clone(),
-            ClientInfo {
-                id,
-                yolo_pid: process.pid,
-                codex_pid: child_codex_by_parent.get(&process.pid).map(|(pid, _)| *pid),
-                cwd: process.cwd.unwrap_or_else(|| String::from("")),
-                args: args.clone(),
-                remote,
-                model: launch_cfg.model.or(cfg.model),
-                service_tier: service_tier.clone(),
-                reasoning_effort: launch_cfg.reasoning_effort,
-                fast: is_fast_tier(service_tier.as_deref()),
-                thread_id: thread_id_from_args_strs(&args),
-                thread_id_source: if thread_id_from_args_strs(&args).is_some() {
-                    "resume_arg".to_string()
-                } else {
-                    "unresolved".to_string()
-                },
-                started_at: now,
-                updated_at: now,
-                ended_at: None,
-                exit_code: None,
-                status: "running".to_string(),
-                codex_status: None,
-                codex_active_flags: Vec::new(),
-                codex_status_updated_at: None,
-                settings_updated_at: None,
+        let client = ClientInfo {
+            id: id.clone(),
+            yolo_pid: process.pid,
+            codex_pid: child_codex_by_parent
+                .get(&process.pid)
+                .map(|(pid, _, _)| *pid),
+            cwd: process.cwd.unwrap_or_else(|| String::from("")),
+            args: args.clone(),
+            remote,
+            model: launch_cfg.model.or(cfg.model),
+            service_tier: service_tier.clone(),
+            reasoning_effort: launch_cfg.reasoning_effort,
+            fast: is_fast_tier(service_tier.as_deref()),
+            thread_id,
+            thread_id_source: if yolo_thread_id.is_some() || codex_thread_id.is_some() {
+                "resume_arg".to_string()
+            } else {
+                "unresolved".to_string()
             },
-        );
+            started_at: now,
+            updated_at: now,
+            ended_at: None,
+            exit_code: None,
+            status: "running".to_string(),
+            codex_status: None,
+            codex_active_flags: Vec::new(),
+            codex_status_updated_at: None,
+            settings_updated_at: None,
+        };
+        persisted_sessions_changed |=
+            remove_active_sessions_for_yolo_pid(&mut state_guard.active_sessions, process.pid);
+        persisted_sessions_changed |=
+            remove_active_session_matches_client(&mut state_guard.active_sessions, &client);
+        persisted_sessions_changed |= upsert_active_session_locked(&mut state_guard, &client);
+        state_guard.clients.insert(id, client);
+    }
+    drop(state_guard);
+    if persisted_sessions_changed {
+        persist_active_sessions(state, paths);
     }
 }
 
@@ -7902,6 +9547,8 @@ fn configure_clients(
         publish_status_event(&state, "client-settings-pending");
     }
     if clients.is_empty() {
+        let client_ids = selected_ids.iter().cloned().collect::<Vec<_>>();
+        sync_active_sessions_for_client_ids(&state, paths, &client_ids);
         return Ok(json!({
             "ok": true,
             "updated": [],
@@ -7918,6 +9565,8 @@ fn configure_clients(
     for attempt in 0..APP_SERVER_CONFIGURE_MAX_ATTEMPTS {
         match configure_clients_once(&state, paths, &request, &clients) {
             Ok(mut value) => {
+                let client_ids = selected_ids.iter().cloned().collect::<Vec<_>>();
+                sync_active_sessions_for_client_ids(&state, paths, &client_ids);
                 value["pending"] = Value::Array(pending);
                 return Ok(value);
             }
@@ -8249,6 +9898,8 @@ fn server_info(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> ServerI
         api_socket: paths.api_socket.display().to_string(),
         app_server_socket: paths.app_server_socket.display().to_string(),
         clients: state.clients.values().cloned().collect(),
+        saved_sessions: state.active_sessions.values().cloned().collect(),
+        default_configuration: state.default_configuration.clone(),
         slaves: state.slaves.values().cloned().collect(),
         tmux_panes: collect_tmux_panes(),
         telemetry_summary: state.telemetry.summary(),
@@ -8509,17 +10160,41 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
             let mut prompt = None;
             let mut last_assistant = None;
             let mut final_report = None;
+            let mut commentary_entries = Vec::new();
+            let mut reasoning_summary_entries = Vec::new();
+            let mut reasoning_raw_entries = Vec::new();
+            let mut plan_entries = Vec::new();
             if let Some(items) = turn.get("items").and_then(Value::as_array) {
                 for item in items {
-                    let Some(text) = extract_message_text(item) else {
-                        continue;
-                    };
                     if is_user_message_item(item) {
-                        append_turn_text(&mut prompt, &text);
+                        if let Some(text) = extract_message_text(item) {
+                            append_turn_text(&mut prompt, &text);
+                        }
                     } else if is_assistant_message_item(item) {
-                        last_assistant = Some(text.clone());
-                        if item.get("phase").and_then(Value::as_str) == Some("final_answer") {
-                            final_report = Some(text);
+                        if let Some(text) = extract_message_text(item) {
+                            if is_commentary_message_item(item) {
+                                let item_id = item.get("id").and_then(Value::as_str);
+                                set_trace_entry(&mut commentary_entries, item_id, &text);
+                            } else {
+                                last_assistant = Some(text.clone());
+                                if item.get("phase").and_then(Value::as_str) == Some("final_answer")
+                                {
+                                    final_report = Some(text);
+                                }
+                            }
+                        }
+                    } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        let item_id = item.get("id").and_then(Value::as_str);
+                        if let Some(text) = item.get("summary").and_then(extract_message_text) {
+                            set_trace_entry(&mut reasoning_summary_entries, item_id, &text);
+                        }
+                        if let Some(text) = item.get("content").and_then(extract_message_text) {
+                            set_trace_entry(&mut reasoning_raw_entries, item_id, &text);
+                        }
+                    } else if item.get("type").and_then(Value::as_str) == Some("plan") {
+                        let item_id = item.get("id").and_then(Value::as_str);
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            set_trace_entry(&mut plan_entries, item_id, text);
                         }
                     }
                 }
@@ -8547,6 +10222,14 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
                 completed_at_ms,
                 prompt,
                 result: final_report.or(last_assistant),
+                commentary: trace_entries_text(&commentary_entries),
+                commentary_entries,
+                reasoning_summary: trace_entries_text(&reasoning_summary_entries),
+                reasoning_summary_entries,
+                reasoning_raw: trace_entries_text(&reasoning_raw_entries),
+                reasoning_raw_entries,
+                plan: trace_entries_text(&plan_entries),
+                plan_entries,
                 updated_at,
             })
         })
@@ -9540,41 +11223,125 @@ fn parse_codex_launch_config(args: &[String]) -> CodexLaunchConfig {
     config
 }
 
-const DEFAULT_NEW_SESSION_MODEL: &str = "gpt-5.6-sol";
-const DEFAULT_NEW_SESSION_REASONING_EFFORT: &str = "low";
-
-fn with_new_session_defaults(args: Vec<OsString>) -> Vec<OsString> {
-    if resume_target_from_args(&args).is_some() {
-        return args;
+fn yolo_default_configuration_from_server() -> Option<YoloDefaultConfiguration> {
+    let value = api_get_json("/defaults").ok()?;
+    let configuration = value.get("configuration")?.clone();
+    let configuration = serde_json::from_value::<YoloDefaultConfiguration>(configuration).ok()?;
+    if configuration.model.trim().is_empty() || configuration.reasoning_effort.trim().is_empty() {
+        return None;
     }
+    Some(configuration)
+}
+
+fn with_yolo_session_defaults(
+    args: Vec<OsString>,
+    configuration: Option<&YoloDefaultConfiguration>,
+) -> Vec<OsString> {
     let strings = args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
         .collect::<Vec<_>>();
     let config = parse_codex_launch_config(&strings);
     let mut defaults = Vec::new();
+    let Some(configuration) = configuration else {
+        return args;
+    };
     if config.model.is_none() {
         defaults.extend([
             OsString::from("-c"),
-            OsString::from(format!("model=\"{DEFAULT_NEW_SESSION_MODEL}\"")),
+            codex_config_os_arg("model", &configuration.model),
         ]);
     }
     if config.reasoning_effort.is_none() {
         defaults.extend([
             OsString::from("-c"),
-            OsString::from(format!(
-                "model_reasoning_effort=\"{DEFAULT_NEW_SESSION_REASONING_EFFORT}\""
-            )),
+            codex_config_os_arg("model_reasoning_effort", &configuration.reasoning_effort),
         ]);
     }
     if config.service_tier.is_none() {
         defaults.extend([
             OsString::from("-c"),
-            OsString::from("service_tier=\"default\""),
+            codex_config_os_arg(
+                "service_tier",
+                if configuration.fast {
+                    "priority"
+                } else {
+                    "default"
+                },
+            ),
         ]);
     }
     defaults.extend(args);
     defaults
+}
+
+fn yolo_mode_cli_args() -> Vec<OsString> {
+    vec![
+        OsString::from("--search"),
+        OsString::from("--dangerously-bypass-approvals-and-sandbox"),
+        OsString::from("-s"),
+        OsString::from("danger-full-access"),
+        OsString::from("-c"),
+        OsString::from("approval_policy=\"never\""),
+        OsString::from("-c"),
+        OsString::from("sandbox_mode=\"danger-full-access\""),
+        // YOLO clients must stay non-interactive when a newer Codex CLI is
+        // available. Codex updates are managed explicitly by yolo's
+        // `upgrade-resume`/`upgrade-resume-all` flows.
+        OsString::from("-c"),
+        OsString::from("check_for_update_on_startup=false"),
+    ]
+}
+
+fn strip_conflicting_yolo_options(args: Vec<OsString>) -> Vec<OsString> {
+    let mut output = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy();
+        if matches!(
+            text.as_ref(),
+            "-s" | "--sandbox" | "-a" | "--ask-for-approval"
+        ) {
+            let _ = iter.next();
+            continue;
+        }
+        if text.starts_with("--sandbox=") || text.starts_with("--ask-for-approval=") {
+            continue;
+        }
+        if text == "--dangerously-bypass-approvals-and-sandbox" {
+            continue;
+        }
+        if text == "-c" || text == "--config" {
+            let Some(value) = iter.next() else {
+                output.push(arg);
+                continue;
+            };
+            if is_conflicting_yolo_config(&value.to_string_lossy()) {
+                continue;
+            }
+            output.push(arg);
+            output.push(value);
+            continue;
+        }
+        if text
+            .strip_prefix("--config=")
+            .is_some_and(is_conflicting_yolo_config)
+        {
+            continue;
+        }
+        output.push(arg);
+    }
+    output
+}
+
+fn is_conflicting_yolo_config(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    matches!(
+        key.trim(),
+        "approval_policy" | "approval_mode" | "sandbox_mode" | "sandbox_policy"
+    )
 }
 
 fn unquote_config_value(value: &str) -> String {
@@ -9650,6 +11417,23 @@ fn managed_codex_bin() -> PathBuf {
     managed_codex_prefix().join("bin").join("codex")
 }
 
+fn persistent_state_dir() -> PathBuf {
+    env::var_os("YOLO_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_STATE_HOME").map(|dir| PathBuf::from(dir).join(RUNTIME_DIR_NAME))
+        })
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("state")
+                    .join(RUNTIME_DIR_NAME)
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(RUNTIME_DIR_NAME).join("state"))
+}
+
 fn runtime_paths() -> Result<RuntimePaths, String> {
     let base = env::var_os("YOLO_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -9666,6 +11450,8 @@ fn runtime_paths() -> Result<RuntimePaths, String> {
         pid_file: dir.join(PID_FILE_NAME),
         log_file: dir.join("server.log"),
         turn_archive: dir.join(TURN_ARCHIVE_FILE_NAME),
+        active_sessions: persistent_state_dir().join(ACTIVE_SESSIONS_FILE_NAME),
+        default_configuration: persistent_state_dir().join(DEFAULT_CONFIGURATION_FILE_NAME),
         dir,
     })
 }
@@ -9724,6 +11510,7 @@ Usage:
   yolo refresh-permissions --all|--client ID|--thread THREAD_ID|--cwd DIR
   yolo server [--daemon|--foreground] [--federation-listen ADDR]
   yolo status
+  yolo saved-sessions
   yolo turns [--thread THREAD_ID] [--limit N] [--history]
   yolo stop
 
@@ -9756,7 +11543,8 @@ the caller's CODEX_THREAD_ID from the idle wait, then lets the final resume
 generation revive that same session.
 
 API:
-  curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
+curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
+  yolo saved-sessions
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock 'http://yolo/turns?limit=20'
   yolo turns --thread THREAD_ID --limit 20
   yolo turns --history --thread THREAD_ID --limit 20
@@ -9781,6 +11569,7 @@ Environment:
   YOLO_CODEX_PREFIX Managed Codex npm prefix
   YOLO_REMOTE       Override app-server endpoint for the client
   YOLO_RUNTIME_DIR  Runtime dir for sockets (default: $XDG_RUNTIME_DIR/yolo or /tmp/yolo)
+  YOLO_STATE_DIR    Persistent state dir (default: $XDG_STATE_HOME/yolo or ~/.local/state/yolo)
   YOLO_TURN_CAPTURE Enable turn prompt/report capture (default: on; set off to disable)
   YOLO_UPGRADE_IDLE_WAIT_TIMEOUT_SECS
                     Max seconds to wait for working clients before upgrade

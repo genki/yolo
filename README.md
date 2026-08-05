@@ -17,6 +17,31 @@ local HTTP-over-UNIX-socket API. `yolo` / `yolo client` starts Codex as a child
 process with stdio passed through to the terminal, then reports client process
 state, model, service tier, and fast-mode state to the server while it runs.
 
+Every managed client launch, including `yolo resume`, enforces YOLO
+permissions (`approval_policy=never`, `sandbox_mode=danger-full-access`, and
+`--dangerously-bypass-approvals-and-sandbox`) and web search. Conflicting
+approval/sandbox arguments are removed before launch. When model settings are
+omitted, the wrapper uses the defaults saved by the websh yolo widget (including
+its model, reasoning effort, and fast setting). The values are persisted by the
+yolo server so new launches and resumes use the same widget configuration after
+a restart.
+
+YOLO clients also disable Codex's startup update prompt. Codex CLI updates are
+managed explicitly by `yolo upgrade-resume` or `yolo upgrade-resume-all`, so a
+new release cannot switch a managed client into an interactive prompt and
+break a resume.
+
+The server persists active client resume metadata in
+`$XDG_STATE_HOME/yolo/active-sessions.json` (or `~/.local/state/yolo` when
+`XDG_STATE_HOME` is unset). The file is written atomically with mode `0600` and
+contains the thread ID, working directory, resume arguments, and effective
+model settings needed to recreate a client after a reboot. Saved records are
+available through `GET /saved-sessions`, the `saved_sessions` field in
+`/status`, or `yolo saved-sessions`. A record is removed when its client exits;
+the server does not start a headless Codex process automatically, so a saved
+record can be reviewed before running `yolo resume THREAD_ID` in the intended
+tmux pane.
+
 ## Install
 
 ```sh
@@ -86,7 +111,7 @@ The `/clients` response includes:
 - fast flag
 - lifecycle status and timestamps
 - `telemetry_summary` with the known thread, subagent, active tool, running hook,
-  and captured turn counts
+  captured turn counts, and captured commentary/reasoning counts
 
 The app-server event aggregator is also available through:
 
@@ -109,13 +134,19 @@ Hook runs expose lifecycle events such as `preToolUse`, `postToolUse`, and
 `subagentStart`/`subagentStop` when those hooks are configured and trusted in
 Codex.
 
-Turn capture records the prompt submitted at turn start and the latest
-completed assistant message as `report`. The live collector observes both the
+Turn capture records the prompt submitted at turn start, user-visible assistant
+commentary, Codex reasoning summaries/raw reasoning deltas when emitted, and
+the latest completed assistant message as `result` (legacy `report` is still
+accepted when reading old archives). The live collector observes both the
 app-server item lifecycle and the yolo client proxy's `turn/start` request.
+The fields are exposed by `/turns` and `/turns/history` as `commentary`,
+`reasoning_summary`, and `reasoning_raw`. Text is bounded to 16 KiB per field.
+Codex does not expose a guaranteed complete internal chain-of-thought, so
+there is no full chain-of-thought field.
 `/turns` returns the bounded local archive; `/turns/history` reads a requested
 thread from app-server and imports the selected recent turns. The archive is
 stored as mode-0600 `turns.jsonl` in the yolo runtime directory and is capped
-at 512 turns with 16 KiB per prompt/report. Set `YOLO_TURN_CAPTURE=off` to stop
+at 512 turns with 16 KiB per captured text field. Set `YOLO_TURN_CAPTURE=off` to stop
 new capture while retaining the existing local archive for reference.
 
 ## Master/slave federation
@@ -209,6 +240,8 @@ processes.
 - `YOLO_REMOTE`: override app-server endpoint for the client.
 - `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
   `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
+- `YOLO_STATE_DIR`: persistent state directory for active session metadata.
+  Defaults to `$XDG_STATE_HOME/yolo` or `~/.local/state/yolo`.
 - `YOLO_FEDERATION_LISTEN`: default master listen address.
 - `YOLO_MASTER_URL`, `YOLO_SLAVE_ID`: slave connector settings.
 - `YOLO_MASTER_BEARER_TOKEN`: optional Bearer token sent to the master URL.
