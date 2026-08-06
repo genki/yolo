@@ -98,6 +98,8 @@ struct ClientInfo {
     codex_status_updated_at: Option<u64>,
     #[serde(default)]
     settings_updated_at: Option<u64>,
+    #[serde(default)]
+    settings_reconfigure_generation: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -368,6 +370,10 @@ struct AgentTelemetry {
     tool_calls: BTreeMap<String, ToolCallRecord>,
     hook_runs: BTreeMap<String, HookRunRecord>,
     turns: BTreeMap<String, TurnRecord>,
+    /// Monotonic order for trace items across all kinds within a turn.
+    /// This is intentionally process-local; archived entries carry their
+    /// assigned sequence so the ordering survives a server restart.
+    trace_sequence: u64,
     agent_message_phases: BTreeMap<String, String>,
     pending_turn_inputs: BTreeMap<String, VecDeque<PendingTurnInput>>,
     last_event_at: Option<u64>,
@@ -431,6 +437,10 @@ struct TraceEntry {
     item_id: Option<String>,
     #[serde(default)]
     text: String,
+    /// Turn-local capture order. Older archives omit this field and decode as
+    /// zero, which remains supported by the client fallback ordering.
+    #[serde(default)]
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -598,6 +608,15 @@ struct TelemetrySnapshot {
 }
 
 impl AgentTelemetry {
+    fn next_trace_sequence(&mut self) -> u64 {
+        self.trace_sequence = self.trace_sequence.saturating_add(1);
+        self.trace_sequence
+    }
+
+    fn observe_trace_sequence(&mut self, record: &TurnRecord) {
+        self.trace_sequence = self.trace_sequence.max(max_trace_sequence(record));
+    }
+
     fn summary(&self) -> TelemetrySummary {
         TelemetrySummary {
             thread_count: self.threads.len(),
@@ -833,6 +852,7 @@ impl AgentTelemetry {
                 record.plan = trace_entries_text(&record.plan_entries);
                 record.updated_at = record.updated_at.max(existing.updated_at);
             }
+            self.observe_trace_sequence(&record);
             self.turns.insert(record.key.clone(), record);
         }
         self.trim_turns();
@@ -971,13 +991,14 @@ impl AgentTelemetry {
         else {
             return;
         };
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, &turn_id);
         ensure_turn_trace_entries(record);
         if is_user_message_item(item) {
             record.prompt = Some(text.clone());
         } else if is_commentary_message_item(item) {
             let item_id = item.get("id").and_then(Value::as_str);
-            set_trace_entry(&mut record.commentary_entries, item_id, &text);
+            set_trace_entry(&mut record.commentary_entries, item_id, &text, sequence);
             sync_legacy_trace(&mut record.commentary, &record.commentary_entries);
         } else if is_assistant_message_item(item) {
             record.result = Some(text);
@@ -1003,17 +1024,23 @@ impl AgentTelemetry {
         if summary.is_none() && raw.is_none() {
             return false;
         }
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, turn_id);
         ensure_turn_trace_entries(record);
         if let Some(summary) = summary {
-            set_trace_entry(&mut record.reasoning_summary_entries, item_id, &summary);
+            set_trace_entry(
+                &mut record.reasoning_summary_entries,
+                item_id,
+                &summary,
+                sequence,
+            );
             sync_legacy_trace(
                 &mut record.reasoning_summary,
                 &record.reasoning_summary_entries,
             );
         }
         if let Some(raw) = raw {
-            set_trace_entry(&mut record.reasoning_raw_entries, item_id, &raw);
+            set_trace_entry(&mut record.reasoning_raw_entries, item_id, &raw, sequence);
             sync_legacy_trace(&mut record.reasoning_raw, &record.reasoning_raw_entries);
         }
         record.updated_at = now_secs();
@@ -1033,22 +1060,28 @@ impl AgentTelemetry {
         if !turn_capture_enabled() || delta.trim().is_empty() {
             return false;
         }
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, turn_id);
         ensure_turn_trace_entries(record);
         match field {
             TraceField::Commentary => {
-                append_trace_entry(&mut record.commentary_entries, item_id, delta);
+                append_trace_entry(&mut record.commentary_entries, item_id, delta, sequence);
                 sync_legacy_trace(&mut record.commentary, &record.commentary_entries);
             }
             TraceField::ReasoningSummary => {
-                append_trace_entry(&mut record.reasoning_summary_entries, item_id, delta);
+                append_trace_entry(
+                    &mut record.reasoning_summary_entries,
+                    item_id,
+                    delta,
+                    sequence,
+                );
                 sync_legacy_trace(
                     &mut record.reasoning_summary,
                     &record.reasoning_summary_entries,
                 );
             }
             TraceField::ReasoningRaw => {
-                append_trace_entry(&mut record.reasoning_raw_entries, item_id, delta);
+                append_trace_entry(&mut record.reasoning_raw_entries, item_id, delta, sequence);
                 sync_legacy_trace(&mut record.reasoning_raw, &record.reasoning_raw_entries);
             }
         }
@@ -1071,10 +1104,11 @@ impl AgentTelemetry {
         let Some(text) = format_plan_update_text(params) else {
             return false;
         };
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, turn_id);
         ensure_turn_trace_entries(record);
         let item_id = format!("plan-update-{}", record.plan_entries.len() + 1);
-        append_trace_entry(&mut record.plan_entries, Some(&item_id), &text);
+        append_trace_entry(&mut record.plan_entries, Some(&item_id), &text, sequence);
         sync_legacy_trace(&mut record.plan, &record.plan_entries);
         record.updated_at = now_secs();
         self.last_event_at = Some(now_secs());
@@ -1100,9 +1134,10 @@ impl AgentTelemetry {
         if delta.trim().is_empty() {
             return false;
         }
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, turn_id);
         ensure_turn_trace_entries(record);
-        append_trace_entry(&mut record.plan_entries, item_id, delta);
+        append_trace_entry(&mut record.plan_entries, item_id, delta, sequence);
         sync_legacy_trace(&mut record.plan, &record.plan_entries);
         record.updated_at = now_secs();
         self.last_event_at = Some(now_secs());
@@ -1123,9 +1158,10 @@ impl AgentTelemetry {
             return false;
         };
         let item_id = item.get("id").and_then(Value::as_str);
+        let sequence = self.next_trace_sequence();
         let record = self.ensure_turn(thread_id, turn_id);
         ensure_turn_trace_entries(record);
-        set_trace_entry(&mut record.plan_entries, item_id, &text);
+        set_trace_entry(&mut record.plan_entries, item_id, &text, sequence);
         sync_legacy_trace(&mut record.plan, &record.plan_entries);
         record.updated_at = now_secs();
         self.last_event_at = Some(now_secs());
@@ -1989,6 +2025,7 @@ fn trace_entries_with_legacy(entries: &[TraceEntry], legacy: Option<&String>) ->
             vec![TraceEntry {
                 item_id: None,
                 text: bounded_turn_text(text),
+                sequence: 0,
             }]
         })
         .unwrap_or_default()
@@ -2020,7 +2057,12 @@ fn trace_item_id_matches(entry: &TraceEntry, item_id: Option<&str>) -> bool {
     }
 }
 
-fn append_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, delta: &str) {
+fn append_trace_entry(
+    entries: &mut Vec<TraceEntry>,
+    item_id: Option<&str>,
+    delta: &str,
+    sequence: u64,
+) {
     if delta.trim().is_empty() {
         return;
     }
@@ -2038,10 +2080,16 @@ fn append_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, delt
             .filter(|item_id| !item_id.is_empty())
             .map(ToString::to_string),
         text: bounded_trace_text(delta),
+        sequence,
     });
 }
 
-fn set_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, text: &str) {
+fn set_trace_entry(
+    entries: &mut Vec<TraceEntry>,
+    item_id: Option<&str>,
+    text: &str,
+    sequence: u64,
+) {
     let text = bounded_turn_text(text);
     if text.is_empty() {
         return;
@@ -2069,6 +2117,7 @@ fn set_trace_entry(entries: &mut Vec<TraceEntry>, item_id: Option<&str>, text: &
     entries.push(TraceEntry {
         item_id: normalized_item_id,
         text,
+        sequence,
     });
 }
 
@@ -2105,8 +2154,21 @@ fn merge_trace_entries(target: &mut Vec<TraceEntry>, incoming: &[TraceEntry]) {
         target.push(TraceEntry {
             item_id: entry.item_id.clone(),
             text: bounded_trace_text(&entry.text),
+            sequence: entry.sequence,
         });
     }
+}
+
+fn max_trace_sequence(record: &TurnRecord) -> u64 {
+    record
+        .commentary_entries
+        .iter()
+        .chain(record.reasoning_summary_entries.iter())
+        .chain(record.reasoning_raw_entries.iter())
+        .chain(record.plan_entries.iter())
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0)
 }
 
 fn ensure_turn_trace_entries(record: &mut TurnRecord) {
@@ -2260,6 +2322,7 @@ fn json_enum_string(value: &Value) -> Option<String> {
 
 enum ClientEvent {
     RestartRequested,
+    SettingsReconfigureRequested,
     ThreadBound(String),
     PendingSettingsApplied(PendingClientSettings),
     TurnInput {
@@ -3119,18 +3182,24 @@ fn run_client(args: Vec<OsString>) {
         codex_active_flags: Vec::new(),
         codex_status_updated_at: None,
         settings_updated_at: None,
+        settings_reconfigure_generation: 0,
     };
 
     let heartbeat_id = client_id.clone();
     let (event_tx, event_rx) = mpsc::channel::<ClientEvent>();
-    let client_proxy =
-        match spawn_client_thread_proxy(&paths, &client_id, &upstream_remote, event_tx.clone()) {
-            Ok(proxy) => Some(proxy),
-            Err(err) => {
-                eprintln!("yolo: thread binding proxy unavailable: {err}");
-                None
-            }
-        };
+    let client_proxy = match spawn_client_thread_proxy(
+        &paths,
+        &client_id,
+        &upstream_remote,
+        event_tx.clone(),
+        resume_thread_id.as_deref(),
+    ) {
+        Ok(proxy) => Some(proxy),
+        Err(err) => {
+            eprintln!("yolo: thread binding proxy unavailable: {err}");
+            None
+        }
+    };
     let remote = client_proxy
         .as_ref()
         .map(|proxy| proxy.remote.clone())
@@ -3142,6 +3211,7 @@ fn run_client(args: Vec<OsString>) {
     let heartbeat_event_tx = event_tx.clone();
     let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
+    let heartbeat_seen_settings_reconfigure_generation = Arc::new(AtomicU64::new(0));
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(2));
@@ -3152,6 +3222,23 @@ fn run_client(args: Vec<OsString>) {
             });
             match api_post_json("/clients/heartbeat", &body) {
                 Ok(value) => {
+                    if let Some(generation) = value
+                        .get("settings_reconfigure_generation")
+                        .and_then(Value::as_u64)
+                    {
+                        let seen =
+                            heartbeat_seen_settings_reconfigure_generation.load(Ordering::SeqCst);
+                        if generation > seen {
+                            heartbeat_seen_settings_reconfigure_generation
+                                .store(generation, Ordering::SeqCst);
+                            if heartbeat_event_tx
+                                .send(ClientEvent::SettingsReconfigureRequested)
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     if let Some(generation) = restart_generation_from_status(&value) {
                         let seen = heartbeat_seen_generation.load(Ordering::SeqCst);
                         if generation > seen {
@@ -3222,6 +3309,14 @@ fn run_client(args: Vec<OsString>) {
     let mut pending_settings_applied = None;
     loop {
         match event_rx.recv() {
+            Ok(ClientEvent::SettingsReconfigureRequested) => {
+                if let Some(proxy) = client_proxy.as_ref() {
+                    let _ = remove_socket_if_present(&proxy.socket_path);
+                    let _ = fs::remove_file(&proxy.pending_settings_path);
+                }
+                terminate_pid_tree(child_pid, Duration::from_secs(5));
+                reexec_client_for_settings(&original_args, &client_id);
+            }
             Ok(ClientEvent::RestartRequested) => {
                 if let Some(proxy) = client_proxy.as_ref() {
                     let _ = remove_socket_if_present(&proxy.socket_path);
@@ -4084,6 +4179,7 @@ mod tests {
             codex_active_flags: Vec::new(),
             codex_status_updated_at: thread_id.map(|_| 1),
             settings_updated_at: None,
+            settings_reconfigure_generation: 0,
         }
     }
 
@@ -4648,12 +4744,20 @@ mod tests {
             Some("commentary-2")
         );
         assert_eq!(turn.commentary_entries[1].text, "Second progress");
+        assert!(
+            turn.commentary_entries[0].sequence < turn.commentary_entries[1].sequence,
+            "commentary entries should retain their capture order"
+        );
         assert_eq!(
             turn.commentary.as_deref(),
             Some("First progress\nSecond progress")
         );
         assert_eq!(turn.reasoning_summary_entries.len(), 1);
         assert_eq!(turn.reasoning_summary_entries[0].text, "Summary complete");
+        assert!(
+            turn.commentary_entries[1].sequence < turn.reasoning_summary_entries[0].sequence,
+            "trace sequence should span commentary and reasoning kinds"
+        );
         assert_eq!(turn.reasoning_summary.as_deref(), Some("Summary complete"));
     }
 
@@ -5534,6 +5638,30 @@ mod tests {
     }
 
     #[test]
+    fn websocket_thread_started_notification_does_not_replace_resume_target() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            current_thread_id: Some("thread-resumed".to_string()),
+            event_tx,
+        }));
+
+        observe_app_server_response(
+            &tracker,
+            &json!({
+                "method": "thread/started",
+                "params": { "thread": { "id": "thread-other" } }
+            }),
+        );
+
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(
+            tracker.lock().unwrap().current_thread_id.as_deref(),
+            Some("thread-resumed")
+        );
+    }
+
+    #[test]
     fn websocket_string_request_id_binds_thread_start_response() {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
@@ -5618,6 +5746,59 @@ mod tests {
                 .values()
                 .all(|client| client.thread_id.is_none())
         );
+    }
+
+    #[test]
+    fn recent_thread_inventory_binds_bare_client_by_launch_time() {
+        let mut client = test_client("1968389-1785961698573", &[], "/home/vagrant/head", None);
+        client.remote =
+            "unix:///run/user/1000/yolo/client-proxies/1968389-1785961698573.sock".to_string();
+        let mut state = test_state(vec![client]);
+        state.telemetry.record_thread_value(&json!({
+            "id": "thread-created",
+            "cwd": "/home/vagrant/head",
+            "createdAt": 1785961709,
+            "updatedAt": 1785961709,
+            "status": { "type": "idle" }
+        }));
+        let state = Arc::new(Mutex::new(state));
+
+        let bound = bind_unresolved_clients_to_recent_threads(&state);
+
+        assert_eq!(bound, vec!["1968389-1785961698573"]);
+        assert_eq!(
+            state.lock().unwrap().clients["1968389-1785961698573"]
+                .thread_id
+                .as_deref(),
+            Some("thread-created")
+        );
+    }
+
+    #[test]
+    fn settings_reexec_overrides_explicit_bare_client_configuration() {
+        let settings = ClientResumeSettings {
+            model: Some("gpt-5.6-luna".to_string()),
+            service_tier: Some("priority".to_string()),
+            reasoning_effort: Some("max".to_string()),
+            ..ClientResumeSettings::default()
+        };
+        let args = override_client_settings_args(
+            os_args(&[
+                "-c",
+                "model=\"gpt-5.6-sol\"",
+                "-c",
+                "model_reasoning_effort=\"low\"",
+                "-c",
+                "service_tier=\"default\"",
+                "--search",
+            ]),
+            &settings,
+        );
+        let parsed = parse_codex_launch_config(&string_args(args));
+
+        assert_eq!(parsed.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(parsed.service_tier.as_deref(), Some("priority"));
+        assert_eq!(parsed.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
@@ -6652,6 +6833,99 @@ fn reexec_client_for_resume(original_args: &[OsString], client_id: &str) -> ! {
     }
     eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
     std::process::exit(127);
+}
+
+fn reexec_client_for_settings(original_args: &[OsString], client_id: &str) -> ! {
+    let settings = current_client_resume_settings(client_id);
+    let args = if let Some(thread_id) = settings.thread_id.as_deref() {
+        resume_args_for(original_args, Some(thread_id))
+    } else {
+        original_args.to_vec()
+    };
+    let args = override_client_settings_args(args, &settings);
+    eprintln!(
+        "yolo: re-executing bare client after settings update with args: {}",
+        args.iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut errors = Vec::new();
+    for exe in yolo_reexec_candidates() {
+        let err = Command::new(&exe).args(&args).exec();
+        errors.push(format!("{}: {err}", exe.display()));
+    }
+    eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
+    std::process::exit(127);
+}
+
+fn override_client_settings_args(
+    args: Vec<OsString>,
+    settings: &ClientResumeSettings,
+) -> Vec<OsString> {
+    let args = strip_client_setting_args(args);
+    let mut config_args = Vec::new();
+    if let Some(model) = settings.model.as_deref().filter(|value| !value.is_empty()) {
+        config_args.push(codex_config_os_arg("model", model));
+    }
+    if let Some(service_tier) = settings
+        .service_tier
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        config_args.push(codex_config_os_arg("service_tier", service_tier));
+    }
+    if let Some(effort) = settings
+        .reasoning_effort
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        config_args.push(codex_config_os_arg("model_reasoning_effort", effort));
+    }
+    prepend_codex_config_args(args, config_args)
+}
+
+fn strip_client_setting_args(args: Vec<OsString>) -> Vec<OsString> {
+    let mut output = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy();
+        if matches!(text.as_ref(), "--model" | "-m") {
+            let _ = iter.next();
+            continue;
+        }
+        if text == "--config" || text == "-c" {
+            let Some(value) = iter.next() else {
+                output.push(arg);
+                continue;
+            };
+            if is_client_setting_config(&value.to_string_lossy()) {
+                continue;
+            }
+            output.push(arg);
+            output.push(value);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--model=")
+            && !value.is_empty()
+        {
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--config=")
+            && is_client_setting_config(value)
+        {
+            continue;
+        }
+        output.push(arg);
+    }
+    output
+}
+
+fn is_client_setting_config(value: &str) -> bool {
+    matches!(
+        value.split_once('=').map(|(key, _)| key.trim()),
+        Some("model" | "service_tier" | "model_reasoning_effort")
+    )
 }
 
 fn preserve_resume_settings_args(
@@ -8352,12 +8626,15 @@ fn handle_api_request(
                 Ok(value) => {
                     let mut resume_generation = 0;
                     let mut app_server_generation = 0;
+                    let mut settings_reconfigure_generation = 0;
                     if let Some(id) = value.get("id").and_then(Value::as_str)
                         && let Ok(mut state) = state.lock()
                     {
                         resume_generation = state.resume_generation;
                         app_server_generation = state.app_server_generation;
                         if let Some(client) = state.clients.get_mut(id) {
+                            settings_reconfigure_generation =
+                                client.settings_reconfigure_generation;
                             client.updated_at = value
                                 .get("updated_at")
                                 .and_then(Value::as_u64)
@@ -8391,7 +8668,8 @@ fn handle_api_request(
                         &json!({
                             "ok": true,
                             "app_server_generation": app_server_generation,
-                            "resume_generation": resume_generation
+                            "resume_generation": resume_generation,
+                            "settings_reconfigure_generation": settings_reconfigure_generation
                         }),
                     )
                 }
@@ -8644,6 +8922,8 @@ fn observe_app_server_message(
     } else {
         false
     };
+    bind_unresolved_clients_to_recent_threads(state);
+    apply_pending_client_settings_for_bound_clients(state, paths);
     if changed && let Ok(state) = state.lock() {
         persist_turn_archive(&paths.turn_archive, &state.telemetry);
     }
@@ -8682,6 +8962,10 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
     else {
         return;
     };
+    let thread_created_at = thread
+        .get("createdAt")
+        .or_else(|| thread.get("created_at"))
+        .and_then(Value::as_u64);
     let Ok(mut state) = state.lock() else {
         return;
     };
@@ -8698,13 +8982,35 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
         // Only clients launched through a managed app-server proxy are safe
         // to associate from a contemporaneous thread/started notification.
         .filter(|client| client_uses_managed_proxy(client) && client.cwd == cwd)
-        .map(|client| client.id.clone())
+        .map(|client| (client.id.clone(), managed_client_start_secs(client)))
         .collect::<Vec<_>>();
-    if candidates.len() != 1 {
-        return;
-    }
-    let client_id = &candidates[0];
-    let Some(client) = state.clients.get_mut(client_id) else {
+    let client_id = if candidates.len() == 1 {
+        candidates[0].0.clone()
+    } else {
+        let Some(thread_created_at) = thread_created_at else {
+            return;
+        };
+        let mut ranked = candidates
+            .into_iter()
+            .filter_map(|(client_id, started_at)| {
+                let started_at = started_at?;
+                let distance = started_at.abs_diff(thread_created_at);
+                (distance <= 120).then_some((distance, client_id))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| left.cmp(right));
+        let Some((distance, client_id)) = ranked.first().cloned() else {
+            return;
+        };
+        if ranked
+            .get(1)
+            .is_some_and(|(other_distance, _)| *other_distance == distance)
+        {
+            return;
+        }
+        client_id
+    };
+    let Some(client) = state.clients.get_mut(&client_id) else {
         return;
     };
     client.thread_id = Some(thread_id.to_string());
@@ -8726,6 +9032,150 @@ fn client_uses_managed_proxy(client: &ClientInfo) -> bool {
     read_proc_cmdline(PathBuf::from(format!("/proc/{codex_pid}/cmdline")))
         .iter()
         .any(|arg| arg.contains("/yolo/client-proxies/") || arg.contains("/yolo/client-proxies"))
+}
+
+fn managed_client_start_secs(client: &ClientInfo) -> Option<u64> {
+    let (_, millis) = client.id.rsplit_once('-')?;
+    let millis = millis.parse::<u64>().ok()?;
+    (millis >= 1_000_000_000_000).then_some(millis / 1000)
+}
+
+fn bind_unresolved_clients_to_recent_threads(state: &Arc<Mutex<ServerState>>) -> Vec<String> {
+    let Ok(mut state) = state.lock() else {
+        return Vec::new();
+    };
+    let clients = state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| !client_thread_id_is_authoritative(client))
+        .filter(|client| client_uses_managed_proxy(client))
+        .filter_map(|client| {
+            Some((
+                client.id.clone(),
+                client.cwd.clone(),
+                managed_client_start_secs(client)?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let threads = state
+        .telemetry
+        .threads
+        .values()
+        .filter(|thread| thread.parent_thread_id.is_none())
+        .filter_map(|thread| {
+            Some((
+                thread.thread_id.clone(),
+                thread.cwd.clone()?,
+                thread.created_at?,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let mut pairs = clients
+        .iter()
+        .flat_map(|(client_id, client_cwd, client_started_at)| {
+            threads
+                .iter()
+                .filter_map(move |(thread_id, thread_cwd, thread_created_at)| {
+                    if client_cwd != thread_cwd {
+                        return None;
+                    }
+                    let distance = client_started_at.abs_diff(*thread_created_at);
+                    (distance <= 120).then_some((distance, client_id.clone(), thread_id.clone()))
+                })
+        })
+        .collect::<Vec<_>>();
+    pairs.sort();
+
+    let mut assigned_clients = BTreeSet::new();
+    let mut assigned_threads = BTreeSet::new();
+    let mut bound = Vec::new();
+    for (_, client_id, thread_id) in pairs {
+        if !assigned_clients.insert(client_id.clone())
+            || !assigned_threads.insert(thread_id.clone())
+        {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&client_id) else {
+            continue;
+        };
+        if client_thread_id_is_authoritative(client) {
+            continue;
+        }
+        client.thread_id = Some(thread_id.clone());
+        client.thread_id_source = "app_server_started".to_string();
+        client.updated_at = now_secs();
+        eprintln!(
+            "yolo server: bound managed client {} to recent thread {} by launch time",
+            client.id, thread_id
+        );
+        bound.push(client_id);
+    }
+    bound
+}
+
+fn apply_pending_client_settings_for_bound_clients(
+    state: &Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+) {
+    let client_ids = state
+        .lock()
+        .map(|state| {
+            state
+                .clients
+                .values()
+                .filter(|client| {
+                    matches!(client.status.as_str(), "running" | "restarting")
+                        && client
+                            .thread_id
+                            .as_deref()
+                            .is_some_and(|thread_id| !thread_id.trim().is_empty())
+                })
+                .filter_map(|client| {
+                    let path = pending_client_settings_path(paths, &client.id).ok()?;
+                    path.exists().then_some(client.id.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for client_id in client_ids {
+        let Ok(path) = pending_client_settings_path(paths, &client_id) else {
+            continue;
+        };
+        let Ok(contents) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(settings) = serde_json::from_slice::<PendingClientSettings>(&contents) else {
+            continue;
+        };
+        let request = ConfigureClientsRequest {
+            client_id: Some(client_id.clone()),
+            model: settings.model.clone(),
+            fast: settings.fast,
+            reasoning_effort: settings.reasoning_effort.clone(),
+            timeout_secs: Some(10),
+            ..ConfigureClientsRequest::default()
+        };
+        match configure_clients(Arc::clone(state), paths, request) {
+            Ok(value)
+                if value
+                    .get("updated")
+                    .and_then(Value::as_array)
+                    .is_some_and(|updated| !updated.is_empty()) =>
+            {
+                let _ = fs::remove_file(path);
+                eprintln!(
+                    "yolo server: applied pending settings immediately after binding client {client_id}"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("yolo server: pending settings apply failed for {client_id}: {err}")
+            }
+        }
+    }
 }
 
 fn subscribe_running_client_threads(
@@ -8896,6 +9346,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
             codex_active_flags: Vec::new(),
             codex_status_updated_at: None,
             settings_updated_at: None,
+            settings_reconfigure_generation: 0,
         };
         persisted_sessions_changed |=
             remove_active_sessions_for_yolo_pid(&mut state_guard.active_sessions, process.pid);
@@ -8956,6 +9407,8 @@ fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths:
                             state.telemetry.record_thread_value(&thread);
                         }
                     }
+                    bind_unresolved_clients_to_recent_threads(&state);
+                    apply_pending_client_settings_for_bound_clients(&state, &paths);
                 }
                 Err(err) => eprintln!("yolo server: agent telemetry inventory failed: {err}"),
             }
@@ -9537,6 +9990,7 @@ fn configure_clients(
             request.fast,
             request.reasoning_effort.clone(),
         );
+        request_client_reconfigure(&state, &client_id);
         pending.push(json!({
             "client_id": client_id,
             "thread_id": Value::Null,
@@ -9686,6 +10140,18 @@ fn note_client_settings_update(
     }
     client.settings_updated_at = Some(now);
     client.updated_at = now;
+}
+
+fn request_client_reconfigure(state: &Arc<Mutex<ServerState>>, client_id: &str) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let Some(client) = state.clients.get_mut(client_id) else {
+        return;
+    };
+    client.settings_reconfigure_generation =
+        client.settings_reconfigure_generation.saturating_add(1);
+    client.updated_at = now_secs();
 }
 
 fn note_client_permissions_update(state: &Arc<Mutex<ServerState>>, client_id: &str) {
@@ -10165,7 +10631,12 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
             let mut reasoning_raw_entries = Vec::new();
             let mut plan_entries = Vec::new();
             if let Some(items) = turn.get("items").and_then(Value::as_array) {
-                for item in items {
+                for (item_index, item) in items.iter().enumerate() {
+                    // Thread history preserves the original item order, so
+                    // use it as the sequence when rebuilding a turn from the
+                    // app-server. Multiple fields on one reasoning item share
+                    // the same sequence and remain adjacent in the UI.
+                    let sequence = (item_index as u64).saturating_add(1);
                     if is_user_message_item(item) {
                         if let Some(text) = extract_message_text(item) {
                             append_turn_text(&mut prompt, &text);
@@ -10174,7 +10645,7 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
                         if let Some(text) = extract_message_text(item) {
                             if is_commentary_message_item(item) {
                                 let item_id = item.get("id").and_then(Value::as_str);
-                                set_trace_entry(&mut commentary_entries, item_id, &text);
+                                set_trace_entry(&mut commentary_entries, item_id, &text, sequence);
                             } else {
                                 last_assistant = Some(text.clone());
                                 if item.get("phase").and_then(Value::as_str) == Some("final_answer")
@@ -10186,15 +10657,20 @@ fn parse_thread_history(thread: &Value, limit: usize) -> Vec<TurnInfo> {
                     } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                         let item_id = item.get("id").and_then(Value::as_str);
                         if let Some(text) = item.get("summary").and_then(extract_message_text) {
-                            set_trace_entry(&mut reasoning_summary_entries, item_id, &text);
+                            set_trace_entry(
+                                &mut reasoning_summary_entries,
+                                item_id,
+                                &text,
+                                sequence,
+                            );
                         }
                         if let Some(text) = item.get("content").and_then(extract_message_text) {
-                            set_trace_entry(&mut reasoning_raw_entries, item_id, &text);
+                            set_trace_entry(&mut reasoning_raw_entries, item_id, &text, sequence);
                         }
                     } else if item.get("type").and_then(Value::as_str) == Some("plan") {
                         let item_id = item.get("id").and_then(Value::as_str);
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            set_trace_entry(&mut plan_entries, item_id, text);
+                            set_trace_entry(&mut plan_entries, item_id, text, sequence);
                         }
                     }
                 }
@@ -10479,6 +10955,7 @@ fn spawn_client_thread_proxy(
     client_id: &str,
     upstream_remote: &str,
     event_tx: mpsc::Sender<ClientEvent>,
+    initial_thread_id: Option<&str>,
 ) -> Result<ClientThreadProxy, String> {
     let upstream_socket = upstream_remote
         .strip_prefix("unix://")
@@ -10502,6 +10979,9 @@ fn spawn_client_thread_proxy(
     let socket_path = proxy_dir.join(format!("{client_id}.sock"));
     let pending_settings_path = pending_client_settings_path(paths, client_id)?;
     let relay_pending_settings_path = pending_settings_path.clone();
+    let initial_thread_id = initial_thread_id
+        .filter(|thread_id| !thread_id.trim().is_empty())
+        .map(ToString::to_string);
     remove_socket_if_present(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("bind client proxy {}: {err}", socket_path.display()))?;
@@ -10531,7 +11011,11 @@ fn spawn_client_thread_proxy(
 
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
-            current_thread_id: None,
+            // A resume argument is authoritative from the moment the proxy
+            // connects. The app-server may broadcast thread/started for other
+            // loaded threads on this socket; those notifications must not
+            // rebind this client away from its requested resume target.
+            current_thread_id: initial_thread_id,
             event_tx,
         }));
         let Ok(mut client_read) = client_stream.try_clone() else {
@@ -10676,7 +11160,10 @@ fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value
             .and_then(|thread| thread.get("id"))
             .and_then(Value::as_str)
         {
-            note_tracked_thread_id(tracker, thread_id);
+            // thread/started is a server notification and may describe a
+            // different loaded thread. Only use it to bind a client that has
+            // not received an authoritative thread ID from its own request.
+            note_unbound_thread_id(tracker, thread_id);
         }
         return;
     }
@@ -10718,6 +11205,23 @@ fn note_tracked_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id:
         return;
     };
     if tracker.current_thread_id.as_deref() == Some(thread_id) {
+        return;
+    }
+    tracker.current_thread_id = Some(thread_id.to_string());
+    let _ = tracker
+        .event_tx
+        .send(ClientEvent::ThreadBound(thread_id.to_string()));
+}
+
+fn note_unbound_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id: &str) {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let Ok(mut tracker) = tracker.lock() else {
+        return;
+    };
+    if tracker.current_thread_id.is_some() {
         return;
     }
     tracker.current_thread_id = Some(thread_id.to_string());
@@ -11110,6 +11614,7 @@ fn load_turn_archive(path: &Path, telemetry: &mut AgentTelemetry) {
             continue;
         };
         let record = turn_record_from_info(info);
+        telemetry.observe_trace_sequence(&record);
         telemetry.turns.insert(record.key.clone(), record);
     }
     telemetry.trim_turns();
