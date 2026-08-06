@@ -5615,7 +5615,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_thread_started_notification_binds_the_proxy_client() {
+    fn websocket_thread_started_notification_does_not_bind_an_uninitialized_proxy() {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
@@ -5631,10 +5631,8 @@ mod tests {
             }),
         );
 
-        assert!(matches!(
-            event_rx.recv_timeout(Duration::from_millis(50)),
-            Ok(ClientEvent::ThreadBound(thread_id)) if thread_id == "thread-notified"
-        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(tracker.lock().unwrap().current_thread_id, None);
     }
 
     #[test]
@@ -11154,17 +11152,11 @@ fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>,
 
 fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
     if value.get("method").and_then(Value::as_str) == Some("thread/started") {
-        if let Some(thread_id) = value
-            .get("params")
-            .and_then(|params| params.get("thread"))
-            .and_then(|thread| thread.get("id"))
-            .and_then(Value::as_str)
-        {
-            // thread/started is a server notification and may describe a
-            // different loaded thread. Only use it to bind a client that has
-            // not received an authoritative thread ID from its own request.
-            note_unbound_thread_id(tracker, thread_id);
-        }
+        // This is an unsolicited server notification.  It can describe a
+        // thread created by another client sharing the app-server socket, so
+        // it must never establish this proxy's thread binding.  Bindings are
+        // learned only from this client's resume/start requests and their
+        // correlated responses (or from the explicit resume argument).
         return;
     }
     let Some(id) = app_server_message_id(value) else {
@@ -11205,23 +11197,6 @@ fn note_tracked_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id:
         return;
     };
     if tracker.current_thread_id.as_deref() == Some(thread_id) {
-        return;
-    }
-    tracker.current_thread_id = Some(thread_id.to_string());
-    let _ = tracker
-        .event_tx
-        .send(ClientEvent::ThreadBound(thread_id.to_string()));
-}
-
-fn note_unbound_thread_id(tracker: &Arc<Mutex<ThreadBindingTracker>>, thread_id: &str) {
-    let thread_id = thread_id.trim();
-    if thread_id.is_empty() {
-        return;
-    }
-    let Ok(mut tracker) = tracker.lock() else {
-        return;
-    };
-    if tracker.current_thread_id.is_some() {
         return;
     }
     tracker.current_thread_id = Some(thread_id.to_string());
