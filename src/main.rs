@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -6,14 +7,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,27 +29,54 @@ const PID_FILE_NAME: &str = "server.pid";
 const MANAGED_CODEX_DIR_NAME: &str = "codex-npm";
 const THREAD_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const UPGRADE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const RESUME_GENERATION_GRACE: Duration = Duration::from_secs(20);
 const DEFAULT_UPGRADE_IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const UPGRADE_REEXEC_PERMIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UPGRADE_REEXEC_ACTIVE_TIMEOUT_SECS: u64 = 120;
+const UPGRADE_MEMORY_BASE_RESERVE_MIB: u64 = 2048;
+const UPGRADE_MEMORY_PER_CLIENT_RESERVE_MIB: u64 = 256;
+const UPGRADE_MIN_SWAP_FREE_MIB: u64 = 512;
+// Polling remains a compatibility fallback for old/proxied masters, but it
+// must not add a full second of user-visible latency to every federation
+// command when the WebSocket push path is unavailable.
+const FEDERATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Federation polling is a liveness path.  A proxy/TLS peer can leave the
+// child process connected forever, so this must be bounded independently of
+// the normal app-server RPC timeout.
+const FEDERATION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const FEDERATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_RPC_READ_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const APP_SERVER_RPC_READ_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const APP_SERVER_RPC_BACKGROUND_GATE_TIMEOUT: Duration = Duration::from_secs(5);
+// A control update is user-visible and may legitimately wait for one
+// background inventory page or another control update to finish. Five
+// seconds was shorter than the existing RPC timeout and surfaced a false
+// "gate busy" failure during a burst of widget settings updates.
+const APP_SERVER_RPC_CONTROL_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+const APP_SERVER_BACKGROUND_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CLIENT_CHILD_RESTART_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_RESTART_DEBOUNCE: Duration = Duration::from_secs(2);
+const UPGRADE_REEXEC_RETRY_DELAY: Duration = Duration::from_secs(5);
 const APP_SERVER_CONFIGURE_MAX_ATTEMPTS: usize = 3;
 const APP_SERVER_CONFIGURE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const APP_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(180);
-const RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT: Duration = Duration::from_secs(60);
-const RESUME_CONTEXT_REPAIR_WATCH_INTERVAL: Duration = Duration::from_secs(10);
-const RESUME_PERMISSIONS_REINFORCE_TIMEOUT: Duration = Duration::from_secs(120);
-const RESUME_PERMISSIONS_REINFORCE_INTERVAL: Duration = Duration::from_secs(2);
+// Resume policy is applied once after the client's thread/resume bootstrap
+// succeeds.  Repeating settings/update while TUI bootstrap or turn/start is
+// in flight can monopolize the shared app-server and turn a recoverable
+// application error into a transport failure.
+const RESUME_POLICY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_SERVER_STATUS_SUBSCRIPTION_GRACE: Duration = Duration::from_secs(5);
 const APP_SERVER_SELF_HEAL_STABLE_AFTER: Duration = Duration::from_secs(60);
 const APP_SERVER_SELF_HEAL_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLIENT_PROXY_DIR_NAME: &str = "client-proxies";
 const CLIENT_PENDING_SETTINGS_DIR_NAME: &str = "client-pending-settings";
 const ACTIVE_SESSIONS_FILE_NAME: &str = "active-sessions.json";
-const ACTIVE_SESSIONS_FILE_VERSION: u32 = 1;
+const ACTIVE_SESSIONS_FILE_VERSION: u32 = 2;
 const DEFAULT_CONFIGURATION_FILE_NAME: &str = "default-configuration.json";
 const TURN_ARCHIVE_FILE_NAME: &str = "turns.jsonl";
-const APP_SERVER_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const APP_SERVER_TELEMETRY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const APP_SERVER_TELEMETRY_MAX_PAGES: usize = 11;
 const MAX_TELEMETRY_THREADS: usize = 2048;
 const MAX_TELEMETRY_TOOL_CALLS: usize = 512;
 const MAX_TELEMETRY_HOOK_RUNS: usize = 512;
@@ -56,6 +84,18 @@ const MAX_TELEMETRY_TURNS: usize = 512;
 const MAX_TURN_TEXT_BYTES: usize = 16 * 1024;
 const MAX_PENDING_TURN_INPUTS: usize = 128;
 const MAX_PENDING_TURN_INPUT_AGE_SECS: u64 = 600;
+const MAX_SESSION_REPAIR_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TURN_ARCHIVE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_API_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_API_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// tmux 3.4 places every pane in a transient user scope. Apply the same
+// bounded budget to a managed client scope so the client-side Codex/tools
+// tree cannot bypass the yolo.service budget.
+const CLIENT_SCOPE_MEMORY_HIGH: &str = "6G";
+const CLIENT_SCOPE_MEMORY_MAX: &str = "8G";
+const CLIENT_SCOPE_MEMORY_SWAP_MAX: &str = "1G";
+
+static UPGRADE_RESUME_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -82,6 +122,12 @@ struct ClientInfo {
     #[serde(default)]
     reasoning_effort: Option<String>,
     fast: bool,
+    #[serde(default)]
+    fast_known: bool,
+    #[serde(default)]
+    settings_source: String,
+    #[serde(default)]
+    settings_observed_at: Option<u64>,
     thread_id: Option<String>,
     #[serde(default)]
     thread_id_source: String,
@@ -108,6 +154,7 @@ struct ClientResumeSettings {
     model: Option<String>,
     service_tier: Option<String>,
     reasoning_effort: Option<String>,
+    settings_source: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,6 +170,14 @@ struct ActiveSessionRecord {
     reasoning_effort: Option<String>,
     #[serde(default)]
     fast: bool,
+    #[serde(default)]
+    fast_known: bool,
+    #[serde(default)]
+    settings_complete: bool,
+    #[serde(default)]
+    settings_source: String,
+    #[serde(default)]
+    settings_observed_at: Option<u64>,
     #[serde(default)]
     thread_id: Option<String>,
     #[serde(default)]
@@ -186,6 +241,8 @@ struct TmuxPaneInfo {
     session_name: Option<String>,
     window_index: Option<u32>,
     pane_index: Option<u32>,
+    #[serde(default)]
+    pane_id: Option<String>,
     pane_pid: Option<u32>,
     #[serde(default)]
     yolo_pid: Option<u32>,
@@ -210,6 +267,14 @@ struct ServerState {
     federation_push_senders: BTreeMap<String, mpsc::Sender<Value>>,
     status_event_senders: BTreeMap<u64, mpsc::Sender<Value>>,
     next_status_event_id: u64,
+    upgrade_reexec_queue: VecDeque<u32>,
+    upgrade_reexec_active: Option<UpgradeReexecPermit>,
+}
+
+#[derive(Clone, Debug)]
+struct UpgradeReexecPermit {
+    yolo_pid: u32,
+    claimed_at: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,29 +309,52 @@ fn app_server_rpc_gate() -> &'static AppServerRpcGate {
     })
 }
 
-fn acquire_app_server_rpc(priority: AppServerRpcPriority) -> AppServerRpcLease {
+fn acquire_app_server_rpc(priority: AppServerRpcPriority) -> Result<AppServerRpcLease, String> {
     let gate = app_server_rpc_gate();
     let mut state = gate.state.lock().expect("app-server RPC gate poisoned");
+    let wait_timeout = match priority {
+        AppServerRpcPriority::Control => APP_SERVER_RPC_CONTROL_GATE_TIMEOUT,
+        AppServerRpcPriority::Background => APP_SERVER_RPC_BACKGROUND_GATE_TIMEOUT,
+    };
+    let deadline = Instant::now() + wait_timeout;
     if priority == AppServerRpcPriority::Control {
         state.control_waiters = state.control_waiters.saturating_add(1);
-        while state.active {
-            state = gate
-                .changed
-                .wait(state)
-                .expect("app-server RPC gate poisoned");
+    }
+    loop {
+        let blocked = state.active
+            || (priority == AppServerRpcPriority::Background && state.control_waiters > 0);
+        if !blocked {
+            if priority == AppServerRpcPriority::Control {
+                state.control_waiters = state.control_waiters.saturating_sub(1);
+            }
+            state.active = true;
+            drop(state);
+            return Ok(AppServerRpcLease { gate });
         }
-        state.control_waiters = state.control_waiters.saturating_sub(1);
-    } else {
-        while state.active || state.control_waiters > 0 {
-            state = gate
-                .changed
-                .wait(state)
-                .expect("app-server RPC gate poisoned");
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if priority == AppServerRpcPriority::Control {
+                state.control_waiters = state.control_waiters.saturating_sub(1);
+            }
+            return Err(format!("app-server RPC gate busy for {:?}", wait_timeout));
+        }
+        let (next_state, wait_result) = gate
+            .changed
+            .wait_timeout(state, remaining)
+            .expect("app-server RPC gate poisoned");
+        state = next_state;
+        if wait_result.timed_out() {
+            let still_blocked = state.active
+                || (priority == AppServerRpcPriority::Background && state.control_waiters > 0);
+            if still_blocked {
+                if priority == AppServerRpcPriority::Control {
+                    state.control_waiters = state.control_waiters.saturating_sub(1);
+                }
+                return Err(format!("app-server RPC gate busy for {:?}", wait_timeout));
+            }
         }
     }
-    state.active = true;
-    drop(state);
-    AppServerRpcLease { gate }
 }
 
 impl Drop for AppServerRpcLease {
@@ -2321,16 +2409,28 @@ fn json_enum_string(value: &Value) -> Option<String> {
 }
 
 enum ClientEvent {
-    RestartRequested,
+    UpgradeResumeRequested,
     SettingsReconfigureRequested,
+    ProxyDisconnected {
+        error: String,
+    },
+    ResumeBootstrapCompleted,
     ThreadBound(String),
+    ThreadStatus {
+        thread_id: String,
+        status: String,
+        active_flags: Vec<String>,
+    },
     PendingSettingsApplied(PendingClientSettings),
     TurnInput {
         thread_id: String,
         turn_id: Option<String>,
         prompt: String,
     },
-    CodexExited(Result<ExitStatus, String>),
+    CodexExited {
+        generation: u64,
+        result: Result<ExitStatus, String>,
+    },
 }
 
 struct ClientThreadProxy {
@@ -2347,6 +2447,7 @@ struct WebsocketFrame {
 
 struct ThreadBindingTracker {
     pending_create_request_ids: BTreeSet<String>,
+    pending_resume_request_ids: BTreeSet<String>,
     current_thread_id: Option<String>,
     event_tx: mpsc::Sender<ClientEvent>,
 }
@@ -2390,7 +2491,7 @@ struct PendingClientSettings {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct UpgradeResumeAllRequest {
     #[serde(default)]
     codex_version: Option<String>,
@@ -2414,7 +2515,202 @@ struct RefreshResumeRequest {
     all: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ResolveResumeLastRequest {
+    #[serde(default)]
+    cwd: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PrepareResumeRequest {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    thread_id: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    configuration: Option<YoloDefaultConfiguration>,
+}
+
+fn settings_source_rank(source: &str) -> u8 {
+    match source {
+        // The yolo launch intent is the durable source for a resumed client.
+        // App-server snapshots can be stale while a thread is being loaded,
+        // so they must never replace a complete launch configuration.
+        "configure" => 6,
+        "heartbeat" => 5,
+        "tmux_footer" => 4,
+        "launch_args" => 3,
+        "legacy" => 2,
+        "app_server" => 1,
+        _ => 0,
+    }
+}
+
+fn client_settings_source(client: &ClientInfo) -> String {
+    if !client.settings_source.trim().is_empty() {
+        return client.settings_source.clone();
+    }
+    if client.settings_updated_at.is_some() {
+        return "configure".to_string();
+    }
+    if client.model.is_some() || client.service_tier.is_some() || client.reasoning_effort.is_some()
+    {
+        return "legacy".to_string();
+    }
+    "unknown".to_string()
+}
+
+fn client_fast_known(client: &ClientInfo) -> bool {
+    client.fast_known
+        || known_fast_from_service_tier(client.service_tier.as_deref()).is_some()
+        || matches!(
+            client.settings_source.as_str(),
+            "app_server" | "configure" | "tmux_footer"
+        )
+}
+
+fn known_fast_from_service_tier(service_tier: Option<&str>) -> Option<bool> {
+    match service_tier.map(str::trim) {
+        Some("fast" | "priority") => Some(true),
+        Some("default") => Some(false),
+        _ => None,
+    }
+}
+
+fn session_settings_complete(
+    model: &Option<String>,
+    service_tier: &Option<String>,
+    reasoning_effort: &Option<String>,
+    fast_known: bool,
+) -> bool {
+    fast_known
+        && model
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && service_tier
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && reasoning_effort
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn active_session_record_settings_complete(record: &ActiveSessionRecord) -> bool {
+    record.settings_complete
+        || session_settings_complete(
+            &record.model,
+            &record.service_tier,
+            &record.reasoning_effort,
+            record.fast_known
+                || known_fast_from_service_tier(record.service_tier.as_deref()).is_some(),
+        )
+}
+
+fn codex_args_settings_score(args: &[String]) -> u8 {
+    let settings = parse_codex_launch_config(args);
+    settings.model.is_some() as u8
+        + settings.service_tier.is_some() as u8
+        + settings.reasoning_effort.is_some() as u8
+}
+
+fn merge_optional_setting(
+    incoming: &Option<String>,
+    current: &Option<String>,
+    prefer_incoming: bool,
+) -> Option<String> {
+    if prefer_incoming {
+        incoming.clone().or_else(|| current.clone())
+    } else {
+        current.clone().or_else(|| incoming.clone())
+    }
+}
+
+fn merge_active_session_record(
+    current: Option<&ActiveSessionRecord>,
+    client: &ClientInfo,
+) -> ActiveSessionRecord {
+    let incoming = active_session_record_from_client(client);
+    let Some(current) = current else {
+        return incoming;
+    };
+
+    let current_fast_known = current.fast_known
+        || known_fast_from_service_tier(current.service_tier.as_deref()).is_some();
+    let current_complete = active_session_record_settings_complete(current);
+    let incoming_rank = settings_source_rank(&incoming.settings_source);
+    let current_rank = settings_source_rank(&current.settings_source);
+    let incoming_observed_at = incoming.settings_observed_at.unwrap_or(0);
+    let current_observed_at = current.settings_observed_at.unwrap_or(0);
+    let prefer_incoming = incoming_rank > current_rank
+        || (incoming_rank == current_rank && incoming_observed_at >= current_observed_at);
+
+    let mut record = incoming.clone();
+    if record.cwd.trim().is_empty() {
+        record.cwd = current.cwd.clone();
+    }
+    if current_complete
+        && codex_args_settings_score(&record.args) < codex_args_settings_score(&current.args)
+    {
+        record.args = current.args.clone();
+    }
+    record.model = merge_optional_setting(&incoming.model, &current.model, prefer_incoming);
+    record.service_tier = merge_optional_setting(
+        &incoming.service_tier,
+        &current.service_tier,
+        prefer_incoming,
+    );
+    record.reasoning_effort = merge_optional_setting(
+        &incoming.reasoning_effort,
+        &current.reasoning_effort,
+        prefer_incoming,
+    );
+
+    if incoming.fast_known && (prefer_incoming || !current_fast_known) {
+        record.fast = incoming.fast;
+        record.fast_known = true;
+    } else {
+        record.fast = current.fast;
+        record.fast_known = current_fast_known || incoming.fast_known;
+    }
+    if let Some(service_fast) = known_fast_from_service_tier(record.service_tier.as_deref()) {
+        record.fast = service_fast;
+        record.fast_known = true;
+    }
+
+    if current_rank > incoming_rank || incoming.settings_source.trim().is_empty() {
+        record.settings_source = current.settings_source.clone();
+    }
+    record.settings_observed_at =
+        match (current.settings_observed_at, incoming.settings_observed_at) {
+            (Some(current), Some(incoming)) => Some(current.max(incoming)),
+            (Some(current), None) => Some(current),
+            (None, Some(incoming)) => Some(incoming),
+            (None, None) => None,
+        };
+    record.settings_complete = session_settings_complete(
+        &record.model,
+        &record.service_tier,
+        &record.reasoning_effort,
+        record.fast_known,
+    );
+    record.started_at = if current.started_at > 0 {
+        current.started_at.min(incoming.started_at)
+    } else {
+        incoming.started_at
+    };
+    if record.thread_id.is_none() {
+        record.thread_id = current.thread_id.clone();
+        record.thread_id_source = current.thread_id_source.clone();
+    }
+    record
+}
+
 fn active_session_record_from_client(client: &ClientInfo) -> ActiveSessionRecord {
+    let fast_known = client_fast_known(client);
+    let settings_source = client_settings_source(client);
+    let fast = known_fast_from_service_tier(client.service_tier.as_deref()).unwrap_or(client.fast);
     ActiveSessionRecord {
         client_id: client.id.clone(),
         cwd: client.cwd.clone(),
@@ -2422,7 +2718,16 @@ fn active_session_record_from_client(client: &ClientInfo) -> ActiveSessionRecord
         model: client.model.clone(),
         service_tier: client.service_tier.clone(),
         reasoning_effort: client.reasoning_effort.clone(),
-        fast: client.fast,
+        fast,
+        fast_known,
+        settings_complete: session_settings_complete(
+            &client.model,
+            &client.service_tier,
+            &client.reasoning_effort,
+            fast_known,
+        ),
+        settings_source,
+        settings_observed_at: client.settings_observed_at,
         thread_id: client.thread_id.clone(),
         thread_id_source: client.thread_id_source.clone(),
         started_at: client.started_at,
@@ -2454,15 +2759,20 @@ fn remove_active_session_matches_client(
     changed
 }
 
-fn remove_active_sessions_for_yolo_pid(
+fn remove_active_sessions_for_yolo_pid_except(
     active_sessions: &mut BTreeMap<String, ActiveSessionRecord>,
     yolo_pid: u32,
+    keep_client: Option<&ClientInfo>,
 ) -> bool {
     let prefix = format!("{yolo_pid}-");
     let ids = active_sessions
-        .keys()
-        .filter(|id| id.starts_with(&prefix))
-        .cloned()
+        .iter()
+        .filter(|(id, record)| {
+            id.starts_with(&prefix)
+                && keep_client
+                    .is_none_or(|client| !active_session_record_matches_client(record, client))
+        })
+        .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     let changed = !ids.is_empty();
     for id in ids {
@@ -2472,14 +2782,32 @@ fn remove_active_sessions_for_yolo_pid(
 }
 
 fn upsert_active_session_locked(state: &mut ServerState, client: &ClientInfo) -> bool {
-    if client.status != "running" {
+    if !matches!(client.status.as_str(), "running" | "restarting") {
         return remove_active_session_matches_client(&mut state.active_sessions, client);
     }
-    let record = active_session_record_from_client(client);
-    let changed = state
+
+    let matching_ids = state
         .active_sessions
-        .get(&client.id)
-        .is_none_or(|current| current != &record);
+        .iter()
+        .filter(|(_, record)| active_session_record_matches_client(record, client))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let current = matching_ids
+        .iter()
+        .filter_map(|id| state.active_sessions.get(id))
+        .max_by_key(|record| {
+            (
+                active_session_record_settings_complete(record),
+                settings_source_rank(&record.settings_source),
+                record.settings_observed_at.unwrap_or(0),
+                record.started_at,
+            )
+        });
+    let record = merge_active_session_record(current, client);
+    let changed = matching_ids.len() != 1 || state.active_sessions.get(&client.id) != Some(&record);
+    for id in matching_ids {
+        state.active_sessions.remove(&id);
+    }
     state.active_sessions.insert(client.id.clone(), record);
     changed
 }
@@ -2488,17 +2816,258 @@ fn reconcile_registered_client_process(state: &mut ServerState, client: &ClientI
     let stale_clients = state
         .clients
         .values()
-        .filter(|existing| existing.id != client.id && existing.yolo_pid == client.yolo_pid)
+        .filter(|existing| {
+            if existing.id == client.id {
+                return false;
+            }
+            existing.yolo_pid == client.yolo_pid
+                || (!matches!(existing.status.as_str(), "running" | "restarting")
+                    && existing
+                        .thread_id
+                        .as_deref()
+                        .zip(client.thread_id.as_deref())
+                        .is_some_and(|(left, right)| !left.is_empty() && left == right))
+        })
         .cloned()
         .collect::<Vec<_>>();
     let mut changed = false;
+    changed |= stale_clients.iter().any(|existing| {
+        existing.yolo_pid != client.yolo_pid
+            && !matches!(existing.status.as_str(), "running" | "restarting")
+            && existing
+                .thread_id
+                .as_deref()
+                .zip(client.thread_id.as_deref())
+                .is_some_and(|(left, right)| !left.is_empty() && left == right)
+    });
     for stale_client in stale_clients {
-        changed |= remove_active_session_matches_client(&mut state.active_sessions, &stale_client);
+        // Keep the saved record when a stale/exited client is replaced by a
+        // new wrapper for the same thread. The following registration will
+        // merge it into the new client identity.
+        if stale_client.yolo_pid == client.yolo_pid {
+            changed |=
+                remove_active_session_matches_client(&mut state.active_sessions, &stale_client);
+        }
     }
-    state
+    let replaced_process = state
         .clients
-        .retain(|id, existing| id == &client.id || existing.yolo_pid != client.yolo_pid);
+        .values()
+        .any(|existing| existing.id != client.id && existing.yolo_pid == client.yolo_pid);
+    state.clients.retain(|id, existing| {
+        if id == &client.id || existing.yolo_pid == client.yolo_pid {
+            return id == &client.id;
+        }
+        let same_thread = existing
+            .thread_id
+            .as_deref()
+            .zip(client.thread_id.as_deref())
+            .is_some_and(|(left, right)| !left.is_empty() && left == right);
+        matches!(existing.status.as_str(), "running" | "restarting") || !same_thread
+    });
+    if replaced_process {
+        release_upgrade_reexec_permit_locked(state, client.yolo_pid);
+    }
     changed
+}
+
+fn is_waiting_thread_status(status: &str) -> bool {
+    status.eq_ignore_ascii_case("idle") || status.eq_ignore_ascii_case("waiting")
+}
+
+fn client_is_waiting_for_upgrade(client: &ClientInfo) -> bool {
+    matches!(client.status.as_str(), "running" | "restarting")
+        && client
+            .codex_status
+            .as_deref()
+            .is_some_and(is_waiting_thread_status)
+        && client.codex_active_flags.is_empty()
+        && client.codex_status_updated_at.is_some()
+}
+
+fn prepare_upgrade_reexec_gate(
+    state: &Arc<Mutex<ServerState>>,
+    request: &UpgradeResumeAllRequest,
+) -> usize {
+    let client_ids = state
+        .lock()
+        .map(|state| {
+            state
+                .clients
+                .values()
+                .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+                .map(|client| client.id.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    prepare_upgrade_reexec_gate_for_client_ids(state, &client_ids, request)
+}
+
+fn prepare_upgrade_reexec_gate_for_client_ids(
+    state: &Arc<Mutex<ServerState>>,
+    client_ids: &BTreeSet<String>,
+    request: &UpgradeResumeAllRequest,
+) -> usize {
+    let Ok(mut state) = state.lock() else {
+        return 0;
+    };
+    let mut clients = state
+        .clients
+        .values()
+        .filter(|client| client_ids.contains(&client.id))
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .collect::<Vec<_>>();
+    // Keep the caller last when Phoenix mode asked us to ignore it while
+    // waiting. This lets the other sessions migrate before the initiating
+    // terminal is asked to re-exec.
+    clients.sort_by_key(|client| {
+        (
+            should_ignore_upgrade_wait_client(client, request),
+            client.started_at,
+            client.yolo_pid,
+        )
+    });
+    let mut seen = BTreeSet::new();
+    state.upgrade_reexec_queue = clients
+        .into_iter()
+        .filter_map(|client| seen.insert(client.yolo_pid).then_some(client.yolo_pid))
+        .collect();
+    state.upgrade_reexec_active = None;
+    state.upgrade_reexec_queue.len()
+}
+
+fn prune_upgrade_reexec_gate_locked(state: &mut ServerState) {
+    let now = now_secs();
+    if state.upgrade_reexec_active.as_ref().is_some_and(|permit| {
+        now.saturating_sub(permit.claimed_at) >= UPGRADE_REEXEC_ACTIVE_TIMEOUT_SECS
+    }) {
+        if let Some(permit) = state.upgrade_reexec_active.take() {
+            eprintln!(
+                "yolo upgrade: releasing stale re-exec permit for yolo pid {}",
+                permit.yolo_pid
+            );
+        }
+    }
+
+    while let Some(yolo_pid) = state.upgrade_reexec_queue.front().copied() {
+        let present = state.clients.values().any(|client| {
+            client.yolo_pid == yolo_pid
+                && matches!(client.status.as_str(), "running" | "restarting")
+                && now.saturating_sub(client.updated_at) < UPGRADE_REEXEC_ACTIVE_TIMEOUT_SECS
+        });
+        if present {
+            break;
+        }
+        state.upgrade_reexec_queue.pop_front();
+    }
+}
+
+fn release_upgrade_reexec_permit_locked(state: &mut ServerState, yolo_pid: u32) {
+    if state
+        .upgrade_reexec_active
+        .as_ref()
+        .is_some_and(|permit| permit.yolo_pid == yolo_pid)
+    {
+        state.upgrade_reexec_active = None;
+        if state.upgrade_reexec_queue.front() == Some(&yolo_pid) {
+            state.upgrade_reexec_queue.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpgradeReexecClaimResult {
+    Granted,
+    GateAbsent,
+    ClientUnknown,
+    WaitingStateAbsent,
+    NotClientTurn,
+    Unknown,
+}
+
+impl UpgradeReexecClaimResult {
+    fn granted(self) -> bool {
+        self == Self::Granted
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::GateAbsent => "gate_absent",
+            Self::ClientUnknown => "client_unknown",
+            Self::WaitingStateAbsent => "waiting_state_absent",
+            Self::NotClientTurn => "not_client_turn",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn claim_upgrade_reexec_permit_result(
+    state: &Arc<Mutex<ServerState>>,
+    client_id: &str,
+) -> Result<UpgradeReexecClaimResult, String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| "server state lock poisoned".to_string())?;
+    prune_upgrade_reexec_gate_locked(&mut state);
+    // A re-exec permit is never a generic liveness/recovery permit. It is
+    // valid only while an explicit upgrade-resume gate is active.
+    if state.upgrade_reexec_queue.is_empty() && state.upgrade_reexec_active.is_none() {
+        return Ok(UpgradeReexecClaimResult::GateAbsent);
+    }
+    let Some(client) = state.clients.get(client_id) else {
+        return Ok(UpgradeReexecClaimResult::ClientUnknown);
+    };
+    // The upgrade worker waits for the app-server thread to become idle. Keep
+    // this check at the final claim point as well, so a client that became
+    // active again can never be terminated/re-execed by the upgrade flow.
+    if !client_is_waiting_for_upgrade(client) {
+        return Ok(UpgradeReexecClaimResult::WaitingStateAbsent);
+    }
+    if state
+        .upgrade_reexec_active
+        .as_ref()
+        .is_some_and(|permit| permit.yolo_pid == client.yolo_pid)
+    {
+        return Ok(UpgradeReexecClaimResult::Granted);
+    }
+    if state.upgrade_reexec_active.is_some()
+        || state.upgrade_reexec_queue.front() != Some(&client.yolo_pid)
+    {
+        return Ok(UpgradeReexecClaimResult::NotClientTurn);
+    }
+    state.upgrade_reexec_active = Some(UpgradeReexecPermit {
+        yolo_pid: client.yolo_pid,
+        claimed_at: now_secs(),
+    });
+    Ok(UpgradeReexecClaimResult::Granted)
+}
+
+fn claim_upgrade_reexec_permit(
+    state: &Arc<Mutex<ServerState>>,
+    client_id: &str,
+) -> Result<bool, String> {
+    Ok(claim_upgrade_reexec_permit_result(state, client_id)?.granted())
+}
+
+fn upgrade_reexec_gate_pending(state: &Arc<Mutex<ServerState>>) -> Result<bool, String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| "server state lock poisoned".to_string())?;
+    prune_upgrade_reexec_gate_locked(&mut state);
+    Ok(!state.upgrade_reexec_queue.is_empty() || state.upgrade_reexec_active.is_some())
+}
+
+fn wait_for_upgrade_reexec_gate(state: &Arc<Mutex<ServerState>>) -> Result<(), String> {
+    let start = SystemTime::now();
+    loop {
+        if !upgrade_reexec_gate_pending(state)? {
+            return Ok(());
+        }
+        if start.elapsed().unwrap_or_default() >= UPGRADE_REEXEC_PERMIT_TIMEOUT {
+            return Err("timed out waiting for serialized Codex client re-exec".to_string());
+        }
+        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+    }
 }
 
 fn persist_active_sessions_snapshot(
@@ -2579,7 +3148,33 @@ fn load_active_sessions(path: &Path) -> BTreeMap<String, ActiveSessionRecord> {
     file.sessions
         .into_iter()
         .filter(|session| !session.client_id.trim().is_empty() && !session.cwd.trim().is_empty())
-        .map(|session| (session.client_id.clone(), session))
+        .map(|mut session| {
+            if !session.fast_known {
+                session.fast_known = known_fast_from_service_tier(session.service_tier.as_deref())
+                    .is_some()
+                    || session.settings_complete;
+            }
+            session.settings_complete |= session_settings_complete(
+                &session.model,
+                &session.service_tier,
+                &session.reasoning_effort,
+                session.fast_known,
+            );
+            if let Some(service_fast) =
+                known_fast_from_service_tier(session.service_tier.as_deref())
+            {
+                session.fast = service_fast;
+                session.fast_known = true;
+            }
+            if session.settings_source.trim().is_empty() {
+                session.settings_source = if session.settings_complete {
+                    "legacy".to_string()
+                } else {
+                    "unknown".to_string()
+                };
+            }
+            (session.client_id.clone(), session)
+        })
         .collect()
 }
 
@@ -2684,12 +3279,13 @@ fn sync_active_sessions_for_client_ids(
 
 fn main() {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
+    let is_native_codex_command = args.first().and_then(|arg| arg.to_str()) == Some("codex");
 
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if !is_native_codex_command && args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_help();
         return;
     }
-    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+    if !is_native_codex_command && args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("yolo {VERSION}");
         return;
     }
@@ -2825,10 +3421,19 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
             paths.default_configuration.display()
         );
     }
+    // A server process restart must produce a generation newer than the one
+    // remembered by surviving yolo clients. A per-process counter starting at
+    // zero can repeat the previous generation and leave the re-exec gate
+    // permanently unobserved after a service restart.
+    let server_generation = now_millis() as u64;
     let state = Arc::new(Mutex::new(ServerState {
         started_at: now_secs(),
         app_server_pid: None,
-        app_server_generation: 0,
+        app_server_generation: server_generation,
+        // Do not turn an ordinary yolo.service/app-server restart into a
+        // proactive client kill or re-exec. Only an explicit upgrade-resume
+        // operation advances this generation and opens the waiting-client
+        // gate.
         resume_generation: 0,
         clients: BTreeMap::new(),
         active_sessions,
@@ -2838,6 +3443,8 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         federation_push_senders: BTreeMap::new(),
         status_event_senders: BTreeMap::new(),
         next_status_event_id: 0,
+        upgrade_reexec_queue: VecDeque::new(),
+        upgrade_reexec_active: None,
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
     scan_existing_yolo_clients(&state, &paths);
@@ -3092,17 +3699,120 @@ fn restart_tracked_app_server_with_cwd(
     Ok(pid)
 }
 
+fn try_claim_upgrade_reexec_permit(client_id: &str) -> Result<UpgradeReexecClaimResult, String> {
+    let value = api_post_json("/clients/reexec-claim", &json!({"client_id": client_id}))?;
+    if value
+        .get("granted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(UpgradeReexecClaimResult::Granted);
+    }
+    Ok(match value.get("reason").and_then(Value::as_str) {
+        Some("gate_absent") => UpgradeReexecClaimResult::GateAbsent,
+        Some("client_unknown") => UpgradeReexecClaimResult::ClientUnknown,
+        Some("waiting_state_absent") => UpgradeReexecClaimResult::WaitingStateAbsent,
+        Some("not_client_turn") => UpgradeReexecClaimResult::NotClientTurn,
+        _ => UpgradeReexecClaimResult::Unknown,
+    })
+}
+
+fn codex_child_exit_is_user_interrupt(status: &ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        status.signal() == Some(2) || status.code() == Some(130)
+    }
+    #[cfg(not(unix))]
+    {
+        status.code() == Some(130)
+    }
+}
+
+fn spawn_codex_child(cwd: &str, remote: &str, args: &[OsString]) -> Result<Child, String> {
+    let codex = codex_executable();
+    let mut command = Command::new(codex);
+    command
+        .current_dir(cwd)
+        .arg("--remote")
+        .arg(remote)
+        .args(yolo_mode_cli_args());
+    if resume_target_from_args(args).is_some() {
+        command.arg("-c").arg("include_environment_context=false");
+    }
+    command
+        .args(codex_args_with_cwd(args.to_vec(), cwd))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+        .spawn()
+        .map_err(|err| format!("failed to spawn codex: {err}"))
+}
+
+fn spawn_and_register_codex_child(
+    cwd: &str,
+    remote: &str,
+    args: &[OsString],
+    generation: u64,
+    info: &mut ClientInfo,
+    event_tx: &mpsc::Sender<ClientEvent>,
+) -> Result<u32, String> {
+    let mut child = spawn_codex_child(cwd, remote, args)?;
+    let child_pid = child.id();
+    info.codex_pid = Some(child_pid);
+    info.updated_at = now_secs();
+    info.ended_at = None;
+    info.exit_code = None;
+    info.status = "running".to_string();
+    info.codex_status = None;
+    info.codex_active_flags.clear();
+    info.codex_status_updated_at = None;
+    let _ = api_post_json(
+        "/clients/register",
+        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+    );
+
+    let child_event_tx = event_tx.clone();
+    thread::spawn(move || {
+        let result = child.wait().map_err(|err| err.to_string());
+        let _ = child_event_tx.send(ClientEvent::CodexExited { generation, result });
+    });
+    Ok(child_pid)
+}
+
+fn wait_for_client_transport(paths: &RuntimePaths) {
+    let mut announced = false;
+    loop {
+        if paths.api_socket.exists()
+            && api_get_json("/status").is_ok()
+            && wait_for_app_server_ready(paths, Duration::from_millis(250)).is_ok()
+        {
+            if announced {
+                eprintln!("yolo: server transport recovered; resuming Codex child");
+            }
+            return;
+        }
+        if !announced {
+            eprintln!("yolo: server transport unavailable; keeping client resident and retrying");
+            announced = true;
+        }
+        thread::sleep(CLIENT_RECOVERY_RETRY_DELAY);
+    }
+}
+
 fn run_client(args: Vec<OsString>) {
+    apply_client_scope_memory_budget();
     if let Err(err) = ensure_server() {
-        eprintln!("yolo: failed to start server: {err}");
-        std::process::exit(1);
+        eprintln!("yolo: server is not ready: {err}; client will remain resident and retry");
     }
 
-    let paths = match runtime_paths() {
-        Ok(paths) => paths,
-        Err(err) => {
-            eprintln!("yolo: {err}");
-            std::process::exit(1);
+    let paths = loop {
+        match runtime_paths() {
+            Ok(paths) => break paths,
+            Err(err) => {
+                eprintln!("yolo: runtime paths unavailable: {err}; retrying");
+                thread::sleep(CLIENT_RECOVERY_RETRY_DELAY);
+            }
         }
     };
     let upstream_remote = env::var("YOLO_REMOTE")
@@ -3117,18 +3827,20 @@ fn run_client(args: Vec<OsString>) {
     let resolved_args = match resolve_resume_last_args(&args, &codex_cwd) {
         Ok(args) => args,
         Err(err) => {
-            eprintln!("yolo: {err}");
-            std::process::exit(2);
+            eprintln!("yolo: {err}; continuing with the requested arguments");
+            args.clone()
         }
     };
-    let original_args = strip_conflicting_yolo_options(resolved_args.clone());
     let default_configuration = yolo_default_configuration_from_server();
     let resolved_args = strip_conflicting_yolo_options(with_yolo_session_defaults(
         resolved_args,
         default_configuration.as_ref(),
     ));
+    // Keep the effective launch intent, including yolo's injected defaults,
+    // for every later re-exec. Capturing the pre-default arguments here loses
+    // the original model mode when a client is resumed after a restart.
+    let original_args = resolved_args.clone();
     ensure_codex_project_trusted(&codex_cwd);
-    let launch_args = codex_args_with_cwd(resolved_args.clone(), &cwd);
     let string_args = resolved_args
         .iter()
         .map(|arg| arg.to_string_lossy().to_string())
@@ -3141,20 +3853,23 @@ fn run_client(args: Vec<OsString>) {
         .clone()
         .or(initial_config.service_tier);
     let initial_fast = is_fast_tier(initial_service_tier.as_deref());
+    let initial_fast_known = initial_service_tier.is_some();
     let thread_id = thread_id_from_args(&resolved_args);
     let resume_thread_id = thread_id.clone();
-    repair_resume_session_cwd(&resolved_args, &codex_cwd);
-    reinforce_loaded_resume_permissions(&paths.app_server_socket, &resolved_args, &codex_cwd);
+    let resume_configuration = resume_thread_id.as_ref().and_then(|_| {
+        resume_configuration_for_args(&original_args, default_configuration.as_ref())
+    });
     if let Some(thread_id) = thread_id.as_deref() {
-        spawn_resume_context_repair_watcher(thread_id, &codex_cwd);
-    }
-    if let Some(thread_id) = thread_id.as_deref()
-        && let Some(existing) = running_duplicate_thread_client(thread_id, std::process::id())
-    {
-        eprintln!(
-            "yolo: refusing duplicate resume for thread {thread_id}; already running in {existing}"
-        );
-        std::process::exit(2);
+        let mut duplicate_notice = false;
+        while let Some(existing) = running_duplicate_thread_client(thread_id, std::process::id()) {
+            if !duplicate_notice {
+                eprintln!(
+                    "yolo: duplicate resume for thread {thread_id} is active in {existing}; client will remain resident and retry"
+                );
+                duplicate_notice = true;
+            }
+            thread::sleep(CLIENT_RECOVERY_RETRY_DELAY);
+        }
     }
     let mut info = ClientInfo {
         id: client_id.clone(),
@@ -3167,6 +3882,9 @@ fn run_client(args: Vec<OsString>) {
         service_tier: initial_service_tier,
         reasoning_effort: launch_config.reasoning_effort,
         fast: initial_fast,
+        fast_known: initial_fast_known,
+        settings_source: "launch_args".to_string(),
+        settings_observed_at: Some(now_secs()),
         thread_id,
         thread_id_source: if resume_thread_id.is_some() {
             "resume_arg".to_string()
@@ -3209,7 +3927,7 @@ fn run_client(args: Vec<OsString>) {
     // connection until a later process scan reconstructed its command line.
     info.remote = remote.clone();
     let heartbeat_event_tx = event_tx.clone();
-    let seen_resume_generation = Arc::new(AtomicU64::new(current_restart_generation()));
+    let seen_resume_generation = Arc::new(AtomicU64::new(current_resume_generation()));
     let heartbeat_seen_generation = Arc::clone(&seen_resume_generation);
     let heartbeat_seen_settings_reconfigure_generation = Arc::new(AtomicU64::new(0));
     thread::spawn(move || {
@@ -3239,12 +3957,17 @@ fn run_client(args: Vec<OsString>) {
                             }
                         }
                     }
-                    if let Some(generation) = restart_generation_from_status(&value) {
+                    // A normal app-server restart or transport loss must never
+                    // proactively kill a terminal-bound Codex process. An
+                    // upgrade generation is only a deferred request here. The
+                    // client loop claims it after observing an idle thread;
+                    // the server performs the final idle check as well.
+                    if let Some(generation) = resume_generation_from_status(&value) {
                         let seen = heartbeat_seen_generation.load(Ordering::SeqCst);
                         if generation > seen {
                             heartbeat_seen_generation.store(generation, Ordering::SeqCst);
                             if heartbeat_event_tx
-                                .send(ClientEvent::RestartRequested)
+                                .send(ClientEvent::UpgradeResumeRequested)
                                 .is_err()
                             {
                                 return;
@@ -3257,73 +3980,137 @@ fn run_client(args: Vec<OsString>) {
         }
     });
 
-    let codex = codex_executable();
-    let mut command = Command::new(codex);
-    command
-        .current_dir(&cwd)
-        .arg("--remote")
-        .arg(&remote)
-        .args(yolo_mode_cli_args());
-    if resume_target_from_args(&resolved_args).is_some() {
-        command.arg("-c").arg("include_environment_context=false");
-    }
-    command
-        .args(&launch_args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            eprintln!("yolo: failed to spawn codex: {err}");
-            std::process::exit(127);
+    let mut active_args = resolved_args.clone();
+    let mut child_generation = 0_u64;
+    let mut child_pid = loop {
+        match spawn_and_register_codex_child(
+            &cwd,
+            &remote,
+            &active_args,
+            child_generation,
+            &mut info,
+            &event_tx,
+        ) {
+            Ok(pid) => break pid,
+            Err(err) => {
+                eprintln!("yolo: {err}; client wrapper remains resident and retries");
+                wait_for_client_transport(&paths);
+            }
         }
     };
-    let child_pid = child.id();
-
-    info.codex_pid = Some(child_pid);
-    info.updated_at = now_secs();
-    info.ended_at = None;
-    info.exit_code = None;
-    info.status = "running".to_string();
-    let _ = api_post_json(
-        "/clients/register",
-        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
-    );
-    if let Some(thread_id) = resume_thread_id {
-        spawn_loaded_resume_permissions_reinforcer(
-            paths.app_server_socket.clone(),
-            thread_id,
-            codex_cwd.clone(),
-        );
-    }
-
-    let child_event_tx = event_tx.clone();
-    thread::spawn(move || {
-        let result = child.wait().map_err(|err| err.to_string());
-        let _ = child_event_tx.send(ClientEvent::CodexExited(result));
-    });
-    drop(event_tx);
 
     let mut pending_settings_applied = None;
+    let mut resume_policy_requested = false;
+    let mut last_child_restart = None;
+    let mut pending_upgrade_resume = false;
+    let mut next_upgrade_reexec_attempt = None;
     loop {
-        match event_rx.recv() {
+        match event_rx.recv_timeout(CLIENT_RECOVERY_RETRY_DELAY) {
             Ok(ClientEvent::SettingsReconfigureRequested) => {
-                if let Some(proxy) = client_proxy.as_ref() {
-                    let _ = remove_socket_if_present(&proxy.socket_path);
-                    let _ = fs::remove_file(&proxy.pending_settings_path);
+                // The server sends this only after thread/settings/update has
+                // succeeded. Restart only the terminal-bound Codex child so
+                // the yolo wrapper itself remains alive. The wrapper may
+                // therefore continue supervising the session across settings
+                // changes, app-server outages, and proxy reconnects.
+                let settings = current_client_resume_settings(&client_id);
+                if settings.model.is_none()
+                    && settings.service_tier.is_none()
+                    && settings.reasoning_effort.is_none()
+                {
+                    eprintln!(
+                        "yolo: settings update for {client_id} had no launch settings; keeping current child"
+                    );
+                    continue;
                 }
-                terminate_pid_tree(child_pid, Duration::from_secs(5));
-                reexec_client_for_settings(&original_args, &client_id);
+                active_args = override_client_settings_args(
+                    if let Some(thread_id) = settings.thread_id.as_deref() {
+                        resume_args_for(&original_args, Some(thread_id))
+                    } else {
+                        original_args.clone()
+                    },
+                    &settings,
+                );
+                child_generation = child_generation.wrapping_add(1);
+                terminate_pid_tree(child_pid, CLIENT_CHILD_RESTART_TIMEOUT);
+                wait_for_client_transport(&paths);
+                loop {
+                    match spawn_and_register_codex_child(
+                        &cwd,
+                        &remote,
+                        &active_args,
+                        child_generation,
+                        &mut info,
+                        &event_tx,
+                    ) {
+                        Ok(pid) => {
+                            child_pid = pid;
+                            info.args = active_args
+                                .iter()
+                                .map(|arg| arg.to_string_lossy().to_string())
+                                .collect();
+                            last_child_restart = Some(Instant::now());
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("yolo: {err}; retrying settings child restart");
+                            wait_for_client_transport(&paths);
+                        }
+                    }
+                }
             }
-            Ok(ClientEvent::RestartRequested) => {
-                if let Some(proxy) = client_proxy.as_ref() {
-                    let _ = remove_socket_if_present(&proxy.socket_path);
-                    let _ = fs::remove_file(&proxy.pending_settings_path);
+            Ok(ClientEvent::UpgradeResumeRequested) => {
+                // Authentication and a server-side generation are only a
+                // request. Do not claim the permit, stop the child, or
+                // re-exec while the local thread is still working. The
+                // bottom-of-loop check retries after status events and on a
+                // timeout, so a turn-completed notification is sufficient to
+                // release the request without another heartbeat race.
+                pending_upgrade_resume = true;
+                next_upgrade_reexec_attempt = None;
+            }
+            Ok(ClientEvent::ProxyDisconnected { error }) => {
+                eprintln!(
+                    "yolo: client proxy lost the app-server transport: {error}; keeping yolo client resident"
+                );
+                if last_child_restart
+                    .is_some_and(|started| started.elapsed() < CLIENT_RESTART_DEBOUNCE)
+                {
+                    continue;
                 }
-                terminate_pid_tree(child_pid, Duration::from_secs(5));
-                reexec_client_for_resume(&original_args, &client_id);
+                child_generation = child_generation.wrapping_add(1);
+                terminate_pid_tree(child_pid, CLIENT_CHILD_RESTART_TIMEOUT);
+                wait_for_client_transport(&paths);
+                loop {
+                    match spawn_and_register_codex_child(
+                        &cwd,
+                        &remote,
+                        &active_args,
+                        child_generation,
+                        &mut info,
+                        &event_tx,
+                    ) {
+                        Ok(pid) => {
+                            child_pid = pid;
+                            last_child_restart = Some(Instant::now());
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("yolo: {err}; retrying after proxy recovery");
+                            wait_for_client_transport(&paths);
+                        }
+                    }
+                }
+            }
+            Ok(ClientEvent::ResumeBootstrapCompleted) => {
+                if !resume_policy_requested && let Some(thread_id) = resume_thread_id.as_deref() {
+                    resume_policy_requested = true;
+                    request_resume_policy_preparation(
+                        &client_id,
+                        thread_id,
+                        &codex_cwd,
+                        resume_configuration.as_ref(),
+                    );
+                }
             }
             Ok(ClientEvent::ThreadBound(thread_id)) => {
                 if info.thread_id.as_deref() != Some(thread_id.as_str())
@@ -3344,6 +4131,28 @@ fn run_client(args: Vec<OsString>) {
                     sync_applied_pending_settings(&client_id, &settings);
                 }
             }
+            Ok(ClientEvent::ThreadStatus {
+                thread_id,
+                status,
+                active_flags,
+            }) => {
+                if info.thread_id.as_deref().is_none()
+                    || info.thread_id.as_deref() == Some(thread_id.as_str())
+                {
+                    info.thread_id = Some(thread_id);
+                    if info.thread_id_source == "unresolved" {
+                        info.thread_id_source = "proxy".to_string();
+                    }
+                    info.codex_status = Some(status);
+                    info.codex_active_flags = active_flags;
+                    info.codex_status_updated_at = Some(now_secs());
+                    info.updated_at = now_secs();
+                    let _ = api_post_json(
+                        "/clients/register",
+                        &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                    );
+                }
+            }
             Ok(ClientEvent::PendingSettingsApplied(settings)) => {
                 apply_pending_settings_to_client_info(&mut info, &settings);
                 pending_settings_applied = Some(settings);
@@ -3362,6 +4171,12 @@ fn run_client(args: Vec<OsString>) {
                 turn_id,
                 prompt,
             }) => {
+                if info.thread_id.as_deref() == Some(thread_id.as_str()) {
+                    info.codex_status = Some("active".to_string());
+                    info.codex_active_flags.clear();
+                    info.codex_status_updated_at = Some(now_secs());
+                    info.updated_at = now_secs();
+                }
                 let _ = api_post_json(
                     "/turns/input",
                     &json!({
@@ -3371,42 +4186,126 @@ fn run_client(args: Vec<OsString>) {
                     }),
                 );
             }
-            Ok(ClientEvent::CodexExited(Ok(status))) => {
-                if let Some(proxy) = client_proxy.as_ref() {
-                    let _ = remove_socket_if_present(&proxy.socket_path);
-                    let _ = fs::remove_file(&proxy.pending_settings_path);
+            Ok(ClientEvent::CodexExited { generation, result }) => {
+                if generation != child_generation {
+                    continue;
                 }
-                if should_reexec_after_codex_exit(
-                    status.success(),
-                    &original_args,
-                    &seen_resume_generation,
-                ) {
-                    reexec_client_for_resume(&original_args, &client_id);
+                match result {
+                    Ok(status) if codex_child_exit_is_user_interrupt(&status) => {
+                        info.updated_at = now_secs();
+                        info.ended_at = Some(now_secs());
+                        info.status = "exited".to_string();
+                        info.exit_code = status.code().or(Some(130));
+                        let _ = api_post_json(
+                            "/clients/finish",
+                            &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                        );
+                        std::process::exit(info.exit_code.unwrap_or(130));
+                    }
+                    Ok(status) => {
+                        eprintln!(
+                            "yolo: codex child exited unexpectedly with status {status:?}; restarting child"
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("yolo: failed to wait for codex: {err}; restarting child");
+                    }
                 }
-                info.updated_at = now_secs();
-                info.ended_at = Some(now_secs());
-                info.status = "exited".to_string();
-                info.exit_code = status.code();
-                let _ = api_post_json(
-                    "/clients/finish",
-                    &serde_json::to_value(&info).unwrap_or_else(|_| json!({})),
+                child_generation = child_generation.wrapping_add(1);
+                wait_for_client_transport(&paths);
+                loop {
+                    match spawn_and_register_codex_child(
+                        &cwd,
+                        &remote,
+                        &active_args,
+                        child_generation,
+                        &mut info,
+                        &event_tx,
+                    ) {
+                        Ok(pid) => {
+                            child_pid = pid;
+                            last_child_restart = Some(Instant::now());
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("yolo: {err}; retrying after child exit");
+                            wait_for_client_transport(&paths);
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "yolo: client event channel closed unexpectedly; keeping wrapper resident"
                 );
-                std::process::exit(info.exit_code.unwrap_or(1));
+                thread::sleep(CLIENT_RECOVERY_RETRY_DELAY);
             }
-            Ok(ClientEvent::CodexExited(Err(err))) => {
-                if let Some(proxy) = client_proxy.as_ref() {
-                    let _ = remove_socket_if_present(&proxy.socket_path);
-                    let _ = fs::remove_file(&proxy.pending_settings_path);
+        }
+
+        if pending_upgrade_resume && client_is_waiting_for_upgrade(&info) {
+            let retry_allowed = next_upgrade_reexec_attempt
+                .map(|deadline| Instant::now() >= deadline)
+                .unwrap_or(true);
+            if retry_allowed {
+                match try_claim_upgrade_reexec_permit(&client_id) {
+                    Ok(UpgradeReexecClaimResult::Granted) => {
+                        next_upgrade_reexec_attempt = None;
+                        // The server's claim performs a second idle check. Repeat the
+                        // local check immediately before terminating the child as well;
+                        // a queued working/status event must never be treated as an exit
+                        // authorization.
+                        if client_is_waiting_for_upgrade(&info) {
+                            if let Some(proxy) = client_proxy.as_ref() {
+                                let _ = remove_socket_if_present(&proxy.socket_path);
+                                let _ = fs::remove_file(&proxy.pending_settings_path);
+                            }
+                            terminate_pid_tree(child_pid, CLIENT_CHILD_RESTART_TIMEOUT);
+                            reexec_client_for_resume(&original_args, &client_id);
+                        }
+                    }
+                    Ok(
+                        UpgradeReexecClaimResult::GateAbsent
+                        | UpgradeReexecClaimResult::ClientUnknown,
+                    ) => {
+                        // The generation notification may outlive the serialized
+                        // server-side gate (for example when a restart follows a
+                        // timed-out migration). Do not retain a stale request and
+                        // emit a claim failure on every idle transition forever.
+                        pending_upgrade_resume = false;
+                        next_upgrade_reexec_attempt = None;
+                    }
+                    Ok(
+                        UpgradeReexecClaimResult::WaitingStateAbsent
+                        | UpgradeReexecClaimResult::NotClientTurn,
+                    ) => {
+                        // A real gate may still be active for another client, or the
+                        // server may have observed a newer working status. Keep the
+                        // request but avoid a one-second log/HTTP retry loop.
+                        next_upgrade_reexec_attempt =
+                            Some(Instant::now() + UPGRADE_REEXEC_RETRY_DELAY);
+                    }
+                    Ok(UpgradeReexecClaimResult::Unknown) => {
+                        // Keep compatibility with an older server that does not
+                        // return a claim reason, but bound the retry rate.
+                        next_upgrade_reexec_attempt =
+                            Some(Instant::now() + UPGRADE_REEXEC_RETRY_DELAY);
+                    }
+                    Err(err) => {
+                        next_upgrade_reexec_attempt =
+                            Some(Instant::now() + UPGRADE_REEXEC_RETRY_DELAY);
+                        eprintln!(
+                            "yolo: cannot verify upgrade-resume gate for {client_id}; retrying: {err}"
+                        );
+                    }
                 }
-                eprintln!("yolo: failed to wait for codex: {err}");
-                std::process::exit(1);
             }
-            Err(_) => std::process::exit(1),
         }
     }
 }
 
 fn run_native_codex_passthrough(args: Vec<OsString>) -> ! {
+    apply_client_scope_memory_budget();
     let cwd = env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
@@ -3420,7 +4319,6 @@ fn run_native_codex_passthrough(args: Vec<OsString>) -> ! {
         }
     };
     ensure_codex_project_trusted(&codex_cwd);
-    repair_resume_session_cwd(&resolved_args, &codex_cwd);
     let default_configuration = yolo_default_configuration_from_server();
     let resolved_args = strip_conflicting_yolo_options(with_yolo_session_defaults(
         resolved_args,
@@ -3435,6 +4333,74 @@ fn run_native_codex_passthrough(args: Vec<OsString>) -> ! {
     let err = command.args(&launch_args).exec();
     eprintln!("yolo codex: failed to exec native codex: {err}");
     std::process::exit(127);
+}
+
+fn apply_client_scope_memory_budget() {
+    let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") else {
+        return;
+    };
+    let Some(scope) = cgroup.lines().find_map(|line| {
+        let path = line.strip_prefix("0::")?.trim();
+        let unit = Path::new(path).file_name()?.to_str()?;
+        (unit.starts_with("tmux-spawn-") && unit.ends_with(".scope")).then(|| unit.to_string())
+    }) else {
+        return;
+    };
+
+    let memory_high = format!("MemoryHigh={CLIENT_SCOPE_MEMORY_HIGH}");
+    let memory_max = format!("MemoryMax={CLIENT_SCOPE_MEMORY_MAX}");
+    let memory_swap_max = format!("MemorySwapMax={CLIENT_SCOPE_MEMORY_SWAP_MAX}");
+    let result = Command::new("systemctl")
+        .args([
+            "--user",
+            "set-property",
+            "--runtime",
+            scope.as_str(),
+            memory_high.as_str(),
+            memory_max.as_str(),
+            memory_swap_max.as_str(),
+        ])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            eprintln!(
+                "yolo: failed to apply client scope memory budget to {scope}: {}",
+                if detail.is_empty() {
+                    format!("systemctl exited with {}", output.status)
+                } else {
+                    detail
+                }
+            );
+        }
+        Err(err) => eprintln!("yolo: failed to apply client scope memory budget to {scope}: {err}"),
+    }
+}
+
+fn request_resume_policy_preparation(
+    client_id: &str,
+    thread_id: &str,
+    cwd: &str,
+    configuration: Option<&YoloDefaultConfiguration>,
+) {
+    // Resume policy belongs to the yolo server, which owns the app-server
+    // connection. The client only submits a bounded launch intent; it never
+    // scans or rewrites Codex rollout/state files on the normal launch path.
+    let request = PrepareResumeRequest {
+        client_id: client_id.to_string(),
+        thread_id: thread_id.to_string(),
+        cwd: cwd.to_string(),
+        configuration: configuration.cloned(),
+    };
+    if let Err(err) = api_post_json(
+        "/clients/prepare-resume",
+        &serde_json::to_value(request).unwrap_or_else(|_| json!({})),
+    ) {
+        eprintln!(
+            "yolo: failed to schedule server-side resume policy preparation for {thread_id}: {err}"
+        );
+    }
 }
 
 fn codex_args_with_cwd(args: Vec<OsString>, cwd: &str) -> Vec<OsString> {
@@ -3581,12 +4547,20 @@ fn resolve_resume_last_args(args: &[OsString], cwd: &str) -> Result<Vec<OsString
     if resume_target_from_args(args) != Some(ResumeTarget::Last) {
         return Ok(args.to_vec());
     }
-    let Some(candidate) = latest_resume_candidate_for_cwd(cwd) else {
-        return Err(format!(
-            "refusing resume --last for {cwd}: no non-running Codex session with matching cwd"
-        ));
-    };
-    replace_resume_last_with_thread(args, &candidate.id)
+    let value = api_post_json("/resume/resolve-last", &json!({"cwd": cwd}))?;
+    if value.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("server could not resolve resume --last")
+            .to_string());
+    }
+    let thread_id = value
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .filter(|thread_id| !thread_id.trim().is_empty())
+        .ok_or_else(|| format!("server returned no resume thread for {cwd}"))?;
+    replace_resume_last_with_thread(args, thread_id)
 }
 
 fn resolve_resume_last_args_without_api(
@@ -3634,12 +4608,6 @@ fn replace_resume_last_with_thread(
     }
 }
 
-fn latest_resume_candidate_for_cwd(cwd: &str) -> Option<SessionCandidate> {
-    latest_resume_candidate_for_cwd_from(session_candidates(), cwd, |candidate| {
-        resume_candidate_unavailable(candidate, std::process::id())
-    })
-}
-
 fn latest_resume_candidate_for_cwd_from<F>(
     candidates: Vec<SessionCandidate>,
     cwd: &str,
@@ -3653,37 +4621,6 @@ where
         .filter(|candidate| candidate.cwd.as_deref() == Some(cwd))
         .max_by_key(|candidate| candidate.modified)
         .filter(|candidate| !is_unavailable(candidate))
-}
-
-fn resume_candidate_unavailable(candidate: &SessionCandidate, current_pid: u32) -> bool {
-    if running_duplicate_thread_client(&candidate.id, current_pid).is_some() {
-        return true;
-    }
-    thread_was_updated_after_yolo_exit(&candidate.id, candidate.modified)
-}
-
-fn thread_was_updated_after_yolo_exit(thread_id: &str, modified: SystemTime) -> bool {
-    let Some(modified_secs) = modified
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
-    else {
-        return false;
-    };
-    let Ok(value) = api_get_json("/clients") else {
-        return false;
-    };
-    let Some(clients) = value.get("clients").and_then(Value::as_array) else {
-        return false;
-    };
-    clients.iter().any(|client| {
-        client.get("thread_id").and_then(Value::as_str) == Some(thread_id)
-            && client.get("status").and_then(Value::as_str) == Some("exited")
-            && client
-                .get("ended_at")
-                .and_then(Value::as_u64)
-                .is_some_and(|ended_at| modified_secs > ended_at.saturating_add(5))
-    })
 }
 
 fn session_candidates() -> Vec<SessionCandidate> {
@@ -3708,66 +4645,69 @@ fn session_candidates() -> Vec<SessionCandidate> {
         .collect()
 }
 
-fn repair_resume_session_cwd(args: &[OsString], cwd: &str) {
-    let Some(target) = resume_target_from_args(args) else {
-        return;
-    };
-    if let Err(err) = repair_resume_target(&target, cwd) {
-        eprintln!(
-            "yolo: failed to repair Codex resume state for {:?}: {err}",
-            target
-        );
-    }
-}
-
-fn reinforce_loaded_resume_permissions(socket: &Path, args: &[OsString], cwd: &str) {
-    let Some(thread_id) = resume_thread_id(args) else {
-        return;
-    };
-    if let Err(err) = update_app_server_resume_thread_settings(socket, &thread_id, cwd) {
-        if !is_app_server_thread_not_found_error(&err, &thread_id) {
-            eprintln!("yolo: failed to update loaded Codex thread settings for {thread_id}: {err}");
+fn resolve_resume_last_thread_on_server(
+    state: &Arc<Mutex<ServerState>>,
+    cwd: &str,
+) -> Option<String> {
+    let current_pid = std::process::id();
+    latest_resume_candidate_for_cwd_from(session_candidates(), cwd, |candidate| {
+        if running_duplicate_thread_process(&candidate.id, current_pid).is_some() {
+            return true;
         }
-    }
-}
-
-fn spawn_loaded_resume_permissions_reinforcer(socket: PathBuf, thread_id: String, cwd: String) {
-    thread::spawn(move || {
-        let start = Instant::now();
-        loop {
-            let err = match update_app_server_resume_thread_settings(&socket, &thread_id, &cwd) {
-                Ok(()) => return,
-                Err(err) => err,
-            };
-            if start.elapsed() >= RESUME_PERMISSIONS_REINFORCE_TIMEOUT {
-                if is_app_server_thread_not_found_error(&err, &thread_id) {
-                    eprintln!(
-                        "yolo: Codex thread {thread_id} was not loaded before permissions reinforcement timed out"
-                    );
-                } else {
-                    eprintln!(
-                        "yolo: failed to reinforce loaded Codex thread settings for {thread_id}: {err}"
-                    );
-                }
-                return;
+        let Some(modified_secs) = candidate
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+        else {
+            return false;
+        };
+        let Ok(state) = state.lock() else {
+            return false;
+        };
+        state.clients.values().any(|client| {
+            if client.thread_id.as_deref() != Some(candidate.id.as_str()) {
+                return false;
             }
-            thread::sleep(RESUME_PERMISSIONS_REINFORCE_INTERVAL);
-        }
-    });
+            if matches!(client.status.as_str(), "running" | "restarting") {
+                return true;
+            }
+            client.status == "exited"
+                && client
+                    .ended_at
+                    .is_some_and(|ended_at| modified_secs > ended_at.saturating_add(5))
+        })
+    })
+    .map(|candidate| candidate.id)
 }
 
 fn is_app_server_thread_not_found_error(err: &str, thread_id: &str) -> bool {
     err.contains(&format!("thread not found: {thread_id}"))
 }
 
-fn resume_thread_id(args: &[OsString]) -> Option<String> {
-    let target = resume_target_from_args(args)?;
-    match target {
-        ResumeTarget::Thread(thread_id) => Some(thread_id),
-        ResumeTarget::Last => session_path_for_resume_target(&ResumeTarget::Last)
+fn resume_configuration_for_args(
+    args: &[OsString],
+    default_configuration: Option<&YoloDefaultConfiguration>,
+) -> Option<YoloDefaultConfiguration> {
+    let default_configuration = default_configuration?;
+    let strings = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let explicit = parse_codex_launch_config(&strings);
+    Some(YoloDefaultConfiguration {
+        model: explicit
+            .model
+            .unwrap_or_else(|| default_configuration.model.clone()),
+        reasoning_effort: explicit
+            .reasoning_effort
+            .unwrap_or_else(|| default_configuration.reasoning_effort.clone()),
+        fast: explicit
+            .service_tier
             .as_deref()
-            .and_then(session_id_from_path),
-    }
+            .map(|tier| is_fast_tier(Some(tier)))
+            .unwrap_or(default_configuration.fast),
+    })
 }
 
 fn resume_target_from_args(args: &[OsString]) -> Option<ResumeTarget> {
@@ -3811,44 +4751,6 @@ fn session_path_for_resume_target(target: &ResumeTarget) -> Option<PathBuf> {
 
 fn repair_resume_thread_id(thread_id: &str, cwd: &str) -> Result<(), String> {
     repair_resume_target(&ResumeTarget::Thread(thread_id.to_string()), cwd)
-}
-
-fn spawn_resume_context_repair_watcher(thread_id: &str, cwd: &str) {
-    let thread_id = thread_id.to_string();
-    let cwd = cwd.to_string();
-    thread::spawn(move || {
-        let mut last_modified = None;
-        let mut stable_checks = 0_u8;
-        let started = Instant::now();
-        while started.elapsed() < RESUME_CONTEXT_REPAIR_WATCH_TIMEOUT {
-            let target = ResumeTarget::Thread(thread_id.clone());
-            if let Some(path) = session_path_for_resume_target(&target) {
-                let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
-                if modified.is_some() && modified != last_modified {
-                    match rewrite_session_meta_cwd(&path, &cwd) {
-                        Ok(true) => stable_checks = 0,
-                        Ok(false) => {
-                            stable_checks = stable_checks.saturating_add(1);
-                            if stable_checks >= 2 {
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "yolo: failed to repair Codex rollout context for {}: {err}",
-                                path.display()
-                            );
-                        }
-                    }
-                    last_modified = fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .or(modified);
-                }
-            }
-            thread::sleep(RESUME_CONTEXT_REPAIR_WATCH_INTERVAL);
-        }
-    });
 }
 
 fn repair_resume_target(target: &ResumeTarget, cwd: &str) -> Result<(), String> {
@@ -3896,31 +4798,36 @@ fn session_id_from_path(path: &Path) -> Option<String> {
 fn session_meta_from_path(path: &Path) -> (Option<String>, Option<String>) {
     let mut id = None;
     let mut cwd = None;
-    if let Ok(input) = fs::read_to_string(path) {
-        for line in input.lines().take(20) {
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-                continue;
-            }
-            if id.is_none() {
-                id = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("id"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-            }
-            if cwd.is_none() {
-                cwd = value
-                    .get("payload")
-                    .and_then(|payload| payload.get("cwd"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-            }
-            if id.is_some() && cwd.is_some() {
-                break;
-            }
+    let Ok(input) = fs::File::open(path) else {
+        return (id, cwd);
+    };
+    let reader = BufReader::new(input);
+    for line in reader.lines().take(20) {
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        if id.is_none() {
+            id = value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        if cwd.is_none() {
+            cwd = value
+                .get("payload")
+                .and_then(|payload| payload.get("cwd"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        if id.is_some() && cwd.is_some() {
+            break;
         }
     }
     (id, cwd)
@@ -3999,84 +4906,199 @@ fn sqlite_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<bool, String> {
-    let input = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let mut changed = false;
-    let mut output = String::with_capacity(input.len());
-    for line in input.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let raw = line.trim_end_matches('\n');
-        if raw.contains("\"session_meta\"") || raw.contains("\"turn_context\"") {
-            if let Ok(mut value) = serde_json::from_str::<Value>(raw)
-                && matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("session_meta" | "turn_context")
-                )
-            {
-                let is_turn_context =
-                    value.get("type").and_then(Value::as_str) == Some("turn_context");
-                if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
-                    if payload.get("cwd").and_then(Value::as_str) != Some(cwd) {
-                        payload.insert("cwd".to_string(), Value::String(cwd.to_string()));
+fn session_rewrite_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rollout.jsonl");
+    path.with_file_name(format!(
+        ".{file_name}.yolo-rewrite-{}-{}.tmp",
+        std::process::id(),
+        now_millis()
+    ))
+}
+
+fn rewrite_session_line(line: &[u8], cwd: &str) -> Result<Option<Vec<u8>>, String> {
+    let has_newline = line.last() == Some(&b'\n');
+    let raw = if has_newline {
+        &line[..line.len().saturating_sub(1)]
+    } else {
+        line
+    };
+    let Ok(raw_text) = std::str::from_utf8(raw) else {
+        return Ok(None);
+    };
+
+    if raw_text.contains("\"session_meta\"") || raw_text.contains("\"turn_context\"") {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(raw)
+            && matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("session_meta" | "turn_context")
+            )
+        {
+            let is_turn_context = value.get("type").and_then(Value::as_str) == Some("turn_context");
+            let mut changed = false;
+            if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+                if payload.get("cwd").and_then(Value::as_str) != Some(cwd) {
+                    payload.insert("cwd".to_string(), Value::String(cwd.to_string()));
+                    changed = true;
+                }
+                if is_turn_context {
+                    let workspace_roots = json!([cwd]);
+                    if payload.get("workspace_roots") != Some(&workspace_roots) {
+                        payload.insert("workspace_roots".to_string(), workspace_roots);
                         changed = true;
                     }
-                    if is_turn_context {
-                        let workspace_roots = json!([cwd]);
-                        if payload.get("workspace_roots") != Some(&workspace_roots) {
-                            payload.insert("workspace_roots".to_string(), workspace_roots);
-                            changed = true;
-                        }
-                        let sandbox = json!({"type": "danger-full-access"});
-                        if payload.get("sandbox_policy") != Some(&sandbox) {
-                            payload.insert("sandbox_policy".to_string(), sandbox);
-                            changed = true;
-                        }
-                        if payload.get("approval_policy").and_then(Value::as_str) != Some("never") {
-                            payload.insert(
-                                "approval_policy".to_string(),
-                                Value::String("never".to_string()),
-                            );
-                            changed = true;
-                        }
-                        let permission_profile = json!({"type": "disabled"});
-                        if payload.get("permission_profile") != Some(&permission_profile) {
-                            payload.insert("permission_profile".to_string(), permission_profile);
-                            changed = true;
-                        }
+                    let sandbox = json!({"type": "danger-full-access"});
+                    if payload.get("sandbox_policy") != Some(&sandbox) {
+                        payload.insert("sandbox_policy".to_string(), sandbox);
+                        changed = true;
                     }
-                    output.push_str(&serde_json::to_string(&value).map_err(|err| err.to_string())?);
-                    if has_newline {
-                        output.push('\n');
+                    if payload.get("approval_policy").and_then(Value::as_str) != Some("never") {
+                        payload.insert(
+                            "approval_policy".to_string(),
+                            Value::String("never".to_string()),
+                        );
+                        changed = true;
                     }
-                    continue;
+                    let permission_profile = json!({"type": "disabled"});
+                    if payload.get("permission_profile") != Some(&permission_profile) {
+                        payload.insert("permission_profile".to_string(), permission_profile);
+                        changed = true;
+                    }
                 }
             }
-        }
-        if raw.contains("<permissions instructions>")
-            || raw.contains("<environment_context>")
-            || raw.contains("sandbox_mode")
-        {
-            if let Ok(mut value) = serde_json::from_str::<Value>(raw)
-                && value.get("type").and_then(Value::as_str) == Some("response_item")
-                && repair_resume_context_message(&mut value, cwd)
-            {
-                changed = true;
-                output.push_str(&serde_json::to_string(&value).map_err(|err| err.to_string())?);
+            if changed {
+                let mut replacement = serde_json::to_vec(&value).map_err(|err| err.to_string())?;
                 if has_newline {
-                    output.push('\n');
+                    replacement.push(b'\n');
                 }
-                continue;
+                return Ok(Some(replacement));
             }
         }
-        output.push_str(raw);
-        if has_newline {
-            output.push('\n');
+    }
+
+    if raw_text.contains("<permissions instructions>")
+        || raw_text.contains("<environment_context>")
+        || raw_text.contains("sandbox_mode")
+    {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(raw)
+            && value.get("type").and_then(Value::as_str) == Some("response_item")
+            && repair_resume_context_message(&mut value, cwd)
+        {
+            let mut replacement = serde_json::to_vec(&value).map_err(|err| err.to_string())?;
+            if has_newline {
+                replacement.push(b'\n');
+            }
+            return Ok(Some(replacement));
         }
     }
-    if changed {
-        fs::write(path, output).map_err(|err| err.to_string())?;
+
+    Ok(None)
+}
+
+fn write_session_line<W: Write>(
+    writer: &mut W,
+    line: &[u8],
+    cwd: &str,
+    changed: &mut bool,
+) -> Result<(), String> {
+    if let Some(replacement) = rewrite_session_line(line, cwd)? {
+        writer
+            .write_all(&replacement)
+            .map_err(|err| err.to_string())?;
+        *changed = true;
+    } else {
+        writer.write_all(line).map_err(|err| err.to_string())?;
     }
-    Ok(changed)
+    Ok(())
+}
+
+fn rewrite_session_meta_cwd(path: &Path, cwd: &str) -> Result<bool, String> {
+    // Rollout JSONL can contain gigabytes of command output. Never materialize
+    // the whole file; large individual records are copied without parsing.
+    let input = fs::File::open(path).map_err(|err| err.to_string())?;
+    let permissions = input
+        .metadata()
+        .map_err(|err| err.to_string())?
+        .permissions();
+    let temp_path = session_rewrite_temp_path(path);
+    let temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|err| err.to_string())?;
+    if let Err(err) = fs::set_permissions(&temp_path, permissions) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+
+    let mut changed = false;
+    let result = (|| -> Result<(), String> {
+        let mut reader = BufReader::new(input);
+        let mut writer = BufWriter::new(temp_file);
+        let mut line = Vec::with_capacity(8192);
+
+        'lines: loop {
+            line.clear();
+            let mut saw_any = false;
+            let mut oversized = false;
+
+            loop {
+                let buffer = reader.fill_buf().map_err(|err| err.to_string())?;
+                if buffer.is_empty() {
+                    if !saw_any {
+                        break 'lines;
+                    }
+                    if !oversized {
+                        write_session_line(&mut writer, &line, cwd, &mut changed)?;
+                    }
+                    break;
+                }
+
+                saw_any = true;
+                let newline = buffer.iter().position(|byte| *byte == b'\n');
+                let take_len = newline.map_or(buffer.len(), |offset| offset + 1);
+                if !oversized
+                    && line.len().saturating_add(take_len) <= MAX_SESSION_REPAIR_LINE_BYTES
+                {
+                    line.extend_from_slice(&buffer[..take_len]);
+                } else {
+                    if !oversized {
+                        writer.write_all(&line).map_err(|err| err.to_string())?;
+                        line.clear();
+                        oversized = true;
+                    }
+                    writer
+                        .write_all(&buffer[..take_len])
+                        .map_err(|err| err.to_string())?;
+                }
+                reader.consume(take_len);
+
+                if newline.is_some() {
+                    if !oversized {
+                        write_session_line(&mut writer, &line, cwd, &mut changed)?;
+                    }
+                    break;
+                }
+            }
+        }
+        writer.flush().map_err(|err| err.to_string())
+    })();
+
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    if !changed {
+        let _ = fs::remove_file(&temp_path);
+        return Ok(false);
+    }
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        err.to_string()
+    })?;
+    Ok(true)
 }
 
 fn repair_resume_context_message(value: &mut Value, cwd: &str) -> bool {
@@ -4164,6 +5186,9 @@ mod tests {
             service_tier: None,
             reasoning_effort: None,
             fast: false,
+            fast_known: false,
+            settings_source: "unknown".to_string(),
+            settings_observed_at: None,
             thread_id: thread_id.map(ToString::to_string),
             thread_id_source: if thread_id.is_some() && args.iter().any(|arg| *arg == "resume") {
                 "resume_arg".to_string()
@@ -4200,7 +5225,256 @@ mod tests {
             federation_push_senders: BTreeMap::new(),
             status_event_senders: BTreeMap::new(),
             next_status_event_id: 0,
+            upgrade_reexec_queue: VecDeque::new(),
+            upgrade_reexec_active: None,
         }
+    }
+
+    #[test]
+    fn upgrade_resume_waits_for_local_idle_status_before_reexec() {
+        let mut client = test_client(
+            "client",
+            &["resume", "thread-client"],
+            "/tmp/client",
+            Some("thread-client"),
+        );
+        assert!(!client_is_waiting_for_upgrade(&client));
+
+        client.codex_status = Some("idle".to_string());
+        client.codex_status_updated_at = Some(now_secs());
+        assert!(client_is_waiting_for_upgrade(&client));
+
+        client
+            .codex_active_flags
+            .push("waiting_on_approval".to_string());
+        assert!(!client_is_waiting_for_upgrade(&client));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_sigint_child_exit_is_terminal() {
+        assert!(codex_child_exit_is_user_interrupt(&ExitStatus::from_raw(2)));
+        assert!(codex_child_exit_is_user_interrupt(&ExitStatus::from_raw(
+            130 << 8
+        )));
+        assert!(!codex_child_exit_is_user_interrupt(&ExitStatus::from_raw(
+            1 << 8
+        )));
+    }
+
+    #[test]
+    fn upgrade_memory_headroom_scales_with_client_count() {
+        let required = upgrade_memory_requirement_bytes(4);
+        assert!(upgrade_memory_headroom_sufficient(
+            required,
+            Some(UPGRADE_MIN_SWAP_FREE_MIB * 1024 * 1024),
+            4
+        ));
+        assert!(!upgrade_memory_headroom_sufficient(
+            required - 1,
+            Some(UPGRADE_MIN_SWAP_FREE_MIB * 1024 * 1024),
+            4
+        ));
+        assert!(!upgrade_memory_headroom_sufficient(
+            required,
+            Some(UPGRADE_MIN_SWAP_FREE_MIB * 1024 * 1024 - 1),
+            4
+        ));
+    }
+
+    #[test]
+    fn upgrade_reexec_gate_allows_only_one_client_at_a_time() {
+        let mut first = test_client(
+            "first",
+            &["resume", "thread-first"],
+            "/tmp/first",
+            Some("thread-first"),
+        );
+        first.yolo_pid = 11;
+        first.codex_status = Some("idle".to_string());
+        first.codex_status_updated_at = Some(now_secs());
+        first.updated_at = now_secs();
+        let mut second = test_client(
+            "second",
+            &["resume", "thread-second"],
+            "/tmp/second",
+            Some("thread-second"),
+        );
+        second.yolo_pid = 22;
+        second.codex_status = Some("waiting".to_string());
+        second.codex_status_updated_at = Some(now_secs());
+        second.updated_at = now_secs();
+        let state = Arc::new(Mutex::new(test_state(vec![first, second])));
+        let request = UpgradeResumeAllRequest::default();
+
+        assert_eq!(prepare_upgrade_reexec_gate(&state, &request), 2);
+        assert!(claim_upgrade_reexec_permit(&state, "first").unwrap());
+        assert!(!claim_upgrade_reexec_permit(&state, "second").unwrap());
+        {
+            let mut state = state.lock().unwrap();
+            release_upgrade_reexec_permit_locked(&mut state, 11);
+        }
+        assert!(claim_upgrade_reexec_permit(&state, "second").unwrap());
+    }
+
+    #[test]
+    fn upgrade_reexec_gate_can_limit_migration_to_selected_clients() {
+        let mut first = test_client(
+            "first",
+            &["resume", "thread-first"],
+            "/tmp/first",
+            Some("thread-first"),
+        );
+        first.yolo_pid = 11;
+        first.codex_status = Some("idle".to_string());
+        first.codex_status_updated_at = Some(now_secs());
+        let mut second = test_client(
+            "second",
+            &["resume", "thread-second"],
+            "/tmp/second",
+            Some("thread-second"),
+        );
+        second.yolo_pid = 22;
+        second.codex_status = Some("idle".to_string());
+        second.codex_status_updated_at = Some(now_secs());
+        second.updated_at = now_secs();
+        let state = Arc::new(Mutex::new(test_state(vec![first, second])));
+        let selected = BTreeSet::from(["second".to_string()]);
+
+        assert_eq!(
+            prepare_upgrade_reexec_gate_for_client_ids(
+                &state,
+                &selected,
+                &UpgradeResumeAllRequest::default()
+            ),
+            1
+        );
+        assert!(!claim_upgrade_reexec_permit(&state, "first").unwrap());
+        assert!(claim_upgrade_reexec_permit(&state, "second").unwrap());
+    }
+
+    #[test]
+    fn upgrade_reexec_claim_requires_explicit_gate_and_waiting_state() {
+        let mut client = test_client(
+            "client",
+            &["resume", "thread-client"],
+            "/tmp/client",
+            Some("thread-client"),
+        );
+        client.codex_status = Some("idle".to_string());
+        client.codex_status_updated_at = Some(now_secs());
+        client.updated_at = now_secs();
+        let state = Arc::new(Mutex::new(test_state(vec![client])));
+
+        // An idle client is still not allowed to re-exec unless an explicit
+        // upgrade-resume operation installed the gate.
+        assert!(!claim_upgrade_reexec_permit(&state, "client").unwrap());
+
+        assert_eq!(
+            prepare_upgrade_reexec_gate(&state, &UpgradeResumeAllRequest::default()),
+            1
+        );
+        assert!(claim_upgrade_reexec_permit(&state, "client").unwrap());
+    }
+
+    #[test]
+    fn upgrade_reexec_claim_reports_absent_gate_for_stale_requests() {
+        let mut client = test_client(
+            "client",
+            &["resume", "thread-client"],
+            "/tmp/client",
+            Some("thread-client"),
+        );
+        client.codex_status = Some("idle".to_string());
+        client.codex_status_updated_at = Some(now_secs());
+        client.updated_at = now_secs();
+        let state = Arc::new(Mutex::new(test_state(vec![client])));
+
+        assert_eq!(
+            claim_upgrade_reexec_permit_result(&state, "client").unwrap(),
+            UpgradeReexecClaimResult::GateAbsent
+        );
+    }
+
+    #[test]
+    fn upgrade_reexec_claim_rejects_active_or_unknown_client_status() {
+        for status in [None, Some("active"), Some("notLoaded")] {
+            let mut client = test_client(
+                "client",
+                &["resume", "thread-client"],
+                "/tmp/client",
+                Some("thread-client"),
+            );
+            client.codex_status = status.map(ToString::to_string);
+            client.codex_status_updated_at = Some(now_secs());
+            let state = Arc::new(Mutex::new(test_state(vec![client])));
+            assert_eq!(
+                prepare_upgrade_reexec_gate(&state, &UpgradeResumeAllRequest::default()),
+                1
+            );
+            assert!(!claim_upgrade_reexec_permit(&state, "client").unwrap());
+        }
+    }
+
+    #[test]
+    fn upgrade_idle_wait_requires_explicit_waiting_snapshot() {
+        let client = test_client(
+            "client",
+            &["resume", "thread-client"],
+            "/tmp/client",
+            Some("thread-client"),
+        );
+        let statuses = ["active", "notLoaded", "unknown"];
+        for status in statuses {
+            let snapshot = vec![AppThreadSnapshot {
+                id: "thread-client".to_string(),
+                cwd: "/tmp/client".to_string(),
+                status: status.to_string(),
+                active_flags: Vec::new(),
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+            }];
+            assert!(!client_is_waiting_in_snapshot(&client, &snapshot));
+        }
+
+        let waiting_snapshot = vec![AppThreadSnapshot {
+            id: "thread-client".to_string(),
+            cwd: "/tmp/client".to_string(),
+            status: "idle".to_string(),
+            active_flags: Vec::new(),
+            model: None,
+            service_tier: None,
+            reasoning_effort: None,
+        }];
+        assert!(client_is_waiting_in_snapshot(&client, &waiting_snapshot));
+    }
+
+    #[test]
+    fn upgrade_idle_wait_rejects_ambiguous_or_missing_client_thread() {
+        let client = test_client("client", &[], "/tmp/client", None);
+        let snapshot = vec![
+            AppThreadSnapshot {
+                id: "thread-a".to_string(),
+                cwd: "/tmp/client".to_string(),
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+            },
+            AppThreadSnapshot {
+                id: "thread-b".to_string(),
+                cwd: "/tmp/client".to_string(),
+                status: "idle".to_string(),
+                active_flags: Vec::new(),
+                model: None,
+                service_tier: None,
+                reasoning_effort: None,
+            },
+        ];
+        assert!(!client_is_waiting_in_snapshot(&client, &snapshot));
+        assert!(!client_is_waiting_in_snapshot(&client, &[]));
     }
 
     #[test]
@@ -4218,6 +5492,10 @@ mod tests {
             service_tier: Some("default".to_string()),
             reasoning_effort: Some("low".to_string()),
             fast: false,
+            fast_known: true,
+            settings_complete: true,
+            settings_source: "app_server".to_string(),
+            settings_observed_at: Some(43),
             thread_id: Some("thread-1".to_string()),
             thread_id_source: "resume_arg".to_string(),
             started_at: 42,
@@ -4232,6 +5510,44 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        fs::remove_file(path).expect("remove test sessions file");
+    }
+
+    #[test]
+    fn active_sessions_v1_migrates_complete_settings_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "yolo-active-sessions-v1-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "saved_at": 42,
+                "sessions": [{
+                    "client_id": "client-v1",
+                    "cwd": "/tmp/project",
+                    "args": ["resume", "thread-v1"],
+                    "model": "gpt-5.6-luna",
+                    "service_tier": "priority",
+                    "reasoning_effort": "max",
+                    "fast": true,
+                    "thread_id": "thread-v1",
+                    "thread_id_source": "resume_arg",
+                    "started_at": 42
+                }]
+            }"#,
+        )
+        .expect("write v1 sessions");
+
+        let record = load_active_sessions(&path)
+            .remove("client-v1")
+            .expect("migrated v1 record");
+        assert!(record.fast_known);
+        assert!(record.settings_complete);
+        assert_eq!(record.settings_source, "legacy");
 
         fs::remove_file(path).expect("remove test sessions file");
     }
@@ -4277,6 +5593,10 @@ mod tests {
                 service_tier: None,
                 reasoning_effort: None,
                 fast: false,
+                fast_known: false,
+                settings_complete: false,
+                settings_source: "unknown".to_string(),
+                settings_observed_at: None,
                 thread_id: client.thread_id.clone(),
                 thread_id_source: "resume_arg".to_string(),
                 started_at: 1,
@@ -4290,6 +5610,113 @@ mod tests {
         assert!(upsert_active_session_locked(&mut state, &client));
         assert!(state.active_sessions.contains_key("client-2"));
         assert!(!state.active_sessions.contains_key("old-client"));
+    }
+
+    #[test]
+    fn active_session_upsert_preserves_complete_settings_from_incomplete_scan() {
+        let mut saved = test_client(
+            "saved-client",
+            &["resume", "thread-settings", "--model", "gpt-5.6-luna"],
+            "/tmp/project",
+            Some("thread-settings"),
+        );
+        saved.model = Some("gpt-5.6-luna".to_string());
+        saved.service_tier = Some("priority".to_string());
+        saved.reasoning_effort = Some("max".to_string());
+        saved.fast = true;
+        saved.fast_known = true;
+        saved.settings_source = "app_server".to_string();
+        saved.settings_observed_at = Some(100);
+        saved.updated_at = 100;
+
+        let mut state = test_state(Vec::new());
+        state
+            .active_sessions
+            .insert(saved.id.clone(), active_session_record_from_client(&saved));
+
+        let scanned = test_client(
+            "scanned-client",
+            &["resume", "thread-settings"],
+            "/tmp/project",
+            Some("thread-settings"),
+        );
+        assert!(upsert_active_session_locked(&mut state, &scanned));
+
+        let record = state
+            .active_sessions
+            .get("scanned-client")
+            .expect("rebound session record");
+        assert_eq!(record.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(record.service_tier.as_deref(), Some("priority"));
+        assert_eq!(record.reasoning_effort.as_deref(), Some("max"));
+        assert!(record.fast);
+        assert!(record.fast_known);
+        assert!(record.settings_complete);
+        assert_eq!(record.settings_source, "app_server");
+        assert!(!state.active_sessions.contains_key("saved-client"));
+    }
+
+    #[test]
+    fn active_session_upsert_preserves_launch_settings_over_stale_app_server() {
+        let mut client = test_client(
+            "client-settings",
+            &["resume", "thread-settings"],
+            "/tmp/project",
+            Some("thread-settings"),
+        );
+        client.model = Some("gpt-5.6-sol".to_string());
+        client.service_tier = Some("priority".to_string());
+        client.reasoning_effort = Some("max".to_string());
+        client.fast = true;
+        client.fast_known = true;
+        client.settings_source = "launch_args".to_string();
+        client.settings_observed_at = Some(100);
+        let mut state = test_state(Vec::new());
+        state.active_sessions.insert(
+            client.id.clone(),
+            active_session_record_from_client(&client),
+        );
+
+        client.model = Some("gpt-5.6-luna".to_string());
+        client.service_tier = Some("default".to_string());
+        client.reasoning_effort = Some("low".to_string());
+        client.fast = false;
+        client.settings_source = "app_server".to_string();
+        client.settings_observed_at = Some(101);
+
+        assert!(upsert_active_session_locked(&mut state, &client));
+        let record = state
+            .active_sessions
+            .get("client-settings")
+            .expect("updated session record");
+        assert_eq!(record.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(record.service_tier.as_deref(), Some("priority"));
+        assert_eq!(record.reasoning_effort.as_deref(), Some("max"));
+        assert!(record.fast);
+        assert!(record.fast_known);
+        assert!(record.settings_complete);
+        assert_eq!(record.settings_source, "launch_args");
+    }
+
+    #[test]
+    fn active_session_record_derives_fast_from_known_service_tier() {
+        let mut client = test_client(
+            "client-fast",
+            &["resume", "thread-fast"],
+            "/tmp/project",
+            Some("thread-fast"),
+        );
+        client.service_tier = Some("priority".to_string());
+        client.fast = false;
+        let record = active_session_record_from_client(&client);
+        assert!(record.fast);
+        assert!(record.fast_known);
+
+        client.service_tier = Some("default".to_string());
+        client.fast = true;
+        let record = active_session_record_from_client(&client);
+        assert!(!record.fast);
+        assert!(record.fast_known);
     }
 
     #[test]
@@ -4320,6 +5747,38 @@ mod tests {
     }
 
     #[test]
+    fn registered_client_replaces_stale_same_thread_and_preserves_saved_record() {
+        let mut stale = test_client(
+            "client-4-stale",
+            &["resume"],
+            "/tmp/project",
+            Some("thread-4"),
+        );
+        stale.yolo_pid = 404;
+        stale.status = "stale".to_string();
+        let mut state = test_state(vec![stale.clone()]);
+        state
+            .active_sessions
+            .insert(stale.id.clone(), active_session_record_from_client(&stale));
+
+        let mut registered = test_client(
+            "client-4-new",
+            &["resume", "thread-4"],
+            "/tmp/project",
+            Some("thread-4"),
+        );
+        registered.yolo_pid = 405;
+
+        assert!(reconcile_registered_client_process(&mut state, &registered));
+        assert!(!state.clients.contains_key(&stale.id));
+        assert!(state.active_sessions.contains_key(&stale.id));
+
+        assert!(upsert_active_session_locked(&mut state, &registered));
+        assert!(!state.active_sessions.contains_key(&stale.id));
+        assert!(state.active_sessions.contains_key(&registered.id));
+    }
+
+    #[test]
     fn scanned_yolo_pid_replaces_stale_saved_records() {
         let mut sessions = BTreeMap::new();
         sessions.insert(
@@ -4332,6 +5791,10 @@ mod tests {
                 service_tier: None,
                 reasoning_effort: None,
                 fast: false,
+                fast_known: false,
+                settings_complete: false,
+                settings_source: "unknown".to_string(),
+                settings_observed_at: None,
                 thread_id: None,
                 thread_id_source: "unresolved".to_string(),
                 started_at: 1,
@@ -4347,13 +5810,21 @@ mod tests {
                 service_tier: None,
                 reasoning_effort: None,
                 fast: false,
+                fast_known: false,
+                settings_complete: false,
+                settings_source: "unknown".to_string(),
+                settings_observed_at: None,
                 thread_id: None,
                 thread_id_source: "unresolved".to_string(),
                 started_at: 1,
             },
         );
 
-        assert!(remove_active_sessions_for_yolo_pid(&mut sessions, 303));
+        assert!(remove_active_sessions_for_yolo_pid_except(
+            &mut sessions,
+            303,
+            None
+        ));
         assert!(!sessions.contains_key("303-older"));
         assert!(sessions.contains_key("404-keep"));
     }
@@ -4941,6 +6412,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: None,
             event_tx,
         }));
@@ -5020,6 +6492,33 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_configuration_takes_precedence_over_stale_client_id() {
+        let state = Arc::new(Mutex::new(test_state(vec![
+            test_client(
+                "current-client",
+                &["resume", "thread-current"],
+                "/home/vagrant/head",
+                Some("thread-current"),
+            ),
+            test_client(
+                "stale-client",
+                &["resume", "thread-stale"],
+                "/home/vagrant/moon",
+                Some("thread-stale"),
+            ),
+        ])));
+        let request = ConfigureClientsRequest {
+            client_id: Some("stale-client".to_string()),
+            thread_id: Some("thread-current".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
+            ..ConfigureClientsRequest::default()
+        };
+
+        let selected = select_configure_clients(&state, &request).unwrap();
+        assert_eq!(selected, BTreeSet::from(["current-client".to_string()]));
+    }
+
+    #[test]
     fn federation_websocket_handshake_uses_rfc_accept_key() {
         let mut headers = BTreeMap::new();
         headers.insert(
@@ -5032,15 +6531,129 @@ mod tests {
     }
 
     #[test]
-    fn federation_master_socket_parses_http_authority() {
+    fn websocket_close_frame_is_masked_with_normal_status() {
+        let mut frame = Vec::new();
+        websocket_send_close(&mut frame).unwrap();
+
+        assert_eq!(frame.len(), 8);
+        assert_eq!(frame[0], 0x88);
+        assert_eq!(frame[1], 0x82);
+        assert_eq!(&frame[2..6], &[0x63, 0x6c, 0x6f, 0x73]);
         assert_eq!(
-            federation_master_socket("http://kagura-sandbox:47040/api").unwrap(),
+            &frame[6..8],
+            &[
+                1000u16.to_be_bytes()[0] ^ 0x63,
+                1000u16.to_be_bytes()[1] ^ 0x6c
+            ]
+        );
+    }
+
+    #[test]
+    fn yolo_auto_approval_response_accepts_supported_approval_requests() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "execCommandApproval",
+        ] {
+            let response = yolo_auto_approval_response(&json!({
+                "id": 42,
+                "method": method,
+                "params": {"threadId": "thread-1"}
+            }))
+            .expect("supported approval request");
+            assert_eq!(response["id"], 42);
+            assert_eq!(response["result"]["decision"], "accept");
+        }
+    }
+
+    #[test]
+    fn yolo_auto_approval_response_ignores_notifications_and_unknown_methods() {
+        assert!(
+            yolo_auto_approval_response(&json!({
+                "method": "item/commandExecution/requestApproval",
+                "params": {}
+            }))
+            .is_none()
+        );
+        assert!(
+            yolo_auto_approval_response(&json!({
+                "id": 42,
+                "method": "item/permissions/requestApproval",
+                "params": {}
+            }))
+            .is_none()
+        );
+        assert!(
+            yolo_auto_approval_response(&json!({
+                "id": 42,
+                "method": "thread/started",
+                "params": {}
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn federation_master_endpoint_parses_http_authority() {
+        let endpoint = federation_master_endpoint("http://kagura-sandbox:47040/api").unwrap();
+        assert_eq!(
+            (endpoint.host, endpoint.port),
             ("kagura-sandbox".to_string(), 47040)
         );
+        let endpoint = federation_master_endpoint("http://127.0.0.1").unwrap();
         assert_eq!(
-            federation_master_socket("http://127.0.0.1").unwrap(),
+            (endpoint.host, endpoint.port),
             ("127.0.0.1".to_string(), 80)
         );
+    }
+
+    #[test]
+    fn federation_master_endpoint_preserves_agent_gate_tls_and_path() {
+        let endpoint =
+            federation_master_endpoint("https://agent-gate.example/agt_token/@localhost:47040")
+                .unwrap();
+        assert_eq!(endpoint.host, "agent-gate.example");
+        assert_eq!(endpoint.port, 443);
+        assert!(endpoint.tls);
+        assert_eq!(endpoint.host_header, "agent-gate.example");
+        assert_eq!(
+            endpoint.websocket_path(),
+            "/agt_token/@localhost:47040/federation/slaves/stream"
+        );
+    }
+
+    #[test]
+    fn federation_master_endpoint_uses_explicit_port_and_plain_http() {
+        let endpoint = federation_master_endpoint("http://127.0.0.1:47040").unwrap();
+        assert_eq!(endpoint.host, "127.0.0.1");
+        assert_eq!(endpoint.port, 47040);
+        assert!(!endpoint.tls);
+        assert_eq!(endpoint.websocket_path(), "/federation/slaves/stream");
+    }
+
+    #[test]
+    fn command_output_with_timeout_kills_stalled_process() {
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2"]);
+
+        let result = command_output_with_timeout(command, Duration::from_millis(100));
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tmux_pane_snapshot_preserves_pane_id() {
+        let pane = parse_tmux_pane_line(
+            "kagura\t1\t0\t%1\t1234\t/dev/pts/1\t/home/vagrant/kagura\tbash",
+            "websh",
+        )
+        .expect("tmux pane should parse");
+
+        assert_eq!(pane.pane_id.as_deref(), Some("%1"));
+        assert_eq!(pane.window_index, Some(1));
+        assert_eq!(pane.pane_index, Some(0));
     }
 
     #[test]
@@ -5148,6 +6761,28 @@ mod tests {
     }
 
     #[test]
+    fn status_subscription_ignores_bootstrap_until_active_grace_expires() {
+        let mut client = test_client(
+            "resume",
+            &["resume", "thread-active"],
+            "/home/vagrant/head",
+            Some("thread-active"),
+        );
+        client.codex_status = Some("active".to_string());
+        client.codex_status_updated_at = Some(now_secs());
+        let state = Arc::new(Mutex::new(test_state(vec![client.clone()])));
+        assert!(known_active_client_thread_ids(&state).is_empty());
+
+        client.codex_status_updated_at =
+            Some(now_secs().saturating_sub(APP_SERVER_STATUS_SUBSCRIPTION_GRACE.as_secs() + 1));
+        let state = Arc::new(Mutex::new(test_state(vec![client])));
+        assert_eq!(
+            known_active_client_thread_ids(&state),
+            BTreeSet::from(["thread-active".to_string()])
+        );
+    }
+
+    #[test]
     fn resume_args_for_preserves_options_with_preferred_thread() {
         let args = resume_args_for(&os_args(&["--model", "gpt-5.5"]), Some("019e-thread"));
         assert_eq!(
@@ -5181,6 +6816,7 @@ mod tests {
             model: Some("gpt-5.5".to_string()),
             service_tier: Some("default".to_string()),
             reasoning_effort: Some("medium".to_string()),
+            settings_source: String::new(),
         };
         let args = preserve_resume_settings_args(os_args(&["resume", "019e-thread"]), &settings);
         assert_eq!(
@@ -5205,6 +6841,7 @@ mod tests {
             model: Some("gpt-5.6".to_string()),
             service_tier: Some("priority".to_string()),
             reasoning_effort: Some("high".to_string()),
+            settings_source: String::new(),
         };
         let args = preserve_resume_settings_args(
             os_args(&[
@@ -5228,6 +6865,43 @@ mod tests {
                 "service_tier=default",
                 "-c",
                 "model_reasoning_effort=medium",
+                "resume",
+                "019e-thread"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_args_with_current_settings_replaces_stale_launch_settings_after_configure() {
+        let settings = ClientResumeSettings {
+            thread_id: Some("019e-thread".to_string()),
+            model: Some("gpt-5.6-luna".to_string()),
+            service_tier: Some("priority".to_string()),
+            reasoning_effort: Some("max".to_string()),
+            settings_source: "configure".to_string(),
+        };
+        let args = resume_args_with_current_settings(
+            os_args(&[
+                "-c",
+                "model=gpt-5.6-sol",
+                "-c",
+                "service_tier=default",
+                "-c",
+                "model_reasoning_effort=low",
+                "resume",
+                "019e-thread",
+            ]),
+            &settings,
+        );
+        assert_eq!(
+            string_args(args),
+            vec![
+                "-c",
+                "model=\"gpt-5.6-luna\"",
+                "-c",
+                "service_tier=\"priority\"",
+                "-c",
+                "model_reasoning_effort=\"max\"",
                 "resume",
                 "019e-thread"
             ]
@@ -5313,6 +6987,7 @@ mod tests {
         let process = ProcInfo {
             pid: 1,
             ppid: 0,
+            state: 'S',
             comm: "codex".to_string(),
             cmdline: vec![
                 "codex".to_string(),
@@ -5324,6 +6999,23 @@ mod tests {
             cwd: Some("/home/vagrant/websh".to_string()),
         };
         assert_eq!(process_thread_id(&process), Some("019e-thread"));
+    }
+
+    #[test]
+    fn stopped_or_zombie_process_is_not_live_for_client_reconciliation() {
+        let mut process = ProcInfo {
+            pid: 1,
+            ppid: 0,
+            state: 'S',
+            comm: "yolo".to_string(),
+            cmdline: vec!["yolo".to_string(), "resume".to_string()],
+            cwd: Some("/tmp/project".to_string()),
+        };
+        assert!(process_is_live(&process));
+        process.state = 'T';
+        assert!(!process_is_live(&process));
+        process.state = 'Z';
+        assert!(!process_is_live(&process));
     }
 
     #[test]
@@ -5350,6 +7042,7 @@ mod tests {
             ProcInfo {
                 pid: 10,
                 ppid: 1,
+                state: 'S',
                 comm: "node".to_string(),
                 cmdline: vec![
                     "node".to_string(),
@@ -5363,6 +7056,7 @@ mod tests {
             ProcInfo {
                 pid: 11,
                 ppid: 10,
+                state: 'S',
                 comm: "codex".to_string(),
                 cmdline: vec![
                     "/vendor/codex".to_string(),
@@ -5383,6 +7077,7 @@ mod tests {
             ProcInfo {
                 pid: 10,
                 ppid: 1,
+                state: 'S',
                 comm: "node".to_string(),
                 cmdline: vec![
                     "node".to_string(),
@@ -5395,6 +7090,7 @@ mod tests {
             ProcInfo {
                 pid: 20,
                 ppid: 1,
+                state: 'S',
                 comm: "node".to_string(),
                 cmdline: vec![
                     "node".to_string(),
@@ -5505,14 +7201,14 @@ mod tests {
     }
 
     #[test]
-    fn thread_settings_override_stale_launch_settings_after_resume() {
+    fn thread_snapshot_preserves_launch_settings_after_resume() {
         let state = Arc::new(Mutex::new(test_state(vec![test_client(
             "resumed",
             &[
                 "-c",
-                "model=\"gpt-5.6-luna\"",
+                "model=\"gpt-5.6-sol\"",
                 "-c",
-                "service_tier=default",
+                "service_tier=priority",
                 "-c",
                 "model_reasoning_effort=xhigh",
                 "resume",
@@ -5536,10 +7232,11 @@ mod tests {
 
         let state = state.lock().unwrap();
         let client = &state.clients["resumed"];
-        assert_eq!(client.model.as_deref(), Some("gpt-5.6-luna"));
-        assert_eq!(client.service_tier.as_deref(), Some("default"));
-        assert_eq!(client.reasoning_effort.as_deref(), Some("max"));
-        assert!(!client.fast);
+        assert_eq!(client.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(client.service_tier.as_deref(), Some("priority"));
+        assert_eq!(client.reasoning_effort.as_deref(), Some("xhigh"));
+        assert!(client.fast);
+        assert_eq!(client.settings_source, "launch_args");
     }
 
     #[test]
@@ -5568,6 +7265,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: None,
             event_tx,
         }));
@@ -5588,10 +7286,69 @@ mod tests {
     }
 
     #[test]
+    fn websocket_resume_success_emits_bootstrap_completion_once() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
+            current_thread_id: Some("thread-resumed".to_string()),
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({
+                "id": 17,
+                "method": "thread/resume",
+                "params": { "threadId": "thread-resumed" }
+            }),
+        );
+        assert!(event_rx.try_recv().is_err());
+
+        observe_app_server_response(
+            &tracker,
+            &json!({"id": 17, "result": {"thread": {"id": "thread-resumed"}}}),
+        );
+
+        assert!(matches!(
+            event_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(ClientEvent::ResumeBootstrapCompleted)
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn websocket_resume_failure_does_not_schedule_policy_update() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+            pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
+            current_thread_id: Some("thread-resumed".to_string()),
+            event_tx,
+        }));
+
+        observe_client_app_server_request(
+            &tracker,
+            &json!({
+                "id": 18,
+                "method": "thread/resume",
+                "params": { "threadId": "thread-resumed" }
+            }),
+        );
+        observe_app_server_response(
+            &tracker,
+            &json!({"id": 18, "error": {"message": "turn/start failed in TUI"}}),
+        );
+
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn websocket_thread_start_response_binds_the_proxy_client_to_created_thread() {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: None,
             event_tx,
         }));
@@ -5619,6 +7376,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: None,
             event_tx,
         }));
@@ -5640,6 +7398,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: Some("thread-resumed".to_string()),
             event_tx,
         }));
@@ -5664,6 +7423,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
             pending_create_request_ids: BTreeSet::new(),
+            pending_resume_request_ids: BTreeSet::new(),
             current_thread_id: None,
             event_tx,
         }));
@@ -5773,7 +7533,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_reexec_overrides_explicit_bare_client_configuration() {
+    fn settings_override_replaces_explicit_bare_client_configuration() {
         let settings = ClientResumeSettings {
             model: Some("gpt-5.6-luna".to_string()),
             service_tier: Some("priority".to_string()),
@@ -5797,6 +7557,32 @@ mod tests {
         assert_eq!(parsed.model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(parsed.service_tier.as_deref(), Some("priority"));
         assert_eq!(parsed.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn settings_update_schedules_reconfigure_after_server_ack() {
+        let state = Arc::new(Mutex::new(test_state(vec![test_client(
+            "client",
+            &["resume", "thread-settings"],
+            "/home/vagrant/head",
+            Some("thread-settings"),
+        )])));
+
+        note_client_settings_update(
+            &state,
+            "client",
+            Some("gpt-5.6-sol".to_string()),
+            Some(true),
+            Some("max".to_string()),
+        );
+        request_client_reconfigure(&state, "client");
+
+        let state = state.lock().unwrap();
+        let client = &state.clients["client"];
+        assert_eq!(client.settings_reconfigure_generation, 1);
+        assert_eq!(client.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(client.service_tier.as_deref(), Some("priority"));
+        assert_eq!(client.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
@@ -5873,6 +7659,85 @@ mod tests {
         assert!(output.contains("permission_profile type=\\\"disabled\\\""));
         assert!(!output.contains("read-only"));
         assert!(!output.contains("require_escalated"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rewrite_session_meta_cwd_preserves_large_rollout_records_without_loading_them() {
+        let path = env::temp_dir().join(format!(
+            "yolo-session-large-record-test-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        let large_record = vec![b'x'; MAX_SESSION_REPAIR_LINE_BYTES + 1024];
+        let mut input = br#"{"type":"session_meta","payload":{"cwd":"/tmp"}}
+"#
+        .to_vec();
+        input.extend_from_slice(&large_record);
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"type\":\"tail\"}\n");
+        fs::write(&path, input).unwrap();
+
+        assert!(rewrite_session_meta_cwd(&path, "/home/vagrant/websh").unwrap());
+        let output = fs::read(&path).unwrap();
+        let first_line = output
+            .split(|byte| *byte == b'\n')
+            .next()
+            .expect("session metadata line");
+        let first_value: Value = serde_json::from_slice(first_line).unwrap();
+        assert_eq!(
+            first_value["payload"]["cwd"],
+            Value::String("/home/vagrant/websh".to_string())
+        );
+        assert!(
+            output
+                .windows(large_record.len())
+                .any(|window| window == large_record.as_slice())
+        );
+        assert!(output.ends_with(b"{\"type\":\"tail\"}\n"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_turn_archive_keeps_only_bounded_recent_turns() {
+        let path = env::temp_dir().join(format!(
+            "yolo-turn-archive-bound-test-{}-{}.jsonl",
+            std::process::id(),
+            now_millis()
+        ));
+        let mut contents = String::new();
+        for index in 0..(MAX_TELEMETRY_TURNS + 32) {
+            let info = TurnInfo {
+                thread_id: "thread-archive".to_string(),
+                turn_id: format!("turn-{index}"),
+                status: "completed".to_string(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                prompt: None,
+                result: None,
+                commentary: None,
+                commentary_entries: Vec::new(),
+                reasoning_summary: None,
+                reasoning_summary_entries: Vec::new(),
+                reasoning_raw: None,
+                reasoning_raw_entries: Vec::new(),
+                plan: None,
+                plan_entries: Vec::new(),
+                updated_at: index as u64,
+            };
+            contents.push_str(&serde_json::to_string(&info).unwrap());
+            contents.push('\n');
+        }
+        fs::write(&path, contents).unwrap();
+
+        let mut telemetry = AgentTelemetry::default();
+        load_turn_archive(&path, &mut telemetry);
+
+        assert_eq!(telemetry.turns.len(), MAX_TELEMETRY_TURNS);
+        assert!(telemetry.turns.contains_key("thread-archive:turn-543"));
+        assert!(!telemetry.turns.contains_key("thread-archive:turn-0"));
 
         let _ = fs::remove_file(path);
     }
@@ -6047,6 +7912,51 @@ mod tests {
     }
 
     #[test]
+    fn resumed_thread_settings_follow_registered_defaults_when_mode_is_implicit() {
+        let defaults = YoloDefaultConfiguration {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "max".to_string(),
+            fast: true,
+        };
+        let configuration =
+            resume_configuration_for_args(&os_args(&["resume", "thread-1"]), Some(&defaults))
+                .expect("implicit resume configuration");
+        assert_eq!(configuration, defaults);
+
+        let explicit = resume_configuration_for_args(
+            &os_args(&[
+                "-c",
+                "model=gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=low",
+                "-c",
+                "service_tier=default",
+                "resume",
+                "thread-1",
+            ]),
+            Some(&defaults),
+        )
+        .expect("explicit resume configuration");
+        assert_eq!(explicit.model, "gpt-5.6-sol");
+        assert_eq!(explicit.reasoning_effort, "low");
+        assert!(!explicit.fast);
+    }
+
+    #[test]
+    fn resumed_thread_settings_params_include_registered_mode() {
+        let defaults = YoloDefaultConfiguration {
+            model: "gpt-5.6-luna".to_string(),
+            reasoning_effort: "max".to_string(),
+            fast: true,
+        };
+        let params = resume_thread_settings_params("thread-1", "/tmp/project", Some(&defaults));
+        assert_eq!(params["model"], "gpt-5.6-luna");
+        assert_eq!(params["serviceTier"], "priority");
+        assert_eq!(params["effort"], "max");
+        assert_eq!(params["cwd"], "/tmp/project");
+    }
+
+    #[test]
     fn yolo_mode_args_override_conflicting_user_permission_flags() {
         let args = strip_conflicting_yolo_options(os_args(&[
             "-s",
@@ -6091,71 +8001,33 @@ mod tests {
                 .any(|pair| pair == ["-c", "check_for_update_on_startup=false"])
         );
     }
-}
 
-fn wait_for_resume_generation_advance(seen_resume_generation: &AtomicU64) -> bool {
-    let start = SystemTime::now();
-    while start.elapsed().unwrap_or_default() < RESUME_GENERATION_GRACE {
-        if resume_generation_advanced(seen_resume_generation) {
-            eprintln!(
-                "yolo: Codex child exited during app-server restart; resuming via Phoenix mode"
-            );
-            return true;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
+    #[test]
+    fn native_codex_selection_prefers_explicit_path_then_path_then_managed() {
+        let selected = select_native_codex_executable(
+            Some(OsString::from("/custom/codex")),
+            Some(PathBuf::from("/path/codex")),
+            PathBuf::from("/managed/codex"),
+        );
+        assert_eq!(selected, OsString::from("/custom/codex"));
 
-fn should_reexec_after_codex_exit(
-    success: bool,
-    original_args: &[OsString],
-    seen_resume_generation: &AtomicU64,
-) -> bool {
-    if resume_generation_advanced(seen_resume_generation) {
-        return true;
-    }
-    if success {
-        return false;
-    }
-    if wait_for_resume_generation_advance(seen_resume_generation) {
-        return true;
-    }
-    if resume_target_from_args(original_args).is_some() && wait_for_app_server_reconnect() {
-        eprintln!("yolo: Codex child lost the app-server transport; app-server is back, resuming");
-        return true;
-    }
-    false
-}
+        let selected = select_native_codex_executable(
+            None,
+            Some(PathBuf::from("/path/codex")),
+            PathBuf::from("/managed/codex"),
+        );
+        assert_eq!(selected, OsString::from("/path/codex"));
 
-fn wait_for_app_server_reconnect() -> bool {
-    let Ok(paths) = runtime_paths() else {
-        return false;
-    };
-    let start = SystemTime::now();
-    while start.elapsed().unwrap_or_default() < RESUME_GENERATION_GRACE {
-        if paths.api_socket.exists()
-            && paths.app_server_socket.exists()
-            && api_get_json("/status").is_ok()
-            && AppServerRpcClient::connect(&paths.app_server_socket).is_ok()
-        {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(200));
+        let selected = select_native_codex_executable(None, None, PathBuf::from("/bin/sh"));
+        assert_eq!(selected, OsString::from("/bin/sh"));
     }
-    false
-}
 
-fn resume_generation_advanced(seen_resume_generation: &AtomicU64) -> bool {
-    let seen = seen_resume_generation.load(Ordering::SeqCst);
-    if let Ok(value) = api_get_json("/status")
-        && let Some(generation) = restart_generation_from_status(&value)
-        && generation > seen
-    {
-        seen_resume_generation.store(generation, Ordering::SeqCst);
-        return true;
+    #[test]
+    fn empty_native_codex_override_does_not_hide_managed_binary() {
+        let selected =
+            select_native_codex_executable(Some(OsString::new()), None, PathBuf::from("/bin/sh"));
+        assert_eq!(selected, OsString::from("/bin/sh"));
     }
-    false
 }
 
 fn running_duplicate_thread_client(thread_id: &str, current_pid: u32) -> Option<String> {
@@ -6173,7 +8045,7 @@ fn running_duplicate_thread_client(thread_id: &str, current_pid: u32) -> Option<
             continue;
         }
         let yolo_pid = client.get("yolo_pid").and_then(Value::as_u64)? as u32;
-        if yolo_pid == current_pid || !pid_is_alive(yolo_pid) {
+        if yolo_pid == current_pid || !pid_is_runnable(yolo_pid) {
             continue;
         }
         let id = client
@@ -6193,6 +8065,9 @@ fn running_duplicate_thread_process(thread_id: &str, current_pid: u32) -> Option
         .collect::<BTreeSet<_>>();
     for process in processes {
         if process.pid == current_pid || current_children.contains(&process.pid) {
+            continue;
+        }
+        if !process_is_live(&process) {
             continue;
         }
         if process_thread_id(&process) != Some(thread_id) {
@@ -6226,9 +8101,40 @@ fn run_upgrade_resume(mut args: Vec<OsString>) {
     if args.is_empty() {
         args.push(OsString::from("--last"));
     }
+    // The direct single-session upgrade also replaces the shared app-server.
+    // Confirm the same explicit waiting condition immediately before that
+    // lifecycle change; a working client must remain untouched.
+    if api_get_json("/status").is_ok()
+        && let Err(err) = wait_for_upgrade_resume_clients_idle()
+    {
+        eprintln!("yolo upgrade-resume: {err}");
+        std::process::exit(1);
+    }
     if let Err(err) = upgrade_codex_cli() {
         eprintln!("yolo upgrade-resume: {err}");
         std::process::exit(1);
+    }
+    // Package installation can take long enough for another client to start
+    // a turn. Recheck before the app-server is stopped as a final barrier.
+    if api_get_json("/status").is_ok()
+        && let Err(err) = wait_for_upgrade_resume_clients_idle()
+    {
+        eprintln!("yolo upgrade-resume: {err}");
+        std::process::exit(1);
+    }
+    // Switch every other managed wrapper to the installed yolo executable
+    // before replacing the shared app-server. If this hand-off cannot be
+    // authorized and completed, abort without touching the app-server.
+    if api_get_json("/status").is_ok() {
+        match api_post_json("/upgrade-resume-reexec", &json!({}))
+            .and_then(|value| ensure_json_ok(&value).map(|_| value))
+        {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("yolo upgrade-resume: {err}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Err(err) = restart_server_for_upgrade() {
         eprintln!("yolo upgrade-resume: failed to restart yolo server: {err}");
@@ -6238,6 +8144,40 @@ fn run_upgrade_resume(mut args: Vec<OsString>) {
     client_args.push(OsString::from("resume"));
     client_args.extend(args);
     run_client(client_args);
+}
+
+fn wait_for_upgrade_resume_clients_idle() -> Result<(), String> {
+    let timeout = upgrade_idle_wait_timeout();
+    let start = SystemTime::now();
+    loop {
+        let value = api_post_json("/upgrade-resume-preflight", &json!({}))?;
+        ensure_json_ok(&value)?;
+        let working = value
+            .get("working")
+            .and_then(Value::as_array)
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if working.is_empty() {
+            return Ok(());
+        }
+        if start.elapsed().unwrap_or_default() >= timeout {
+            return Err(format!(
+                "timed out waiting for Codex clients to become idle: {}",
+                working.join(", ")
+            ));
+        }
+        eprintln!(
+            "yolo upgrade-resume: waiting for Codex clients to become idle: {}",
+            working.join(", ")
+        );
+        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+    }
 }
 
 fn run_upgrade_resume_all() -> Result<(), String> {
@@ -6735,10 +8675,7 @@ fn terminate_pid_tree(pid: u32, timeout: Duration) {
     pids.sort_unstable();
     pids.dedup();
     for pid in pids.iter().rev() {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status();
+        let _ = signal_pid(pid, "TERM");
     }
     let start = SystemTime::now();
     while start.elapsed().unwrap_or_default() < timeout {
@@ -6748,11 +8685,20 @@ fn terminate_pid_tree(pid: u32, timeout: Duration) {
         thread::sleep(Duration::from_millis(100));
     }
     for pid in pids.iter().rev() {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
+        let _ = signal_pid(pid, "KILL");
     }
+}
+
+fn signal_pid(pid: &u32, signal: &str) -> bool {
+    Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn child_pids_recursive(pid: u32) -> Vec<u32> {
@@ -6789,6 +8735,9 @@ fn pid_is_alive(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -6815,9 +8764,9 @@ fn resume_args_for(args: &[OsString], preferred_thread_id: Option<&str>) -> Vec<
 fn reexec_client_for_resume(original_args: &[OsString], client_id: &str) -> ! {
     let resume_settings = current_client_resume_settings(client_id);
     let resume_args = resume_args_for(original_args, resume_settings.thread_id.as_deref());
-    let resume_args = preserve_resume_settings_args(resume_args, &resume_settings);
+    let resume_args = resume_args_with_current_settings(resume_args, &resume_settings);
     eprintln!(
-        "yolo: re-executing client after app-server restart with args: {}",
+        "yolo: re-executing waiting client for authorized upgrade-resume with args: {}",
         resume_args
             .iter()
             .map(|arg| arg.to_string_lossy())
@@ -6827,30 +8776,6 @@ fn reexec_client_for_resume(original_args: &[OsString], client_id: &str) -> ! {
     let mut errors = Vec::new();
     for exe in yolo_reexec_candidates() {
         let err = Command::new(&exe).args(&resume_args).exec();
-        errors.push(format!("{}: {err}", exe.display()));
-    }
-    eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
-    std::process::exit(127);
-}
-
-fn reexec_client_for_settings(original_args: &[OsString], client_id: &str) -> ! {
-    let settings = current_client_resume_settings(client_id);
-    let args = if let Some(thread_id) = settings.thread_id.as_deref() {
-        resume_args_for(original_args, Some(thread_id))
-    } else {
-        original_args.to_vec()
-    };
-    let args = override_client_settings_args(args, &settings);
-    eprintln!(
-        "yolo: re-executing bare client after settings update with args: {}",
-        args.iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let mut errors = Vec::new();
-    for exe in yolo_reexec_candidates() {
-        let err = Command::new(&exe).args(&args).exec();
         errors.push(format!("{}: {err}", exe.display()));
     }
     eprintln!("yolo: failed to re-execute client: {}", errors.join("; "));
@@ -6963,6 +8888,17 @@ fn preserve_resume_settings_args(
     prepend_codex_config_args(args, config_args)
 }
 
+fn resume_args_with_current_settings(
+    args: Vec<OsString>,
+    settings: &ClientResumeSettings,
+) -> Vec<OsString> {
+    if settings.settings_source == "configure" {
+        override_client_settings_args(args, settings)
+    } else {
+        preserve_resume_settings_args(args, settings)
+    }
+}
+
 fn codex_config_os_arg(key: &str, value: &str) -> OsString {
     OsString::from(format!("{key}=\"{}\"", toml_basic_string_escape(value)))
 }
@@ -7000,11 +8936,13 @@ fn current_client_resume_settings(client_id: &str) -> ClientResumeSettings {
             .map(|fast| if fast { "priority" } else { "default" }.to_string());
     }
     let reasoning_effort = nonempty_json_string(client, "reasoning_effort");
+    let settings_source = nonempty_json_string(client, "settings_source").unwrap_or_default();
     ClientResumeSettings {
         thread_id,
         model,
         service_tier,
         reasoning_effort,
+        settings_source,
     }
 }
 
@@ -7070,23 +9008,15 @@ fn thread_id_from_args_strs(args: &[String]) -> Option<String> {
         .cloned()
 }
 
-fn current_restart_generation() -> u64 {
+fn current_resume_generation() -> u64 {
     api_get_json("/status")
         .ok()
-        .and_then(|value| restart_generation_from_status(&value))
+        .and_then(|value| resume_generation_from_status(&value))
         .unwrap_or(0)
 }
 
-fn restart_generation_from_status(value: &Value) -> Option<u64> {
-    let resume_generation = value
-        .get("resume_generation")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let app_server_generation = value
-        .get("app_server_generation")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    Some(resume_generation.max(app_server_generation))
+fn resume_generation_from_status(value: &Value) -> Option<u64> {
+    value.get("resume_generation").and_then(Value::as_u64)
 }
 
 fn ensure_server() -> Result<(), String> {
@@ -7722,21 +9652,112 @@ fn record_slave_result(state: &Arc<Mutex<ServerState>>, request: SlaveResultRequ
     }
 }
 
-fn federation_master_socket(base_url: &str) -> Result<(String, u16), String> {
-    let authority = base_url
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FederationMasterEndpoint {
+    host: String,
+    port: u16,
+    tls: bool,
+    host_header: String,
+    path_prefix: String,
+}
+
+impl FederationMasterEndpoint {
+    fn websocket_path(&self) -> String {
+        format!(
+            "{}/federation/slaves/stream",
+            self.path_prefix.trim_end_matches('/')
+        )
+    }
+}
+
+fn federation_master_endpoint(base_url: &str) -> Result<FederationMasterEndpoint, String> {
+    let value = base_url.trim();
+    let (tls, authority_and_path) = if let Some(value) = value.strip_prefix("https://") {
+        (true, value)
+    } else if let Some(value) = value.strip_prefix("http://") {
+        (false, value)
+    } else {
+        (false, value)
+    };
+    let (authority, raw_path) = authority_and_path
+        .split_once('/')
+        .map_or((authority_and_path, ""), |(authority, path)| {
+            (authority, path)
+        });
+    let authority = authority
+        .split('?')
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "YOLO_MASTER_URL has no host".to_string())?;
-    if let Some((host, port)) = authority.rsplit_once(':')
+
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| "YOLO_MASTER_URL has an invalid IPv6 host".to_string())?;
+        let host = authority[1..end].to_string();
+        let port = authority
+            .get(end + 1..)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(if tls { 443 } else { 80 });
+        (host, port)
+    } else if let Some((host, port)) = authority.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
+        && !host.is_empty()
     {
-        return Ok((host.trim_matches(['[', ']']).to_string(), port));
+        (host.to_string(), port)
+    } else {
+        (authority.to_string(), if tls { 443 } else { 80 })
+    };
+
+    let host_header = if authority.starts_with('[') {
+        authority.to_string()
+    } else {
+        authority.to_string()
+    };
+    let path_prefix = if raw_path.is_empty() {
+        String::new()
+    } else {
+        let path = raw_path.split('?').next().unwrap_or_default();
+        format!("/{}", path.trim_matches('/'))
+    };
+    Ok(FederationMasterEndpoint {
+        host,
+        port,
+        tls,
+        host_header,
+        path_prefix,
+    })
+}
+
+enum FederationPushStream {
+    Plain(TcpStream),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl Read for FederationPushStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
     }
-    Ok((authority.to_string(), 80))
+}
+
+impl Write for FederationPushStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
 }
 
 fn connect_federation_push(
@@ -7744,15 +9765,15 @@ fn connect_federation_push(
     slave_id: &str,
     version: &str,
     bearer_token: Option<&str>,
-) -> Result<TcpStream, String> {
-    let (host, port) = federation_master_socket(master_url)?;
-    let mut addresses = (host.as_str(), port)
+) -> Result<FederationPushStream, String> {
+    let endpoint = federation_master_endpoint(master_url)?;
+    let mut addresses = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("resolve federation master: {err}"))?;
     let address = addresses
         .next()
         .ok_or_else(|| "federation master has no addresses".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
         .map_err(|err| format!("connect federation push: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(35)))
@@ -7760,8 +9781,24 @@ fn connect_federation_push(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("set federation push write timeout: {err}"))?;
+    let mut stream = if endpoint.tls {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = ServerName::try_from(endpoint.host.clone())
+            .map_err(|err| format!("invalid federation TLS server name: {err}"))?;
+        let connection = ClientConnection::new(std::sync::Arc::new(config), server_name)
+            .map_err(|err| format!("create federation TLS connection: {err}"))?;
+        FederationPushStream::Tls(StreamOwned::new(connection, stream))
+    } else {
+        FederationPushStream::Plain(stream)
+    };
     let mut request = format!(
-        "GET /federation/slaves/stream HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: eW9sby1mZWRlcmF0aW9uLXB1c2g=\r\nSec-WebSocket-Version: 13\r\n"
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: eW9sby1mZWRlcmF0aW9uLXB1c2g=\r\nSec-WebSocket-Version: 13\r\n",
+        endpoint.websocket_path(),
+        endpoint.host_header,
     );
     if let Some(token) = bearer_token.filter(|token| !token.trim().is_empty()) {
         request.push_str(&format!("Authorization: Bearer {}\r\n", token.trim()));
@@ -8093,24 +10130,301 @@ fn run_codex_upgrade_resume_all_local(
     codex_version: Option<&str>,
     request: &UpgradeResumeAllRequest,
 ) -> Result<Value, String> {
-    wait_for_clients_idle(Arc::clone(&state), paths, request)
-        .and_then(|_| upgrade_codex_cli_version(codex_version))
-        .and_then(|_| restart_tracked_app_server(Arc::clone(&state), paths.clone()))
-        .and_then(|app_server_pid| {
-            if let Ok(mut state) = state.lock() {
-                state.resume_generation = state.resume_generation.saturating_add(1);
-                let generation = state.resume_generation;
-                return Ok(json!({
-                    "ok": true,
-                    "app_server_pid": app_server_pid,
-                    "app_server_generation": state.app_server_generation,
-                    "resume_generation": generation,
-                    "codex_version": codex_version,
-                    "clients": state.clients.len()
-                }));
-            }
-            Err("server state lock poisoned".to_string())
+    if UPGRADE_RESUME_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("a Codex upgrade-resume job is already running".to_string());
+    }
+    let target_client_ids = upgrade_target_client_ids(&state, request);
+    let target_client_count = target_client_ids.len();
+    let client_count = state
+        .lock()
+        .map(|state| {
+            state
+                .clients
+                .values()
+                .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+                .count()
         })
+        .unwrap_or(target_client_count);
+    if let Err(err) = ensure_upgrade_memory_headroom(client_count.max(1)) {
+        UPGRADE_RESUME_IN_PROGRESS.store(false, Ordering::SeqCst);
+        return Err(err);
+    }
+
+    let job_id = format!("upgrade-resume-{}", now_millis());
+    let worker_state = Arc::clone(&state);
+    let worker_paths = paths.clone();
+    let worker_job_id = job_id.clone();
+    let worker_codex_version = codex_version.map(ToString::to_string);
+    let worker_request = request.clone();
+    thread::spawn(move || {
+        let result = run_incremental_codex_upgrade_resume_worker(
+            worker_state,
+            worker_paths,
+            target_client_ids,
+            worker_codex_version.as_deref(),
+            worker_request,
+        );
+        match result {
+            Ok((app_server_pid, app_server_generation, resume_generation)) => eprintln!(
+                "yolo upgrade job {worker_job_id} completed: app-server pid={app_server_pid:?} generation={app_server_generation} resume_generation={resume_generation}"
+            ),
+            Err(err) => eprintln!("yolo upgrade job {worker_job_id} failed: {err}"),
+        }
+        UPGRADE_RESUME_IN_PROGRESS.store(false, Ordering::SeqCst);
+    });
+
+    Ok(json!({
+        "ok": true,
+        "queued": true,
+        "job_id": job_id,
+        "codex_version": codex_version,
+        "clients": target_client_count,
+        "resume_mode": "idle_then_serialized_reexec"
+    }))
+}
+
+fn upgrade_memory_requirement_bytes(client_count: usize) -> u64 {
+    let clients = client_count.min(64) as u64;
+    (UPGRADE_MEMORY_BASE_RESERVE_MIB
+        .saturating_add(clients.saturating_mul(UPGRADE_MEMORY_PER_CLIENT_RESERVE_MIB)))
+    .saturating_mul(1024 * 1024)
+}
+
+fn upgrade_memory_headroom_sufficient(
+    available_bytes: u64,
+    swap_free_bytes: Option<u64>,
+    client_count: usize,
+) -> bool {
+    if available_bytes < upgrade_memory_requirement_bytes(client_count) {
+        return false;
+    }
+    swap_free_bytes.is_none_or(|bytes| {
+        bytes == 0 || bytes >= UPGRADE_MIN_SWAP_FREE_MIB.saturating_mul(1024 * 1024)
+    })
+}
+
+fn meminfo_value_bytes(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        if name != key {
+            return None;
+        }
+        let value = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(value.saturating_mul(1024))
+    })
+}
+
+fn ensure_upgrade_memory_headroom(client_count: usize) -> Result<(), String> {
+    let Ok(contents) = fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let Some(available_bytes) = meminfo_value_bytes(&contents, "MemAvailable") else {
+        return Ok(());
+    };
+    let swap_total = meminfo_value_bytes(&contents, "SwapTotal").unwrap_or(0);
+    let swap_free = meminfo_value_bytes(&contents, "SwapFree");
+    let effective_swap_free = (swap_total > 0).then_some(swap_free.unwrap_or(0));
+    if upgrade_memory_headroom_sufficient(available_bytes, effective_swap_free, client_count) {
+        return Ok(());
+    }
+    let required = upgrade_memory_requirement_bytes(client_count) / (1024 * 1024);
+    let available = available_bytes / (1024 * 1024);
+    let swap = effective_swap_free.map(|bytes| bytes / (1024 * 1024));
+    Err(format!(
+        "insufficient memory headroom for upgrade-resume: available={available}MiB required={required}MiB swap_free={swap:?}MiB"
+    ))
+}
+
+fn upgrade_target_client_ids(
+    state: &Arc<Mutex<ServerState>>,
+    request: &UpgradeResumeAllRequest,
+) -> BTreeSet<String> {
+    let Ok(state) = state.lock() else {
+        return BTreeSet::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| !should_ignore_upgrade_wait_client(client, request))
+        .map(|client| client.id.clone())
+        .collect()
+}
+
+fn upgrade_thread_ids_for_clients(
+    state: &Arc<Mutex<ServerState>>,
+    client_ids: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let Ok(state) = state.lock() else {
+        return None;
+    };
+    let mut thread_ids = BTreeSet::new();
+    let mut has_unbound_client = false;
+    for client_id in client_ids {
+        let Some(client) = state.clients.get(client_id) else {
+            continue;
+        };
+        if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        if let Some(thread_id) = client.thread_id.as_deref() {
+            if !thread_id.trim().is_empty() {
+                thread_ids.insert(thread_id.to_string());
+            }
+        } else {
+            has_unbound_client = true;
+        }
+    }
+    if has_unbound_client {
+        None
+    } else {
+        Some(thread_ids)
+    }
+}
+
+fn matching_app_thread<'a>(
+    client: &ClientInfo,
+    snapshot: &'a [AppThreadSnapshot],
+) -> Option<&'a AppThreadSnapshot> {
+    if let Some(thread_id) = client.thread_id.as_deref() {
+        return snapshot.iter().find(|thread| thread.id == thread_id);
+    }
+
+    // An unbound legacy client may be matched by cwd only when that cwd has
+    // exactly one app-server thread. Ambiguous or missing ownership is
+    // deliberately treated as non-waiting by the callers below.
+    let mut matches = snapshot.iter().filter(|thread| thread.cwd == client.cwd);
+    let thread = matches.next()?;
+    matches.next().is_none().then_some(thread)
+}
+
+fn app_thread_is_waiting(thread: &AppThreadSnapshot) -> bool {
+    is_waiting_thread_status(&thread.status) && thread.active_flags.is_empty()
+}
+
+fn client_is_waiting_in_snapshot(client: &ClientInfo, snapshot: &[AppThreadSnapshot]) -> bool {
+    matching_app_thread(client, snapshot).is_some_and(app_thread_is_waiting)
+}
+
+fn working_upgrade_clients(
+    state: &Arc<Mutex<ServerState>>,
+    client_ids: &BTreeSet<String>,
+    snapshot: &[AppThreadSnapshot],
+) -> Vec<String> {
+    let Ok(state) = state.lock() else {
+        return Vec::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| client_ids.contains(&client.id))
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        // Upgrade-resume is allowed to proceed only after every target has
+        // an explicit idle/waiting status. Unknown, missing, notLoaded, and
+        // active states remain blocking so they can never be terminated by a
+        // stale or incomplete snapshot.
+        .filter(|client| !client_is_waiting_in_snapshot(client, snapshot))
+        .map(|client| format!("{} cwd={}", client.id, client.cwd))
+        .collect()
+}
+
+fn run_incremental_codex_upgrade_resume_worker(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    target_client_ids: BTreeSet<String>,
+    codex_version: Option<&str>,
+    request: UpgradeResumeAllRequest,
+) -> Result<(Option<u32>, u64, u64), String> {
+    // The federation caller only waits for this worker to be queued. The
+    // server that owns these clients performs the idle wait, package install,
+    // app-server restart, and serialized client re-exec locally.
+    let timeout = upgrade_idle_wait_timeout();
+    let start = SystemTime::now();
+
+    loop {
+        let thread_ids = upgrade_thread_ids_for_clients(&state, &target_client_ids);
+        let snapshot = match app_server_thread_snapshot(&paths, thread_ids.as_ref()) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                if start.elapsed().unwrap_or_default() >= timeout {
+                    return Err(format!(
+                        "timed out waiting for Codex clients to become idle; app-server status remained unavailable: {err}"
+                    ));
+                }
+                eprintln!(
+                    "yolo upgrade: app-server status unavailable; keeping clients alive and retrying: {err}"
+                );
+                thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+                continue;
+            }
+        };
+        apply_thread_snapshot(&state, &snapshot);
+
+        let working_clients = working_upgrade_clients(&state, &target_client_ids, &snapshot);
+        if working_clients.is_empty() {
+            // Do not mutate the managed Codex installation while a target
+            // client is still working. The upgrade-resume operation begins
+            // only after the explicit waiting condition above is satisfied.
+            upgrade_codex_cli_version(codex_version)?;
+            // Migrate the client wrappers while the old app-server is still
+            // reachable. Replacing the app-server first lets an old wrapper
+            // observe EOF, and old binaries may terminate before they can
+            // receive the authorized upgrade-resume generation. The gate is
+            // limited to the target set so a Phoenix caller that was
+            // intentionally excluded from the idle wait is not terminated by
+            // this pre-restart migration.
+            let gate_count =
+                prepare_upgrade_reexec_gate_for_client_ids(&state, &target_client_ids, &request);
+            eprintln!(
+                "yolo upgrade: prepared serialized pre-restart re-exec gate for {gate_count} clients"
+            );
+            let mut state_guard = state
+                .lock()
+                .map_err(|_| "server state lock poisoned".to_string())?;
+            state_guard.resume_generation = state_guard.resume_generation.saturating_add(1);
+            let resume_generation = state_guard.resume_generation;
+            drop(state_guard);
+            if let Err(err) = wait_for_upgrade_reexec_gate(&state) {
+                if let Ok(mut state) = state.lock() {
+                    state.upgrade_reexec_queue.clear();
+                    state.upgrade_reexec_active = None;
+                }
+                return Err(err);
+            }
+            // Only after every target wrapper has switched to the installed
+            // yolo executable may the shared app-server be replaced. Current
+            // wrappers then reconnect their Codex child on the new generation;
+            // legacy wrappers have already been migrated before seeing EOF.
+            let app_server_pid = match restart_tracked_app_server(Arc::clone(&state), paths.clone())
+            {
+                Ok(pid) => pid,
+                Err(err) => return Err(err),
+            };
+            let state_guard = state
+                .lock()
+                .map_err(|_| "server state lock poisoned".to_string())?;
+            return Ok((
+                Some(app_server_pid),
+                state_guard.app_server_generation,
+                resume_generation,
+            ));
+        }
+
+        if start.elapsed().unwrap_or_default() >= timeout {
+            return Err(format!(
+                "timed out waiting for Codex clients to become idle: {}",
+                working_clients.join(", ")
+            ));
+        }
+        eprintln!(
+            "yolo upgrade: waiting only for still-working clients before app-server resume: {}",
+            working_clients.join(", ")
+        );
+        thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+    }
 }
 
 fn refresh_resume_clients(
@@ -8220,6 +10534,7 @@ fn refresh_resume_permissions_clients(
             &paths.app_server_socket,
             thread_id,
             &client.cwd,
+            None,
         ) {
             Ok(()) => {
                 note_client_permissions_update(&state, &client.id);
@@ -8258,6 +10573,7 @@ fn refresh_resume_permissions_clients(
             &paths.app_server_socket,
             &thread.id,
             &thread.cwd,
+            None,
         ) {
             Ok(()) => {
                 updated_thread_ids.insert(thread.id.clone());
@@ -8327,6 +10643,8 @@ fn run_yolo_upgrade_resume_local(
     let request = UpgradeResumeAllRequest::default();
     wait_for_clients_idle(Arc::clone(&state), paths, &request)?;
     let mut value = upgrade_yolo(command)?;
+    let gate_count = prepare_upgrade_reexec_gate(&state, &request);
+    eprintln!("yolo upgrade: prepared serialized re-exec gate for {gate_count} clients");
     let generation = {
         let mut state = state
             .lock()
@@ -8336,7 +10654,10 @@ fn run_yolo_upgrade_resume_local(
     };
     if let Some(object) = value.as_object_mut() {
         object.insert("resume_generation".to_string(), Value::from(generation));
-        object.insert("client_reexec_scheduled".to_string(), Value::Bool(true));
+        object.insert(
+            "client_reexec_scheduled".to_string(),
+            Value::Bool(gate_count > 0),
+        );
         object.insert("server_restart_required".to_string(), Value::Bool(true));
         object.insert(
             "restart_policy".to_string(),
@@ -8480,6 +10801,68 @@ fn handle_api_request(
                 }),
             )
         }
+        ("POST", "/resume/resolve-last") => {
+            let request = match serde_json::from_str::<ResolveResumeLastRequest>(body) {
+                Ok(request) if !request.cwd.trim().is_empty() => request,
+                Ok(_) => {
+                    return json_response(400, &json!({"ok": false, "error": "cwd is required"}));
+                }
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            match resolve_resume_last_thread_on_server(&state, &request.cwd) {
+                Some(thread_id) => json_response(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "cwd": request.cwd,
+                        "thread_id": thread_id,
+                    }),
+                ),
+                None => json_response(
+                    409,
+                    &json!({
+                        "ok": false,
+                        "error": format!(
+                            "refusing resume --last for {}: no non-running Codex session with matching cwd",
+                            request.cwd
+                        ),
+                    }),
+                ),
+            }
+        }
+        ("POST", "/clients/prepare-resume") => {
+            let request = match serde_json::from_str::<PrepareResumeRequest>(body) {
+                Ok(request)
+                    if !request.thread_id.trim().is_empty() && !request.cwd.trim().is_empty() =>
+                {
+                    request
+                }
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        &json!({"ok": false, "error": "thread_id and cwd are required"}),
+                    );
+                }
+                Err(err) => {
+                    return json_response(400, &json!({"ok": false, "error": err.to_string()}));
+                }
+            };
+            if !Path::new(&request.cwd).is_absolute() {
+                return json_response(400, &json!({"ok": false, "error": "cwd must be absolute"}));
+            }
+            spawn_server_resume_policy_preparer(paths.clone(), request.clone());
+            json_response(
+                202,
+                &json!({
+                    "ok": true,
+                    "scheduled": true,
+                    "client_id": request.client_id,
+                    "thread_id": request.thread_id,
+                }),
+            )
+        }
         ("GET", "/agents") | ("GET", "/subagents") => {
             let snapshot = state
                 .lock()
@@ -8592,6 +10975,16 @@ fn handle_api_request(
                         state
                             .telemetry
                             .record_turn_input(thread_id, turn_id, prompt);
+                        for client in state.clients.values_mut() {
+                            if matches!(client.status.as_str(), "running" | "restarting")
+                                && client.thread_id.as_deref() == Some(thread_id)
+                            {
+                                client.codex_status = Some("active".to_string());
+                                client.codex_active_flags.clear();
+                                client.codex_status_updated_at = Some(now_secs());
+                                client.updated_at = now_secs();
+                            }
+                        }
                         persist_turn_archive(&paths.turn_archive, &state.telemetry);
                     }
                     json_response(202, &json!({"ok": true, "captured": true}))
@@ -8602,9 +10995,7 @@ fn handle_api_request(
         ("POST", "/clients/register") => match serde_json::from_str::<ClientInfo>(body) {
             Ok(client) => {
                 let changed = if let Ok(mut state) = state.lock() {
-                    let mut changed = reconcile_registered_client_process(&mut state, &client);
-                    changed |=
-                        remove_active_session_matches_client(&mut state.active_sessions, &client);
+                    let changed = reconcile_registered_client_process(&mut state, &client);
                     let changed = upsert_active_session_locked(&mut state, &client) || changed;
                     state.clients.insert(client.id.clone(), client);
                     changed
@@ -8625,41 +11016,65 @@ fn handle_api_request(
                     let mut resume_generation = 0;
                     let mut app_server_generation = 0;
                     let mut settings_reconfigure_generation = 0;
+                    let mut active_sessions_changed = false;
                     if let Some(id) = value.get("id").and_then(Value::as_str)
                         && let Ok(mut state) = state.lock()
                     {
                         resume_generation = state.resume_generation;
                         app_server_generation = state.app_server_generation;
                         if let Some(client) = state.clients.get_mut(id) {
+                            let heartbeat_now = now_secs();
+                            let mut settings_changed = false;
+                            let mut fast_known = false;
                             settings_reconfigure_generation =
                                 client.settings_reconfigure_generation;
                             client.updated_at = value
                                 .get("updated_at")
                                 .and_then(Value::as_u64)
-                                .unwrap_or_else(now_secs);
+                                .unwrap_or(heartbeat_now);
                             if let Some(model) = value.get("model").and_then(Value::as_str) {
                                 client.model = Some(model.to_string());
+                                settings_changed = true;
                             }
                             if let Some(service_tier) =
                                 value.get("service_tier").and_then(Value::as_str)
                             {
                                 client.service_tier = Some(service_tier.to_string());
                                 client.fast = is_fast_tier(client.service_tier.as_deref());
+                                settings_changed = true;
+                                fast_known = true;
                             }
                             if let Some(reasoning_effort) =
                                 value.get("reasoning_effort").and_then(Value::as_str)
                             {
                                 client.reasoning_effort = Some(reasoning_effort.to_string());
+                                settings_changed = true;
                             }
                             if let Some(fast) = value.get("fast").and_then(Value::as_bool) {
                                 client.fast = fast;
+                                settings_changed = true;
+                                fast_known = true;
+                            }
+                            if settings_changed {
+                                client.settings_source = "heartbeat".to_string();
+                                client.settings_observed_at = Some(heartbeat_now);
+                                client.fast_known |= fast_known;
                             }
                             client.status = value
                                 .get("status")
                                 .and_then(Value::as_str)
                                 .unwrap_or("running")
                                 .to_string();
+                            if settings_changed {
+                                if let Some(client) = state.clients.get(id).cloned() {
+                                    active_sessions_changed |=
+                                        upsert_active_session_locked(&mut state, &client);
+                                }
+                            }
                         }
+                    }
+                    if active_sessions_changed {
+                        persist_active_sessions(&state, &paths);
                     }
                     json_response(
                         200,
@@ -8672,6 +11087,28 @@ fn handle_api_request(
                     )
                 }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
+        }
+        ("POST", "/clients/reexec-claim") => {
+            let client_id = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+                value
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+            let Some(client_id) = client_id.filter(|id| !id.trim().is_empty()) else {
+                return json_response(400, &json!({"ok": false, "error": "client_id is required"}));
+            };
+            match claim_upgrade_reexec_permit_result(&state, &client_id) {
+                Ok(result) => json_response(
+                    200,
+                    &json!({
+                        "ok": true,
+                        "granted": result.granted(),
+                        "reason": result.reason()
+                    }),
+                ),
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
             }
         }
         ("POST", "/clients/finish") => match serde_json::from_str::<ClientInfo>(body) {
@@ -8738,6 +11175,20 @@ fn handle_api_request(
                     }
                 }
                 Err(err) => json_response(400, &json!({"ok": false, "error": err.to_string()})),
+            }
+        }
+        ("POST", "/upgrade-resume-preflight") => {
+            let request = serde_json::from_str::<UpgradeResumeAllRequest>(body).unwrap_or_default();
+            match upgrade_resume_preflight(Arc::clone(&state), &paths, &request) {
+                Ok(value) => json_response(200, &value),
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
+            }
+        }
+        ("POST", "/upgrade-resume-reexec") => {
+            let request = serde_json::from_str::<UpgradeResumeAllRequest>(body).unwrap_or_default();
+            match run_upgrade_resume_reexec_local(Arc::clone(&state), &paths, &request) {
+                Ok(value) => json_response(200, &value),
+                Err(err) => json_response(500, &json!({"ok": false, "error": err})),
             }
         }
         ("POST", "/upgrade-resume-all") => {
@@ -9181,7 +11632,11 @@ fn subscribe_running_client_threads(
     client: &mut AppServerRpcClient,
     subscribed_thread_ids: &mut BTreeSet<String>,
 ) -> Result<(), String> {
-    let mut target_thread_ids = known_running_client_thread_ids(state);
+    // Do not make a fresh app-server load for every saved client at service
+    // startup. The native client proxy already owns its resume connection;
+    // subscribe telemetry only after that client has sent a turn and its
+    // short bootstrap grace period has elapsed.
+    let mut target_thread_ids = known_active_client_thread_ids(state);
     target_thread_ids.extend(known_running_agent_thread_ids(state));
     for thread_id in target_thread_ids {
         if subscribed_thread_ids.contains(&thread_id) {
@@ -9199,7 +11654,8 @@ fn subscribe_running_client_threads(
     Ok(())
 }
 
-fn known_running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<String> {
+fn known_active_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<String> {
+    let now = now_secs();
     let Ok(state) = state.lock() else {
         return BTreeSet::new();
     };
@@ -9207,10 +11663,39 @@ fn known_running_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<
         .clients
         .values()
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| {
+            client
+                .codex_status
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|status| {
+                    matches!(
+                        status.as_str(),
+                        "active" | "working" | "running" | "inprogress"
+                    )
+                })
+        })
+        .filter(|client| {
+            client.codex_status_updated_at.is_some_and(|updated_at| {
+                now.saturating_sub(updated_at) >= APP_SERVER_STATUS_SUBSCRIPTION_GRACE.as_secs()
+            })
+        })
         .filter_map(|client| client.thread_id.as_deref())
         .map(str::trim)
         .filter(|thread_id| !thread_id.is_empty())
         .map(ToString::to_string)
+        .collect()
+}
+
+fn known_running_client_ids(state: &Arc<Mutex<ServerState>>) -> Vec<String> {
+    let Ok(state) = state.lock() else {
+        return Vec::new();
+    };
+    state
+        .clients
+        .values()
+        .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .map(|client| client.id.clone())
         .collect()
 }
 
@@ -9243,7 +11728,8 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
     let mut child_codex_by_parent: BTreeMap<u32, (u32, String, Option<String>)> = BTreeMap::new();
     let mut live_client_pids: BTreeSet<u32> = BTreeSet::new();
     for process in &processes {
-        if process.cmdline.iter().any(|arg| arg.contains("codex"))
+        if process_is_live(process)
+            && process.cmdline.iter().any(|arg| arg.contains("codex"))
             && process
                 .cmdline
                 .iter()
@@ -9259,6 +11745,7 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
             );
         }
         if process.pid != current_pid
+            && process_is_live(process)
             && is_yolo_process(process)
             && is_yolo_client_args(&process.cmdline.iter().skip(1).cloned().collect::<Vec<_>>())
         {
@@ -9269,26 +11756,39 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
     let Ok(mut state_guard) = state.lock() else {
         return;
     };
+    let mut tmux_panes = None;
     let mut persisted_sessions_changed = false;
-    let missing_clients = state_guard
+    let stale_client_ids = state_guard
         .clients
         .values()
         .filter(|client| client.status == "running" && !live_client_pids.contains(&client.yolo_pid))
-        .cloned()
+        .map(|client| client.id.clone())
         .collect::<Vec<_>>();
-    for client in state_guard.clients.values_mut() {
-        if client.status == "running" && !live_client_pids.contains(&client.yolo_pid) {
-            client.status = "exited".to_string();
+    for client_id in stale_client_ids {
+        // An unexpected process loss is a stale client, not proof that the
+        // saved thread should be discarded. Ensure the latest client record
+        // is persisted as a recovery candidate before changing its lifecycle
+        // status, then keep stale clients out of upgrade/preflight targets.
+        let Some(client_snapshot) = state_guard.clients.get(&client_id).cloned() else {
+            continue;
+        };
+        persisted_sessions_changed |=
+            upsert_active_session_locked(&mut state_guard, &client_snapshot);
+        if let Some(client) = state_guard.clients.get_mut(&client_id) {
+            client.status = "stale".to_string();
             client.ended_at = Some(now);
+            client.codex_status = None;
+            client.codex_active_flags.clear();
+            client.codex_status_updated_at = None;
             client.updated_at = now;
+            eprintln!(
+                "yolo server: marked missing or stopped client {} stale; preserving saved session",
+                client.id
+            );
         }
     }
-    for client in missing_clients {
-        persisted_sessions_changed |=
-            remove_active_session_matches_client(&mut state_guard.active_sessions, &client);
-    }
     for process in processes {
-        if process.pid == current_pid || !is_yolo_process(&process) {
+        if process.pid == current_pid || !process_is_live(&process) || !is_yolo_process(&process) {
             continue;
         }
         let args = process.cmdline.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -9315,7 +11815,37 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
         }
         let cfg = read_codex_config();
         let launch_cfg = parse_codex_launch_config(&args);
-        let service_tier = launch_cfg.service_tier.clone();
+        let ui_status = tmux_panes
+            .get_or_insert_with(collect_tmux_panes)
+            .iter()
+            .find(|pane| pane.yolo_pid == Some(process.pid))
+            .and_then(|pane| pane.codex_ui_status.clone());
+        let ui_service_tier = ui_status.as_ref().and_then(|status| {
+            status
+                .fast
+                .map(|fast| if fast { "priority" } else { "default" }.to_string())
+        });
+        let model = ui_status
+            .as_ref()
+            .and_then(|status| status.model.clone())
+            .or(launch_cfg.model)
+            .or(cfg.model);
+        let service_tier = ui_service_tier
+            .or(launch_cfg.service_tier)
+            .or(cfg.service_tier);
+        let reasoning_effort = ui_status
+            .as_ref()
+            .and_then(|status| status.effort.clone())
+            .or(launch_cfg.reasoning_effort);
+        let fast = ui_status
+            .as_ref()
+            .and_then(|status| status.fast)
+            .or_else(|| service_tier.as_deref().map(|tier| is_fast_tier(Some(tier))))
+            .unwrap_or(false);
+        let fast_known =
+            ui_status.as_ref().and_then(|status| status.fast).is_some() || service_tier.is_some();
+        let has_session_settings =
+            model.is_some() || service_tier.is_some() || reasoning_effort.is_some();
         let client = ClientInfo {
             id: id.clone(),
             yolo_pid: process.pid,
@@ -9325,10 +11855,19 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
             cwd: process.cwd.unwrap_or_else(|| String::from("")),
             args: args.clone(),
             remote,
-            model: launch_cfg.model.or(cfg.model),
+            model,
             service_tier: service_tier.clone(),
-            reasoning_effort: launch_cfg.reasoning_effort,
-            fast: is_fast_tier(service_tier.as_deref()),
+            reasoning_effort,
+            fast,
+            fast_known,
+            settings_source: if ui_status.is_some() {
+                "tmux_footer".to_string()
+            } else if has_session_settings {
+                "launch_args".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            settings_observed_at: has_session_settings.then_some(now),
             thread_id,
             thread_id_source: if yolo_thread_id.is_some() || codex_thread_id.is_some() {
                 "resume_arg".to_string()
@@ -9346,10 +11885,11 @@ fn scan_existing_yolo_clients(state: &Arc<Mutex<ServerState>>, paths: &RuntimePa
             settings_updated_at: None,
             settings_reconfigure_generation: 0,
         };
-        persisted_sessions_changed |=
-            remove_active_sessions_for_yolo_pid(&mut state_guard.active_sessions, process.pid);
-        persisted_sessions_changed |=
-            remove_active_session_matches_client(&mut state_guard.active_sessions, &client);
+        persisted_sessions_changed |= remove_active_sessions_for_yolo_pid_except(
+            &mut state_guard.active_sessions,
+            process.pid,
+            Some(&client),
+        );
         persisted_sessions_changed |= upsert_active_session_locked(&mut state_guard, &client);
         state_guard.clients.insert(id, client);
     }
@@ -9389,15 +11929,21 @@ fn client_id_from_managed_proxy_remote(remote: &str) -> Option<String> {
 }
 
 fn spawn_initial_app_server_thread_snapshot(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
-    thread::spawn(move || match app_server_thread_snapshot(&paths, None) {
-        Ok(snapshot) => apply_thread_snapshot(&state, &snapshot),
-        Err(err) => eprintln!("yolo server: initial app-server thread snapshot failed: {err}"),
-    });
+    // Startup must never enumerate or resume every saved rollout. A single
+    // large thread/read can monopolize the app-server and delay a live TUI's
+    // own thread/resume or turn/start. Thread status is populated lazily by
+    // the status listener after a client actually starts a turn.
+    let client_ids = known_running_client_ids(&state);
+    sync_active_sessions_for_client_ids(&state, &paths, &client_ids);
 }
 
 fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
     thread::spawn(move || {
         loop {
+            // Let native client resumes complete before the first background
+            // inventory request. Telemetry is intentionally eventual; it
+            // must not win the app-server startup race.
+            thread::sleep(APP_SERVER_TELEMETRY_REFRESH_INTERVAL);
             match app_server_agent_thread_inventory(&paths) {
                 Ok(threads) => {
                     if let Ok(mut state) = state.lock() {
@@ -9410,48 +11956,17 @@ fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths:
                 }
                 Err(err) => eprintln!("yolo server: agent telemetry inventory failed: {err}"),
             }
-            thread::sleep(APP_SERVER_TELEMETRY_REFRESH_INTERVAL);
         }
     });
 }
 
 fn app_server_agent_thread_inventory(paths: &RuntimePaths) -> Result<Vec<Value>, String> {
-    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
-    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
-    client.initialize()?;
     let mut cursor: Option<String> = None;
     let mut threads = Vec::new();
-    for _ in 0..16 {
-        let mut params = json!({
-            "limit": 200,
-            "sortKey": "updated_at",
-            "useStateDbOnly": true,
-            "sourceKinds": [
-                "cli",
-                "vscode",
-                "exec",
-                "appServer",
-                "subAgent",
-                "subAgentReview",
-                "subAgentCompact",
-                "subAgentThreadSpawn",
-                "subAgentOther",
-                "unknown"
-            ]
-        });
-        if let Some(cursor_value) = cursor.as_deref() {
-            params["cursor"] = Value::String(cursor_value.to_string());
-        }
-        let result = client.request("thread/list", params)?;
-        let data = result
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("thread/list missing data: {result}"))?;
-        threads.extend(data.iter().cloned());
-        cursor = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+    for _ in 0..APP_SERVER_TELEMETRY_MAX_PAGES {
+        let (page, next_cursor) = app_server_agent_thread_inventory_page(paths, cursor.as_deref())?;
+        threads.extend(page);
+        cursor = next_cursor;
         if cursor.is_none() {
             break;
         }
@@ -9459,10 +11974,55 @@ fn app_server_agent_thread_inventory(paths: &RuntimePaths) -> Result<Vec<Value>,
     Ok(threads)
 }
 
+fn app_server_agent_thread_inventory_page(
+    paths: &RuntimePaths,
+    cursor: Option<&str>,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    // Do not hold the global RPC gate across all pagination pages. A large
+    // state DB inventory can take tens of seconds and used to make every
+    // foreground settings update report "app-server RPC gate busy".
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background)?;
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.set_rpc_timeout(APP_SERVER_BACKGROUND_RPC_TIMEOUT);
+    client.initialize()?;
+    let mut params = json!({
+        "limit": 200,
+        "sortKey": "updated_at",
+        "useStateDbOnly": true,
+        "sourceKinds": [
+            "cli",
+            "vscode",
+            "exec",
+            "appServer",
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther",
+            "unknown"
+        ]
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = Value::String(cursor.to_string());
+    }
+    let result = client.request("thread/list", params)?;
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("thread/list missing data: {result}"))?
+        .to_vec();
+    let next_cursor = result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Ok((data, next_cursor))
+}
+
 #[derive(Debug)]
 struct ProcInfo {
     pid: u32,
     ppid: u32,
+    state: char,
     comm: String,
     cmdline: Vec<String>,
     cwd: Option<String>,
@@ -9482,13 +12042,16 @@ fn read_process_table() -> Result<Vec<ProcInfo>, String> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let ppid = read_proc_ppid(dir.join("stat")).unwrap_or(0);
+        let stat_path = dir.join("stat");
+        let ppid = read_proc_ppid(stat_path.clone()).unwrap_or(0);
+        let state = read_proc_state(stat_path).unwrap_or('?');
         let cwd = fs::read_link(dir.join("cwd"))
             .ok()
             .map(|path| path.display().to_string());
         out.push(ProcInfo {
             pid,
             ppid,
+            state,
             comm,
             cmdline,
             cwd,
@@ -9510,6 +12073,21 @@ fn read_proc_ppid(path: PathBuf) -> Option<u32> {
     let stat = fs::read_to_string(path).ok()?;
     let right = stat.rsplit_once(')')?.1.trim();
     right.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn read_proc_state(path: PathBuf) -> Option<char> {
+    let stat = fs::read_to_string(path).ok()?;
+    let right = stat.rsplit_once(')')?.1.trim();
+    right.split_whitespace().next()?.chars().next()
+}
+
+fn process_is_live(process: &ProcInfo) -> bool {
+    !matches!(process.state, 'T' | 't' | 'Z' | 'X' | 'x')
+}
+
+fn pid_is_runnable(pid: u32) -> bool {
+    let state = read_proc_state(PathBuf::from(format!("/proc/{pid}/stat")));
+    state.is_some_and(|state| !matches!(state, 'T' | 't' | 'Z' | 'X' | 'x')) && pid_is_alive(pid)
 }
 
 fn is_yolo_process(process: &ProcInfo) -> bool {
@@ -9580,6 +12158,73 @@ fn terminate_app_servers_for_socket(paths: &RuntimePaths, timeout: Duration) {
     }
 }
 
+fn apply_thread_settings_to_client(client: &mut ClientInfo, thread: &AppThreadSnapshot, now: u64) {
+    let app_server_settings_observed = thread.model.is_some()
+        || thread.service_tier.is_some()
+        || thread.reasoning_effort.is_some();
+    let app_server_fast_observed = thread.service_tier.is_some();
+    let preserve_client_settings = client.settings_updated_at.is_some()
+        || matches!(
+            client.settings_source.as_str(),
+            "configure" | "heartbeat" | "tmux_footer"
+        );
+    let launch_cfg = if preserve_client_settings {
+        CodexLaunchConfig::default()
+    } else {
+        parse_codex_launch_config(&client.args)
+    };
+
+    // A thread snapshot can describe the settings that were last persisted by
+    // app-server, while the just-restarted client is still being prepared.
+    // The yolo launch intent (or an explicit live update) is authoritative for
+    // this managed client; app-server fills only settings absent locally.
+    let local_model = if preserve_client_settings {
+        client.model.clone()
+    } else {
+        launch_cfg.model
+    };
+    let local_service_tier = if preserve_client_settings {
+        client.service_tier.clone()
+    } else {
+        launch_cfg.service_tier
+    };
+    let local_reasoning_effort = if preserve_client_settings {
+        client.reasoning_effort.clone()
+    } else {
+        launch_cfg.reasoning_effort
+    };
+    let local_settings_observed =
+        local_model.is_some() || local_service_tier.is_some() || local_reasoning_effort.is_some();
+
+    if let Some(model) = local_model.or_else(|| thread.model.clone()) {
+        client.model = Some(model);
+    }
+    if let Some(service_tier) = local_service_tier.or_else(|| thread.service_tier.clone()) {
+        client.service_tier = Some(service_tier);
+        client.fast = is_fast_tier(client.service_tier.as_deref());
+        client.fast_known = true;
+    }
+    if let Some(reasoning_effort) =
+        local_reasoning_effort.or_else(|| thread.reasoning_effort.clone())
+    {
+        client.reasoning_effort = Some(reasoning_effort);
+    }
+
+    if local_settings_observed {
+        if !matches!(
+            client.settings_source.as_str(),
+            "configure" | "heartbeat" | "tmux_footer"
+        ) {
+            client.settings_source = "launch_args".to_string();
+        }
+        client.settings_observed_at = Some(now);
+    } else if app_server_settings_observed {
+        client.settings_source = "app_server".to_string();
+        client.settings_observed_at = Some(now);
+        client.fast_known |= app_server_fast_observed;
+    }
+}
+
 fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadSnapshot]) {
     let now = now_secs();
     let Ok(mut state) = state.lock() else {
@@ -9610,32 +12255,8 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
         client.codex_status = Some(thread.status.clone());
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
-        let launch_cfg = if client.settings_updated_at.is_some() {
-            CodexLaunchConfig::default()
-        } else {
-            parse_codex_launch_config(&client.args)
-        };
-        // A resumed thread may outlive the yolo process and carry a newer
-        // setting than the launch command line. Treat app-server state as the
-        // source of truth and use launch arguments only as a fallback.
-        if let Some(model) = thread.model.clone().or_else(|| launch_cfg.model) {
-            client.model = Some(model);
-        }
-        if let Some(service_tier) = thread
-            .service_tier
-            .clone()
-            .or_else(|| launch_cfg.service_tier)
-        {
-            client.service_tier = Some(service_tier);
-            client.fast = is_fast_tier(client.service_tier.as_deref());
-        }
-        if let Some(reasoning_effort) = thread
-            .reasoning_effort
-            .clone()
-            .or_else(|| launch_cfg.reasoning_effort)
-        {
-            client.reasoning_effort = Some(reasoning_effort);
-        }
+        client.updated_at = now;
+        apply_thread_settings_to_client(client, thread, now);
     }
 }
 
@@ -9662,32 +12283,7 @@ fn apply_single_thread_snapshot(state: &Arc<Mutex<ServerState>>, thread: &AppThr
         client.codex_active_flags = thread.active_flags.clone();
         client.codex_status_updated_at = Some(now);
         client.updated_at = now;
-        let launch_cfg = if client.settings_updated_at.is_some() {
-            CodexLaunchConfig::default()
-        } else {
-            parse_codex_launch_config(&client.args)
-        };
-        // A resumed thread may outlive the yolo process and carry a newer
-        // setting than the launch command line. Treat app-server state as the
-        // source of truth and use launch arguments only as a fallback.
-        if let Some(model) = thread.model.clone().or_else(|| launch_cfg.model) {
-            client.model = Some(model);
-        }
-        if let Some(service_tier) = thread
-            .service_tier
-            .clone()
-            .or_else(|| launch_cfg.service_tier)
-        {
-            client.service_tier = Some(service_tier);
-            client.fast = is_fast_tier(client.service_tier.as_deref());
-        }
-        if let Some(reasoning_effort) = thread
-            .reasoning_effort
-            .clone()
-            .or_else(|| launch_cfg.reasoning_effort)
-        {
-            client.reasoning_effort = Some(reasoning_effort);
-        }
+        apply_thread_settings_to_client(client, thread, now);
     }
 }
 
@@ -9871,8 +12467,24 @@ fn wait_for_clients_idle(
     let start = SystemTime::now();
     loop {
         let target_thread_ids = upgrade_wait_thread_ids(&state, request);
-        let snapshot = app_server_thread_snapshot(paths, target_thread_ids.as_ref())?;
+        let snapshot = match app_server_thread_snapshot(paths, target_thread_ids.as_ref()) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                if start.elapsed().unwrap_or_default() >= timeout {
+                    return Err(format!(
+                        "timed out waiting for Codex clients to become idle; app-server status remained unavailable: {err}"
+                    ));
+                }
+                eprintln!(
+                    "yolo: app-server status unavailable; keeping clients alive and retrying: {err}"
+                );
+                thread::sleep(UPGRADE_IDLE_POLL_INTERVAL);
+                continue;
+            }
+        };
         apply_thread_snapshot(&state, &snapshot);
+        let client_ids = known_running_client_ids(&state);
+        sync_active_sessions_for_client_ids(&state, paths, &client_ids);
         let working_clients = working_clients_for_snapshot(&state, &snapshot, request);
         if working_clients.is_empty() {
             return Ok(());
@@ -9891,6 +12503,88 @@ fn wait_for_clients_idle(
     }
 }
 
+fn upgrade_resume_preflight(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    request: &UpgradeResumeAllRequest,
+) -> Result<Value, String> {
+    // Reconcile /proc before using the last heartbeat as an upgrade gate. A
+    // stopped wrapper must be stale, not an idle live client that can block
+    // migration indefinitely.
+    scan_existing_yolo_clients(&state, paths);
+    let target_thread_ids = upgrade_wait_thread_ids(&state, request);
+    let snapshot = match app_server_thread_snapshot(paths, target_thread_ids.as_ref()) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            // A timeout is not evidence of waiting. Return a blocking status
+            // so direct upgrade-resume callers can poll until the app-server
+            // reports an explicit state instead of aborting or proceeding.
+            return Ok(json!({
+                "ok": true,
+                "waiting": false,
+                "working": [format!("app-server status unavailable: {err}")],
+                "status_error": err,
+            }));
+        }
+    };
+    apply_thread_snapshot(&state, &snapshot);
+    let working = working_clients_for_snapshot(&state, &snapshot, request);
+    Ok(json!({
+        "ok": true,
+        "waiting": working.is_empty(),
+        "working": working,
+    }))
+}
+
+fn run_upgrade_resume_reexec_local(
+    state: Arc<Mutex<ServerState>>,
+    paths: &RuntimePaths,
+    request: &UpgradeResumeAllRequest,
+) -> Result<Value, String> {
+    if UPGRADE_RESUME_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("a Codex upgrade-resume job is already running".to_string());
+    }
+
+    let result = (|| {
+        // This endpoint is the safe hand-off point for a yolo binary update:
+        // wait for explicit app-server idle state, then re-exec wrappers while
+        // the current app-server is still reachable. It intentionally does
+        // not restart the app-server itself.
+        scan_existing_yolo_clients(&state, paths);
+        wait_for_clients_idle(Arc::clone(&state), paths, request)?;
+        let target_client_ids = upgrade_target_client_ids(&state, request);
+        let gate_count =
+            prepare_upgrade_reexec_gate_for_client_ids(&state, &target_client_ids, request);
+        let generation = {
+            let mut state = state
+                .lock()
+                .map_err(|_| "server state lock poisoned".to_string())?;
+            state.resume_generation = state.resume_generation.saturating_add(1);
+            state.resume_generation
+        };
+        if let Err(err) = wait_for_upgrade_reexec_gate(&state) {
+            if let Ok(mut state) = state.lock() {
+                state.upgrade_reexec_queue.clear();
+                state.upgrade_reexec_active = None;
+            }
+            return Err(err);
+        }
+        Ok(json!({
+            "ok": true,
+            "client_reexec_scheduled": gate_count > 0,
+            "clients": target_client_ids.len(),
+            "reexecuted": gate_count,
+            "resume_generation": generation,
+            "app_server_restart_required": false,
+        }))
+    })();
+    UPGRADE_RESUME_IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
+}
+
 fn working_clients_for_snapshot(
     state: &Arc<Mutex<ServerState>>,
     snapshot: &[AppThreadSnapshot],
@@ -9905,15 +12599,7 @@ fn working_clients_for_snapshot(
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
         .filter(|client| !should_ignore_upgrade_wait_client(client, request))
         .filter_map(|client| {
-            let is_active = match client.thread_id.as_deref() {
-                Some(thread_id) => snapshot
-                    .iter()
-                    .any(|thread| thread.id == thread_id && thread.status == "active"),
-                None => snapshot
-                    .iter()
-                    .any(|thread| thread.cwd == client.cwd && thread.status == "active"),
-            };
-            if is_active {
+            if !client_is_waiting_in_snapshot(client, snapshot) {
                 Some(format!("{} cwd={}", client.id, client.cwd))
             } else {
                 None
@@ -9988,7 +12674,6 @@ fn configure_clients(
             request.fast,
             request.reasoning_effort.clone(),
         );
-        request_client_reconfigure(&state, &client_id);
         pending.push(json!({
             "client_id": client_id,
             "thread_id": Value::Null,
@@ -9998,6 +12683,12 @@ fn configure_clients(
     if !pending.is_empty() {
         publish_status_event(&state, "client-settings-pending");
     }
+    // Pending clients have no loaded app-server thread yet. Their durable
+    // launch intent is safe to record above; the first turn will consume it.
+    // Live clients are deliberately not updated here: their metadata becomes
+    // authoritative only after thread/settings/update acknowledges success.
+    // The live update then advances the settings generation, and the client
+    // re-execs after the ACK so the terminal CLI reflects the new mode.
     if clients.is_empty() {
         let client_ids = selected_ids.iter().cloned().collect::<Vec<_>>();
         sync_active_sessions_for_client_ids(&state, paths, &client_ids);
@@ -10051,7 +12742,7 @@ fn configure_clients_once(
     // Background inventory/history/snapshot RPCs share the same app-server
     // process. Control updates get priority so a UI setting change cannot sit
     // behind telemetry work or another configuration request.
-    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control);
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control)?;
     let mut rpc = AppServerRpcClient::connect(&paths.app_server_socket)?;
     rpc.set_rpc_timeout(configure_rpc_timeout(request));
     rpc.initialize()?;
@@ -10072,6 +12763,9 @@ fn configure_clients_once(
             params.insert("effort".to_string(), Value::String(effort.clone()));
         }
         rpc.request("thread/settings/update", Value::Object(params))?;
+        // Commit the in-memory and durable settings only after the live RPC
+        // succeeded. Otherwise a timeout/reset would make /status advertise a
+        // configuration that Codex never accepted.
         note_client_settings_update(
             state,
             client_id,
@@ -10079,6 +12773,11 @@ fn configure_clients_once(
             request.fast,
             request.reasoning_effort.clone(),
         );
+        // Advance the generation only after the app-server acknowledged the
+        // update. The heartbeat then asks the terminal-bound client to re-exec
+        // with the server's authoritative settings without racing this RPC.
+        request_client_reconfigure(state, client_id);
+        sync_active_sessions_for_client_ids(state, paths, &[client_id.clone()]);
         publish_status_event(state, "client-settings-updated");
         updated.push(json!({
             "client_id": client_id,
@@ -10120,6 +12819,7 @@ fn note_client_settings_update(
     reasoning_effort: Option<String>,
 ) {
     let now = now_secs();
+    let fast_known_update = fast.is_some();
     let Ok(mut state) = state.lock() else {
         return;
     };
@@ -10136,6 +12836,9 @@ fn note_client_settings_update(
     if let Some(reasoning_effort) = reasoning_effort {
         client.reasoning_effort = Some(reasoning_effort);
     }
+    client.settings_source = "configure".to_string();
+    client.settings_observed_at = Some(now);
+    client.fast_known |= fast_known_update;
     client.settings_updated_at = Some(now);
     client.updated_at = now;
 }
@@ -10228,8 +12931,12 @@ fn apply_pending_settings_to_client_info(
         client.fast = fast;
         client.service_tier = Some(if fast { "priority" } else { "default" }.to_string());
     }
-    client.settings_updated_at = Some(now_secs());
-    client.updated_at = now_secs();
+    let now = now_secs();
+    client.settings_source = "configure".to_string();
+    client.settings_observed_at = Some(now);
+    client.fast_known |= settings.fast.is_some();
+    client.settings_updated_at = Some(now);
+    client.updated_at = now;
 }
 
 fn sync_applied_pending_settings(client_id: &str, settings: &PendingClientSettings) {
@@ -10294,21 +13001,46 @@ fn select_configure_clients(
         .map_err(|_| "server state lock poisoned".to_string())?;
     let mut ids = BTreeSet::new();
     for client in state.clients.values() {
-        if !matches!(client.status.as_str(), "running" | "restarting") {
-            continue;
-        }
-        let matched = request.all
-            || request.client_id.as_deref() == Some(client.id.as_str())
-            || request
-                .thread_id
-                .as_deref()
-                .is_some_and(|thread_id| client.thread_id.as_deref() == Some(thread_id))
-            || request.cwd.as_deref() == Some(client.cwd.as_str());
-        if matched {
+        if configure_client_matches(client, request) {
             ids.insert(client.id.clone());
         }
     }
     Ok(ids)
+}
+
+fn configure_client_matches(client: &ClientInfo, request: &ConfigureClientsRequest) -> bool {
+    if !matches!(client.status.as_str(), "running" | "restarting") {
+        return false;
+    }
+    if request.all {
+        return true;
+    }
+
+    // A thread ID is stable across a client re-exec and is the identity used
+    // by the app-server RPC. If it is present, never broaden the match with a
+    // stale client ID or cwd from an older modal snapshot.
+    if let Some(thread_id) = request
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return client.thread_id.as_deref().map(str::trim) == Some(thread_id);
+    }
+    if let Some(client_id) = request
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return client.id.trim() == client_id;
+    }
+    request
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|cwd| client.cwd.trim() == cwd)
 }
 
 fn selected_clients_by_thread_state(
@@ -10381,7 +13113,7 @@ fn collect_tmux_panes() -> Vec<TmuxPaneInfo> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{pane_current_command}",
+            "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_path}\t#{pane_current_command}",
         ])
         .output();
     let Ok(output) = output else {
@@ -10402,6 +13134,7 @@ fn parse_tmux_pane_line(line: &str, socket_name: &str) -> Option<TmuxPaneInfo> {
     let session_name = nonempty_string(parts.next());
     let window_index = parts.next().and_then(|value| value.parse::<u32>().ok());
     let pane_index = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let pane_id = nonempty_string(parts.next());
     let pane_pid = parts.next().and_then(|value| value.parse::<u32>().ok());
     let pane_tty = nonempty_string(parts.next());
     let cwd = nonempty_string(parts.next());
@@ -10422,6 +13155,7 @@ fn parse_tmux_pane_line(line: &str, socket_name: &str) -> Option<TmuxPaneInfo> {
         session_name,
         window_index,
         pane_index,
+        pane_id,
         pane_pid,
         yolo_pid,
         cwd,
@@ -10532,7 +13266,20 @@ fn app_server_thread_snapshot(
     paths: &RuntimePaths,
     target_thread_ids: Option<&BTreeSet<String>>,
 ) -> Result<Vec<AppThreadSnapshot>, String> {
-    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
+    if let Some(targets) = target_thread_ids {
+        // A preflight may inspect many live sessions. Keep each resume/read
+        // RPC behind its own short gate lease so a settings update can run
+        // between sessions instead of waiting for the whole batch.
+        let mut threads = Vec::new();
+        for thread_id in targets {
+            if let Some(thread) = app_server_thread_snapshot_one(paths, thread_id)? {
+                threads.push(thread);
+            }
+        }
+        return Ok(threads);
+    }
+
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background)?;
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
     let loaded = client.request(
@@ -10544,23 +13291,18 @@ fn app_server_thread_snapshot(
     let thread_ids = loaded
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("thread/loaded/list missing data: {loaded}"))?;
+        .ok_or_else(|| format!("thread/loaded/list missing data: {loaded}"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     let mut threads = Vec::new();
     for thread_id in thread_ids {
-        let Some(thread_id) = thread_id.as_str() else {
-            continue;
-        };
-        if let Some(targets) = target_thread_ids
-            && !targets.is_empty()
-            && !targets.contains(thread_id)
-        {
-            continue;
-        }
         let response = match client.request(
             "thread/resume",
             json!({
-                "threadId": thread_id,
+                "threadId": &thread_id,
                 "excludeTurns": true
             }),
         ) {
@@ -10568,7 +13310,7 @@ fn app_server_thread_snapshot(
             Err(_) => client.request(
                 "thread/read",
                 json!({
-                    "threadId": thread_id,
+                    "threadId": &thread_id,
                     "includeTurns": false
                 }),
             )?,
@@ -10583,12 +13325,46 @@ fn app_server_thread_snapshot(
     Ok(threads)
 }
 
+fn app_server_thread_snapshot_one(
+    paths: &RuntimePaths,
+    thread_id: &str,
+) -> Result<Option<AppThreadSnapshot>, String> {
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background)?;
+    let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
+    client.set_rpc_timeout(APP_SERVER_BACKGROUND_RPC_TIMEOUT);
+    client.initialize()?;
+    let response = match client.request(
+        "thread/resume",
+        json!({
+            "threadId": thread_id,
+            "excludeTurns": true
+        }),
+    ) {
+        Ok(response) => response,
+        Err(_) => client.request(
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+                "includeTurns": false
+            }),
+        )?,
+    };
+    let Some(thread) = response.get("thread") else {
+        return Ok(None);
+    };
+    let Some(mut snapshot) = parse_app_thread_snapshot(thread) else {
+        return Ok(None);
+    };
+    apply_app_thread_settings(&mut snapshot, &response);
+    Ok(Some(snapshot))
+}
+
 fn app_server_thread_history(
     paths: &RuntimePaths,
     thread_id: &str,
     limit: usize,
 ) -> Result<Vec<TurnInfo>, String> {
-    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background);
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Background)?;
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
     let response = client.request(
@@ -10747,24 +13523,86 @@ fn update_app_server_resume_thread_settings(
     socket: &Path,
     thread_id: &str,
     cwd: &str,
+    configuration: Option<&YoloDefaultConfiguration>,
 ) -> Result<(), String> {
-    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control);
+    let _rpc_lease = acquire_app_server_rpc(AppServerRpcPriority::Control)?;
     let mut client = AppServerRpcClient::connect(socket)?;
+    client.set_rpc_timeout(RESUME_POLICY_RPC_TIMEOUT);
     client.initialize()?;
     client.request(
         "thread/settings/update",
-        json!({
-            "threadId": thread_id,
-            "cwd": cwd,
-            "runtimeWorkspaceRoots": [cwd],
-            "approvalPolicy": "never",
-            "approvalsReviewer": "user",
-            "sandboxPolicy": {
-                "type": YOLO_APP_SERVER_SANDBOX_POLICY
-            }
-        }),
+        resume_thread_settings_params(thread_id, cwd, configuration),
     )?;
     Ok(())
+}
+
+fn spawn_server_resume_policy_preparer(paths: RuntimePaths, request: PrepareResumeRequest) {
+    thread::spawn(move || {
+        match update_app_server_resume_thread_settings(
+            &paths.app_server_socket,
+            &request.thread_id,
+            &request.cwd,
+            request.configuration.as_ref(),
+        ) {
+            Ok(()) => eprintln!(
+                "yolo server: prepared resume policy for client {} thread {}",
+                request.client_id, request.thread_id
+            ),
+            Err(err) if is_app_server_thread_not_found_error(&err, &request.thread_id) => {
+                eprintln!(
+                    "yolo server: resume policy skipped because Codex thread {} is not loaded: {err}",
+                    request.thread_id
+                );
+            }
+            Err(err) => eprintln!(
+                "yolo server: resume policy preparation failed for thread {} (best effort): {err}",
+                request.thread_id
+            ),
+        }
+    });
+}
+
+fn resume_thread_settings_params(
+    thread_id: &str,
+    cwd: &str,
+    configuration: Option<&YoloDefaultConfiguration>,
+) -> Value {
+    let mut params = serde_json::Map::from_iter([
+        ("threadId".to_string(), Value::String(thread_id.to_string())),
+        ("cwd".to_string(), Value::String(cwd.to_string())),
+        ("runtimeWorkspaceRoots".to_string(), json!([cwd])),
+        (
+            "approvalPolicy".to_string(),
+            Value::String("never".to_string()),
+        ),
+        (
+            "approvalsReviewer".to_string(),
+            Value::String("user".to_string()),
+        ),
+        (
+            "sandboxPolicy".to_string(),
+            json!({"type": YOLO_APP_SERVER_SANDBOX_POLICY}),
+        ),
+    ]);
+    if let Some(configuration) = configuration {
+        params.insert(
+            "model".to_string(),
+            Value::String(configuration.model.clone()),
+        );
+        params.insert(
+            "serviceTier".to_string(),
+            Value::String(if configuration.fast {
+                "priority".to_string()
+            } else {
+                "default".to_string()
+            }),
+        );
+        params.insert(
+            "effort".to_string(),
+            Value::String(configuration.reasoning_effort.clone()),
+        );
+    }
+    Value::Object(params)
 }
 
 fn apply_app_thread_settings(snapshot: &mut AppThreadSnapshot, response: &Value) {
@@ -10814,6 +13652,17 @@ struct AppServerRpcClient {
     stream: UnixStream,
     next_id: u64,
     rpc_timeout: Duration,
+}
+
+impl Drop for AppServerRpcClient {
+    fn drop(&mut self) {
+        // The telemetry and control paths use short-lived WebSocket clients.
+        // Dropping the UnixStream directly sends EOF, which makes the
+        // app-server report `Connection reset without closing handshake` and
+        // needlessly exercises its transport error path.  A best-effort close
+        // also gives the server a chance to release the connection cleanly.
+        let _ = websocket_send_close(&mut self.stream);
+    }
 }
 
 impl AppServerRpcClient {
@@ -10914,8 +13763,21 @@ impl AppServerRpcClient {
     }
 
     fn read_response_for(&mut self, id: u64) -> Result<Value, String> {
+        // App-server notifications may continue while the requested RPC is
+        // being computed. Use one deadline for the whole request; resetting
+        // the timeout for every unrelated notification turns a busy server
+        // into an effectively unbounded wait.
+        let deadline = Instant::now() + self.rpc_timeout;
         loop {
-            let value = self.read_message_value()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "app-server request {id} timed out waiting for response"
+                ));
+            }
+            let message = websocket_read_text_with_timeout(&mut self.stream, remaining)?;
+            let value: Value = serde_json::from_str(&message)
+                .map_err(|err| format!("decode app-server message: {err}: {message}"))?;
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -10983,56 +13845,31 @@ fn spawn_client_thread_proxy(
     remove_socket_if_present(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|err| format!("bind client proxy {}: {err}", socket_path.display()))?;
-
+    let listener_event_tx = event_tx.clone();
     thread::spawn(move || {
-        let Ok((mut client_stream, _)) = listener.accept() else {
-            return;
-        };
-        let Ok(mut upstream_stream) = UnixStream::connect(&upstream_socket) else {
-            return;
-        };
-
-        let request = match read_http_headers(&mut client_stream) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        if upstream_stream.write_all(request.as_bytes()).is_err() {
-            return;
-        }
-        let response = match read_http_headers(&mut upstream_stream) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        if client_stream.write_all(response.as_bytes()).is_err() {
-            return;
-        }
-
-        let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
-            pending_create_request_ids: BTreeSet::new(),
-            // A resume argument is authoritative from the moment the proxy
-            // connects. The app-server may broadcast thread/started for other
-            // loaded threads on this socket; those notifications must not
-            // rebind this client away from its requested resume target.
-            current_thread_id: initial_thread_id,
-            event_tx,
-        }));
-        let Ok(mut client_read) = client_stream.try_clone() else {
-            return;
-        };
-        let Ok(mut upstream_write) = upstream_stream.try_clone() else {
-            return;
-        };
-        let client_tracker = Arc::clone(&tracker);
-        let client_to_server = thread::spawn(move || {
-            relay_client_websocket_frames(
-                &mut client_read,
-                &mut upstream_write,
-                &client_tracker,
+        loop {
+            let (client_stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    eprintln!("yolo client proxy: accept failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = run_client_proxy_connection(
+                client_stream,
+                &upstream_socket,
+                &listener_event_tx,
                 &relay_pending_settings_path,
-            );
-        });
-        relay_server_websocket_frames(&mut upstream_stream, &mut client_stream, &tracker);
-        let _ = client_to_server.join();
+                initial_thread_id.as_deref(),
+            ) {
+                if listener_event_tx
+                    .send(ClientEvent::ProxyDisconnected { error })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
     });
 
     Ok(ClientThreadProxy {
@@ -11042,13 +13879,92 @@ fn spawn_client_thread_proxy(
     })
 }
 
+fn run_client_proxy_connection(
+    mut client_stream: UnixStream,
+    upstream_socket: &Path,
+    event_tx: &mpsc::Sender<ClientEvent>,
+    pending_settings_path: &Path,
+    initial_thread_id: Option<&str>,
+) -> Result<(), String> {
+    let request = read_http_headers(&mut client_stream)
+        .map_err(|error| format!("read client websocket handshake: {error}"))?;
+    let mut upstream_stream = UnixStream::connect(upstream_socket)
+        .map_err(|error| format!("connect app-server: {error}"))?;
+    upstream_stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write app-server websocket handshake: {error}"))?;
+    let response = read_http_headers(&mut upstream_stream)
+        .map_err(|error| format!("read app-server websocket handshake: {error}"))?;
+    if !response.starts_with("HTTP/1.1 101") && !response.starts_with("HTTP/1.0 101") {
+        return Err(format!(
+            "app-server websocket handshake failed: {}",
+            response.lines().next().unwrap_or_default()
+        ));
+    }
+    client_stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write client websocket handshake: {error}"))?;
+
+    let tracker = Arc::new(Mutex::new(ThreadBindingTracker {
+        pending_create_request_ids: BTreeSet::new(),
+        pending_resume_request_ids: BTreeSet::new(),
+        // A resume argument is authoritative from the moment the proxy
+        // connects. The app-server may broadcast thread/started for other
+        // loaded threads on this socket; those notifications must not
+        // rebind this client away from its requested resume target.
+        current_thread_id: initial_thread_id.map(ToString::to_string),
+        event_tx: event_tx.clone(),
+    }));
+    let mut client_read = client_stream
+        .try_clone()
+        .map_err(|error| format!("clone client websocket: {error}"))?;
+    let mut upstream_write = upstream_stream
+        .try_clone()
+        .map_err(|error| format!("clone app-server websocket: {error}"))?;
+    let client_close_sent = Arc::new(AtomicBool::new(false));
+    let client_tracker = Arc::clone(&tracker);
+    let client_close_sent_for_relay = Arc::clone(&client_close_sent);
+    let pending_settings_path = pending_settings_path.to_path_buf();
+    let client_to_server = thread::spawn(move || {
+        relay_client_websocket_frames(
+            &mut client_read,
+            &mut upstream_write,
+            &client_tracker,
+            &pending_settings_path,
+            &client_close_sent_for_relay,
+        );
+    });
+    let server_result = relay_server_websocket_frames(
+        &mut upstream_stream,
+        &mut client_stream,
+        &tracker,
+        &client_close_sent,
+    );
+    // A broken app-server connection must only tear down this child
+    // connection. The listener remains bound and accepts the next Codex
+    // child after the wrapper has waited for server recovery.
+    let _ = client_stream.shutdown(Shutdown::Both);
+    let _ = upstream_stream.shutdown(Shutdown::Both);
+    let _ = client_to_server.join();
+
+    match server_result {
+        Ok(()) => Ok(()),
+        Err(_error) if client_close_sent.load(Ordering::SeqCst) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn relay_client_websocket_frames(
     source: &mut UnixStream,
     target: &mut UnixStream,
     tracker: &Arc<Mutex<ThreadBindingTracker>>,
     pending_settings_path: &Path,
+    client_close_sent: &Arc<AtomicBool>,
 ) {
     while let Ok(frame) = read_websocket_frame(source) {
+        if frame.opcode == 0x8 {
+            client_close_sent.store(true, Ordering::SeqCst);
+        }
         if frame.opcode != 0x1 {
             if target.write_all(&frame.raw).is_err() {
                 return;
@@ -11090,19 +14006,85 @@ fn relay_server_websocket_frames(
     source: &mut UnixStream,
     target: &mut UnixStream,
     tracker: &Arc<Mutex<ThreadBindingTracker>>,
-) {
-    while let Ok(frame) = read_websocket_frame(source) {
-        if target.write_all(&frame.raw).is_err() {
-            return;
+    client_close_sent: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    loop {
+        let frame = match read_websocket_frame(source) {
+            Ok(frame) => frame,
+            Err(error) => {
+                if client_close_sent.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                return Err(format!("app-server websocket relay: {error}"));
+            }
+        };
+        if frame.opcode == 0x8 {
+            // Do not forward an app-server close frame to Codex. The wrapper
+            // owns recovery and will close/restart only the child connection,
+            // keeping the yolo client process resident.
+            return Err("app-server sent a websocket close frame".to_string());
         }
         if frame.opcode != 0x1 {
+            if target.write_all(&frame.raw).is_err() {
+                return Ok(());
+            }
             continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(&frame.payload) else {
+            if target.write_all(&frame.raw).is_err() {
+                return Ok(());
+            }
             continue;
         };
+        if let Some(response) = yolo_auto_approval_response(&value) {
+            if websocket_send_text(source, &response.to_string()).is_err() {
+                return Ok(());
+            }
+            eprintln!(
+                "yolo client proxy: auto-approved app-server request {}",
+                value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            continue;
+        }
+        if let Some(update) = parse_app_server_status_notification(&value)
+            && let Ok(tracker) = tracker.lock()
+            && (tracker.current_thread_id.as_deref().is_none()
+                || tracker.current_thread_id.as_deref() == Some(update.thread_id.as_str()))
+        {
+            let _ = tracker.event_tx.send(ClientEvent::ThreadStatus {
+                thread_id: update.thread_id,
+                status: update.status,
+                active_flags: update.active_flags,
+            });
+        }
+        if target.write_all(&frame.raw).is_err() {
+            return Ok(());
+        }
         observe_app_server_response(tracker, &value);
     }
+}
+
+fn yolo_auto_approval_response(value: &Value) -> Option<Value> {
+    let method = value.get("method").and_then(Value::as_str)?;
+    if !matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "execCommandApproval"
+    ) {
+        return None;
+    }
+    let id = value.get("id")?;
+    if !id.is_number() && !id.is_string() {
+        return None;
+    }
+    Some(json!({
+        "id": id,
+        "result": {"decision": "accept"}
+    }))
 }
 
 fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
@@ -11148,6 +14130,12 @@ fn observe_client_app_server_request(tracker: &Arc<Mutex<ThreadBindingTracker>>,
     {
         tracker.pending_create_request_ids.insert(id);
     }
+    if method == "thread/resume"
+        && let Some(id) = app_server_message_id(value)
+        && let Ok(mut tracker) = tracker.lock()
+    {
+        tracker.pending_resume_request_ids.insert(id);
+    }
 }
 
 fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value: &Value) {
@@ -11162,10 +14150,22 @@ fn observe_app_server_response(tracker: &Arc<Mutex<ThreadBindingTracker>>, value
     let Some(id) = app_server_message_id(value) else {
         return;
     };
-    let should_track = tracker
-        .lock()
-        .map(|mut tracker| tracker.pending_create_request_ids.remove(&id))
-        .unwrap_or(false);
+    let (should_track, resume_succeeded, event_tx) = match tracker.lock() {
+        Ok(mut tracker) => {
+            let should_track = tracker.pending_create_request_ids.remove(&id);
+            let resume_succeeded =
+                tracker.pending_resume_request_ids.remove(&id) && value.get("error").is_none();
+            (
+                should_track,
+                resume_succeeded,
+                Some(tracker.event_tx.clone()),
+            )
+        }
+        Err(_) => (false, false, None),
+    };
+    if resume_succeeded && let Some(event_tx) = event_tx {
+        let _ = event_tx.send(ClientEvent::ResumeBootstrapCompleted);
+    }
     if !should_track {
         return;
     }
@@ -11304,6 +14304,24 @@ fn websocket_send_text_unmasked<W: Write>(stream: &mut W, text: &str) -> Result<
         .map_err(|err| format!("write unmasked websocket frame: {err}"))
 }
 
+fn websocket_send_close<W: Write>(stream: &mut W) -> Result<(), String> {
+    let payload = 1000u16.to_be_bytes();
+    let mask = [0x63, 0x6c, 0x6f, 0x73];
+    let mut frame = Vec::with_capacity(8);
+    frame.push(0x88);
+    frame.push(0x80 | payload.len() as u8);
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(idx, byte)| byte ^ mask[idx % 4]),
+    );
+    stream
+        .write_all(&frame)
+        .map_err(|err| format!("write websocket close frame: {err}"))
+}
+
 fn websocket_read_text<S: Read + Write>(stream: &mut S) -> Result<String, String> {
     websocket_read_text_with_timeout(stream, APP_SERVER_RPC_READ_RETRY_TIMEOUT)
 }
@@ -11427,21 +14445,41 @@ fn api_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, 
         Some(body) => serde_json::to_string(body).map_err(|err| err.to_string())?,
         None => String::new(),
     };
+    if body_text.len() > MAX_API_REQUEST_BODY_BYTES {
+        return Err(format!(
+            "api request body too large: {} bytes",
+            body_text.len()
+        ));
+    }
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: yolo\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body_text.len(),
         body_text
     );
     stream
+        .set_read_timeout(Some(API_REQUEST_TIMEOUT))
+        .map_err(|err| format!("set api read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(API_REQUEST_TIMEOUT))
+        .map_err(|err| format!("set api write timeout: {err}"))?;
+    stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("write request: {err}"))?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(|err| format!("shutdown request: {err}"))?;
-    let mut response = String::new();
+    let mut response_bytes = Vec::new();
     stream
-        .read_to_string(&mut response)
+        .take((MAX_API_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response_bytes)
         .map_err(|err| format!("read response: {err}"))?;
+    if response_bytes.len() > MAX_API_RESPONSE_BYTES {
+        return Err(format!(
+            "api response too large: more than {MAX_API_RESPONSE_BYTES} bytes"
+        ));
+    }
+    let response = String::from_utf8(response_bytes)
+        .map_err(|err| format!("decode api response text: {err}"))?;
     let body = response
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
@@ -11477,12 +14515,18 @@ fn federation_post_json(
             .arg("-H")
             .arg(format!("Authorization: Bearer {}", token.trim()));
     }
-    let output = command
+    let connect_timeout = FEDERATION_CONNECT_TIMEOUT.as_secs().max(1).to_string();
+    let request_timeout = FEDERATION_HTTP_TIMEOUT.as_secs().max(1).to_string();
+    command
+        .arg("--connect-timeout")
+        .arg(connect_timeout)
+        .arg("--max-time")
+        .arg(request_timeout)
         .arg("--data-binary")
         .arg(body_text)
-        .arg(url)
-        .output()
-        .map_err(|err| format!("spawn curl: {err}"))?;
+        .arg(url);
+    let output = command_output_with_timeout(command, FEDERATION_HTTP_TIMEOUT)
+        .map_err(|err| format!("federation curl: {err}"))?;
     if !output.status.success() {
         return Err(format!(
             "curl exited with {}: {}",
@@ -11496,6 +14540,35 @@ fn federation_post_json(
     }
     let text = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&text).map_err(|err| format!("decode federation response: {err}: {text}"))
+}
+
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn command: {err}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("collect command output: {err}"));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("command timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait for command: {err}"));
+            }
+        }
+    }
 }
 
 fn read_http_request<R: Read>(
@@ -11539,6 +14612,9 @@ fn read_http_request<R: Read>(
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > MAX_API_REQUEST_BODY_BYTES {
+        return Err(format!("request body too large: {content_length} bytes"));
+    }
     while body_bytes.len() < content_length {
         let n = stream
             .read(&mut tmp)
@@ -11581,16 +14657,53 @@ fn json_response<T: Serialize>(status: u16, body: &T) -> String {
 }
 
 fn load_turn_archive(path: &Path, telemetry: &mut AgentTelemetry) {
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Ok(input) = fs::File::open(path) else {
         return;
     };
-    for line in contents.lines() {
-        let Ok(info) = serde_json::from_str::<TurnInfo>(line) else {
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::with_capacity(8192);
+
+    'records: loop {
+        line.clear();
+        let mut saw_any = false;
+        let mut oversized = false;
+
+        loop {
+            let Ok(buffer) = reader.fill_buf() else {
+                break 'records;
+            };
+            if buffer.is_empty() {
+                if !saw_any {
+                    break 'records;
+                }
+                break;
+            }
+
+            saw_any = true;
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let take_len = newline.map_or(buffer.len(), |offset| offset + 1);
+            if !oversized && line.len().saturating_add(take_len) <= MAX_TURN_ARCHIVE_LINE_BYTES {
+                line.extend_from_slice(&buffer[..take_len]);
+            } else {
+                oversized = true;
+            }
+            reader.consume(take_len);
+
+            if newline.is_some() {
+                break;
+            }
+        }
+
+        if oversized || line.is_empty() {
+            continue;
+        }
+        let Ok(info) = serde_json::from_slice::<TurnInfo>(&line) else {
             continue;
         };
         let record = turn_record_from_info(info);
         telemetry.observe_trace_sequence(&record);
         telemetry.turns.insert(record.key.clone(), record);
+        telemetry.trim_turns();
     }
     telemetry.trim_turns();
 }
@@ -11869,7 +14982,28 @@ fn codex_executable() -> OsString {
 }
 
 fn native_codex_executable() -> OsString {
-    env::var_os("YOLO_NATIVE_CODEX").unwrap_or_else(|| OsString::from(DEFAULT_CODEX))
+    select_native_codex_executable(
+        env::var_os("YOLO_NATIVE_CODEX"),
+        find_executable_in_path(DEFAULT_CODEX),
+        managed_codex_bin(),
+    )
+}
+
+fn select_native_codex_executable(
+    explicit: Option<OsString>,
+    path_executable: Option<PathBuf>,
+    managed: PathBuf,
+) -> OsString {
+    if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
+        return explicit;
+    }
+    if let Some(path_executable) = path_executable {
+        return path_executable.into_os_string();
+    }
+    if managed.is_file() {
+        return managed.into_os_string();
+    }
+    OsString::from(DEFAULT_CODEX)
 }
 
 fn managed_codex_prefix() -> PathBuf {
@@ -12007,13 +15141,19 @@ and only adds YOLO mode flags plus cwd/resume metadata repair. It does not use
 the yolo server or remote app-server.
 
 upgrade-resume installs the latest Codex CLI into a yolo-managed
-user-writable npm prefix, restarts the yolo app-server, then launches
-`codex resume` through yolo. With no arguments it resumes `--last`.
+user-writable npm prefix, migrates live yolo wrappers through the authorized
+idle gate, restarts the yolo app-server, then launches `codex resume` through
+yolo. With no arguments it resumes `--last`.
 
 upgrade-resume-all asks the running yolo server to install the latest Codex
-CLI, wait for active app-server threads to become idle, restart its app-server
+CLI, wait for active app-server threads to become idle, migrate live yolo
+wrappers while the current app-server is reachable, restart its app-server
 child, and request every live yolo client wrapper to restart its Codex child as
 `codex resume` on the same terminal.
+
+upgrade-resume-reexec waits for idle clients and migrates their yolo wrappers
+without restarting the app-server; use it after a manual yolo binary install
+and before restarting yolo.service.
 
 refresh-permissions reapplies YOLO-mode live settings to already-loaded resume
 threads without restarting the yolo client or Codex child process.
@@ -12028,6 +15168,7 @@ curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/clients
   curl --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock 'http://yolo/turns?limit=20'
   yolo turns --thread THREAD_ID --limit 20
   yolo turns --history --thread THREAD_ID --limit 20
+  curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-reexec
   curl -X POST --unix-socket $XDG_RUNTIME_DIR/yolo/api.sock http://yolo/upgrade-resume-all
 
 Federation:
