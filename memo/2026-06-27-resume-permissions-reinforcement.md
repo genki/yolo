@@ -21,8 +21,11 @@ API socket.
 
 ## Fix
 
-- Resume clients now start a bounded post-launch reinforcer that retries the
-  app-server live settings update for up to 120 seconds.
+- Resume clients now wait for their own `thread/resume` success response and
+  then schedule one bounded, best-effort app-server live settings update.
+  There is no per-client retry loop during TUI bootstrap; an explicit
+  `refresh-permissions` remains available when a busy app-server cannot accept
+  the update immediately.
 - Added `yolo refresh-permissions` to reapply YOLO live settings to already
   loaded resume threads without restarting yolo clients or Codex children.
 - Server startup no longer unlinks an active API socket owned by a reachable
@@ -49,3 +52,13 @@ updated the four running resumed clients:
 - `/home/vagrant/moon`
 
 The non-resume head client without a `thread_id` was skipped.
+
+## Follow-up hardening
+
+The former 120-second, two-second-interval reinforcer could keep issuing
+`thread/settings/update` while the native TUI was starting a turn. With
+multiple resumed clients this competed with `thread/resume`/`turn/start`,
+causing a non-OOM `turn/start failed in TUI` followed by a transport recovery
+path. The current implementation applies policy only after the matching
+bootstrap response and gives the RPC a five-second deadline; failures are
+logged as best effort and do not terminate the terminal-bound client.
