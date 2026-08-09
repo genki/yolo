@@ -5262,6 +5262,72 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn client_proxy_releases_upstream_when_child_disconnects() {
+        let temp_dir = env::temp_dir().join(format!(
+            "yolo-client-proxy-disconnect-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let upstream_path = temp_dir.join("app-server.sock");
+        let pending_settings_path = temp_dir.join("pending-settings.json");
+        let upstream_listener = UnixListener::bind(&upstream_path).unwrap();
+        let (upstream_closed_tx, upstream_closed_rx) = mpsc::channel();
+        let upstream_thread = thread::spawn(move || {
+            let (mut stream, _) = upstream_listener.accept().unwrap();
+            let request = read_http_headers(&mut stream).unwrap();
+            assert!(request.starts_with("GET "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            let read = stream.read(&mut byte).unwrap();
+            upstream_closed_tx.send(read).unwrap();
+        });
+
+        let (mut child_stream, proxy_stream) = UnixStream::pair().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let proxy_upstream_path = upstream_path.clone();
+        let (proxy_done_tx, proxy_done_rx) = mpsc::channel();
+        let proxy_thread = thread::spawn(move || {
+            let result = run_client_proxy_connection(
+                proxy_stream,
+                &proxy_upstream_path,
+                &event_tx,
+                &pending_settings_path,
+                Some("thread-test"),
+            );
+            proxy_done_tx.send(result).unwrap();
+        });
+
+        child_stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: yolo\r\nUpgrade: websocket\r\n\r\n")
+            .unwrap();
+        let response = read_http_headers(&mut child_stream).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101"));
+        child_stream.shutdown(Shutdown::Both).unwrap();
+        drop(child_stream);
+
+        let proxy_result = proxy_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy relay should stop after the child disconnects");
+        assert!(proxy_result.is_ok(), "proxy result: {proxy_result:?}");
+        assert_eq!(
+            upstream_closed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("upstream connection should be closed"),
+            0
+        );
+        proxy_thread.join().unwrap();
+        upstream_thread.join().unwrap();
+        let _ = fs::remove_file(&upstream_path);
+        let _ = fs::remove_dir(&temp_dir);
+    }
+
     #[test]
     fn upgrade_memory_headroom_scales_with_client_count() {
         let required = upgrade_memory_requirement_bytes(4);
@@ -13921,9 +13987,9 @@ fn run_client_proxy_connection(
     let mut upstream_write = upstream_stream
         .try_clone()
         .map_err(|error| format!("clone app-server websocket: {error}"))?;
-    let client_close_sent = Arc::new(AtomicBool::new(false));
+    let client_relay_finished = Arc::new(AtomicBool::new(false));
     let client_tracker = Arc::clone(&tracker);
-    let client_close_sent_for_relay = Arc::clone(&client_close_sent);
+    let client_relay_finished_for_relay = Arc::clone(&client_relay_finished);
     let pending_settings_path = pending_settings_path.to_path_buf();
     let client_to_server = thread::spawn(move || {
         relay_client_websocket_frames(
@@ -13931,14 +13997,20 @@ fn run_client_proxy_connection(
             &mut upstream_write,
             &client_tracker,
             &pending_settings_path,
-            &client_close_sent_for_relay,
+            &client_relay_finished_for_relay,
         );
+        // The child side can disappear while the shared app-server remains
+        // quiet. Closing the cloned upstream socket wakes the blocking
+        // server-to-client relay so this listener can accept the replacement
+        // child instead of accumulating reconnects in the socket backlog.
+        client_relay_finished_for_relay.store(true, Ordering::SeqCst);
+        let _ = upstream_write.shutdown(Shutdown::Both);
     });
     let server_result = relay_server_websocket_frames(
         &mut upstream_stream,
         &mut client_stream,
         &tracker,
-        &client_close_sent,
+        &client_relay_finished,
     );
     // A broken app-server connection must only tear down this child
     // connection. The listener remains bound and accepts the next Codex
@@ -13949,7 +14021,7 @@ fn run_client_proxy_connection(
 
     match server_result {
         Ok(()) => Ok(()),
-        Err(_error) if client_close_sent.load(Ordering::SeqCst) => Ok(()),
+        Err(_error) if client_relay_finished.load(Ordering::SeqCst) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -13959,11 +14031,11 @@ fn relay_client_websocket_frames(
     target: &mut UnixStream,
     tracker: &Arc<Mutex<ThreadBindingTracker>>,
     pending_settings_path: &Path,
-    client_close_sent: &Arc<AtomicBool>,
+    client_relay_finished: &Arc<AtomicBool>,
 ) {
     while let Ok(frame) = read_websocket_frame(source) {
         if frame.opcode == 0x8 {
-            client_close_sent.store(true, Ordering::SeqCst);
+            client_relay_finished.store(true, Ordering::SeqCst);
         }
         if frame.opcode != 0x1 {
             if target.write_all(&frame.raw).is_err() {
@@ -14006,13 +14078,13 @@ fn relay_server_websocket_frames(
     source: &mut UnixStream,
     target: &mut UnixStream,
     tracker: &Arc<Mutex<ThreadBindingTracker>>,
-    client_close_sent: &Arc<AtomicBool>,
+    client_relay_finished: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     loop {
         let frame = match read_websocket_frame(source) {
             Ok(frame) => frame,
             Err(error) => {
-                if client_close_sent.load(Ordering::SeqCst) {
+                if client_relay_finished.load(Ordering::SeqCst) {
                     return Ok(());
                 }
                 return Err(format!("app-server websocket relay: {error}"));
