@@ -24,8 +24,19 @@ minimal transport adapter required to connect that child to the server-managed
 app-server. The yolo client wrapper is intentionally persistent: server/API
 failure, app-server failure, proxy disconnect, child exit, and wait errors only
 restart or reconnect the Codex child. The wrapper itself may terminate only on
-the user's Ctrl+C or an authorized upgrade-resume after the client is idle.
+the user's Ctrl+C (including Codex TUI's raw-mode exit) or an authorized
+upgrade-resume after the client is idle. A child exit code of 1 is treated as a
+user exit only when the proxy did not observe an upstream app-server failure;
+transport failures remain recoverable and restart only the child.
 Normal client launch does not rewrite Codex rollout or state files.
+
+The server also guards background terminals against a specific shell-construction
+deadlock: `while pgrep -f ...; do sleep ...; done` can match the waiting shell's
+own command line forever. The guard terminates only that self-matching shell
+subtree after confirming that no independent matching process exists. It is not
+a generic runtime or CPU timeout, so legitimate long-running computation is
+left alone. Set `YOLO_BACKGROUND_TERMINAL_GUARD_INTERVAL_MS` to tune the scan
+interval; values below one second are clamped.
 
 Every managed client launch, including `yolo resume`, enforces YOLO
 permissions (`approval_policy=never`, `sandbox_mode=danger-full-access`, and
@@ -46,7 +57,12 @@ The server persists active client resume metadata in
 `XDG_STATE_HOME` is unset). The file is written atomically with mode `0600` and
 contains the thread ID, working directory, resume arguments, and effective
 model, service-tier, reasoning-effort, and fast-mode settings needed to
-recreate a client after a reboot. Schema v2 also records whether the settings
+recreate a client after a reboot. Schema v3 keeps the wrapper-owned `yolo_id`
+separate from the process ID and Codex thread ID, and records the thread
+binding state (`pending`, `bound`, `loaded`, or `unloaded`). During an upgrade
+from a legacy server, a valid `yolo_id` received in a wrapper heartbeat replaces
+the scanner fallback and is persisted before the next restart. The schema also
+records whether the settings
 are complete, where they were observed (`app_server`, `configure`, or a
 fallback source), and when they were observed. Startup reconciliation merges
 records by client/thread identity and does not replace complete settings with
@@ -78,6 +94,22 @@ yolo server --daemon --federation-listen 127.0.0.1:47040
 yolo status
 yolo stop
 ```
+
+Linux user-unit deployments can isolate the yolo control plane from the
+Codex worker and its tools. The websh repository provides a staging installer
+and an explicit activation command:
+
+```sh
+./scripts/install-yolo-user-systemd.sh
+./scripts/activate-yolo-user-isolation.sh
+```
+
+The installer does not restart the live service. After the idle gate is
+confirmed, activation moves the app-server to the stable
+`yolo-app-server.service` worker, which has its own cgroup and restart policy.
+Thread-tagged tools are then moved into per-session cgroups with an 8 GiB hard
+limit and 1 GiB swap limit. An OOM in a tool or worker can no longer stop the
+separate yolo control-plane unit.
 
 `yolo upgrade-resume [RESUME_ARGS...]` waits until all managed clients have an
 explicit `idle`/`waiting` app-server status, installs the latest Codex CLI into
@@ -115,27 +147,112 @@ After installing a new yolo binary manually, use
 waits for explicit idle/waiting status and migrates live wrappers without
 restarting the app-server. It is the safe bridge for legacy wrappers whose
 `/proc/<pid>/exe` still shows `(deleted)`.
+The preflight snapshot used by this gate is also published as a fresh,
+upgrade-verified per-thread status. A current wrapper may use that narrowly
+scoped proof to initialize a missing local TUI status, or repair a missed final
+idle notification, before claiming the permit. The proof must have been
+observed after the wrapper's current proxy connection began, so a restarted
+client cannot consume a pre-restart idle result. Generic inventory, stale idle,
+an active status, or active flags still cannot authorize a re-exec.
+
+Codex 0.149.0 and later can store long legacy JSONL rollouts in paginated
+thread history. If a saved session has a very large rollout and `thread/read`
+times out during resume, stop only the confirmed failing client, preserve the
+original JSONL, and migrate that thread with:
+
+```sh
+codex migrate-rollouts --thread THREAD_ID --apply --json --verbose
+```
+
+The migration keeps the thread ID and the original rollout as a source record;
+the app-server then reads the bounded paginated projection instead of loading
+the entire rollout for every TUI lookup. Verify `history_mode=paginated` in
+the Codex state DB and resume the same thread in the original tmux window.
+Do not use a broad process kill for a merely alive client: the migration is
+authorized only after the client is explicitly waiting or is confirmed to be
+in a resume crash loop.
+
+Each blue/green generation owns a distinct app-server socket and `CODEX_HOME`.
+This keeps the Codex model cache and state DB version-aligned with that
+generation's CLI, and prevents an old app-server from overwriting a new model
+catalog. The destination is seeded from consistent SQLite backups rather than
+sharing or byte-copying a live WAL. Before an idle wrapper leaves the source,
+it copies only its exact canonical rollout into the destination home, verifies
+that the source did not change during the copy, and runs the destination
+Codex CLI's bounded `migrate-rollouts` command for that exact thread. The
+source server grants only one copy/projection/resume lease at a time. The
+wrapper returns that lease on failure, rechecks the live idle status, and only
+then resumes the same thread ID against the destination app-server.
+
+A legacy wrapper cannot claim this handoff until it has re-execed into a
+version that implements the current state-copy protocol. On that re-exec, a
+new wrapper checks for its pending handoff before starting another source
+Codex child, so a multi-gigabyte source session is not cold-loaded solely to
+move generations. The source withholds the handoff event from an incompatible
+wrapper until its bootstrap heartbeat advertises the new protocol; otherwise
+the old wrapper would prioritize an unclaimable handoff over its own upgrade.
+Compatible wrappers are not restarted for the cutover.
+
+As of 0.5.43, pending handoffs are atomically persisted in
+`blue-green-handoffs.json` in the source state directory. A source restart
+restores pending requests, while completed requests stay completed. Repeating
+the same request is safe; changing an outstanding target or expected thread is
+rejected. The rollout script schedules all peers before waiting for legacy
+wrapper upgrades, and retains a checkpoint for retrying interrupted cutovers.
+
+Generation homes retain an ordered `yolo-rollout-sources.json` lineage. An
+exact resume, including a selection made in Codex's picker, materializes a
+missing dormant rollout from the nearest retained generation. Recovery is
+locked per thread, checks every JSONL record, and retries an interrupted
+projection before launching Codex. Keep these source homes until their
+historical sessions are no longer needed. Migration stdout/stderr are drained
+concurrently with bounded capture so progress output cannot deadlock a copy.
+
+For the isolated restart/claim/completion integration test (no OpenAI calls):
+
+```sh
+python3 tests/bg_restart.py target/x86_64-unknown-linux-musl/release/yolo
+```
+
+The destination runtime contains a `codex-executable` file whose single line
+is an absolute executable path. A newly re-execed wrapper selects this
+destination-generation pin before an inherited `YOLO_CODEX` value. An atomic
+`~/.local/state/yolo/active-generation.json` pointer directs new clients to
+the promoted generation; already-running wrappers remain on their source
+generation until their own thread is idle. Invalid or unhealthy pointers are
+ignored rather than partially applying a generation tuple.
+
+Each server process reconciles wrappers only when the Codex child uses a
+managed proxy socket directly below that server's runtime directory. This
+runtime-scoped scan also runs for standby generations, so a server-only
+restart reconstructs its live clients from their unchanged wrappers without
+importing clients attached to blue or another green slot.
 
 Phoenix mode only applies to Codex processes launched by the yolo wrapper. A
 legacy pane launched with `codex` directly does not heartbeat to the yolo server,
 so it cannot receive the resume generation signal. Use
-`external-codex-upgrade-resume` to migrate such panes without replacing the
-existing pane.
+`external-codex-upgrade-resume` to migrate such panes. Once the pane is explicitly
+waiting, yolo sends EOF to the direct Codex process, confirms that its process
+tree has exited, and starts `yolo resume <thread-id>` in the same tmux pane. A
+busy pane is never terminated; `--defer-busy` waits until its next waiting state.
 
 Managed client proxies report an unexpected app-server WebSocket close,
 including `turn/steer transport error` and `Connection reset without closing
 handshake`, then close only that child connection. The listener remains bound;
 after the API and app-server recover, the wrapper starts a new Codex child on
-the same proxy and session metadata. Transport loss, ordinary app-server
-restarts, child exits, and unknown client state are never treated as yolo
+the same proxy and session metadata. The proxy records whether the upstream or
+the terminal-bound child closed first, so an upstream transport failure cannot
+be mistaken for a raw-mode user exit. Transport loss, ordinary app-server
+restarts, and unknown client state remain recovery paths rather than yolo
 wrapper termination or upgrade authorization.
 
 Robot/widget settings are first applied to a loaded thread through the
 app-server `thread/settings/update` request. After that RPC succeeds, the
-terminal-bound Codex child is restarted in place with the new model, service
-tier, and reasoning effort. This is also allowed while the client is working so
-the CLI mode changes immediately; the yolo wrapper remains alive and settings
-are never applied before the server has acknowledged the update.
+terminal-bound Codex child remains attached and is not restarted: the loaded
+thread already owns the new model, service tier, and reasoning effort. The
+server keeps those acknowledged settings authoritative over stale launch
+metadata. If an unrelated transport recovery or an explicitly authorized
+upgrade later launches a child, that launch reads the latest durable settings.
 
 Managed `resume --last` candidate selection is performed by the server and
 returns only the selected thread ID to the client. Resume policy (cwd,
@@ -147,9 +264,15 @@ client launch. Those explicit operations process rollout JSONL incrementally.
 `yolo external-codex-upgrade-resume` is for legacy tmux panes that were launched
 with `codex` directly instead of through yolo. It updates the user npm prefix
 used by `~/.npm-global/bin/codex`, optionally updates `/usr/local/bin/codex`
-with `--system`, detects non-yolo Codex panes, skips panes that appear busy, and
-opens a new tmux window in the same session with `yolo resume <thread-id>`.
-Use `--include-busy` only when duplicating active panes is intentional.
+with `--system`, detects non-yolo Codex panes, and hands explicitly waiting
+panes over in place to `yolo resume <thread-id>`. `--defer-busy` starts a
+background watcher that performs this handoff at the first waiting state.
+`--include-busy` remains a compatibility escape hatch for intentionally
+duplicating active panes and does not authorize in-place termination.
+
+The verified operating procedure, success criteria, and abort conditions are
+recorded in
+[`memo/2026-08-23-external-phoenix-in-place-runbook.md`](memo/2026-08-23-external-phoenix-in-place-runbook.md).
 
 ## API
 
@@ -251,6 +374,10 @@ curl -X POST -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"action":"yolo-upgrade","yolo_version":"0.5.0"}' \
   http://127.0.0.1:47040/federation/slaves/mars/commands
+
+# Read one command without transferring the full federation snapshot.
+curl -H "Authorization: Bearer $AGENT_GATE_YOLO_TOKEN" \
+  http://127.0.0.1:47040/federation/slaves/mars/commands/<command-id>
 ```
 
 The local master also exposes a WebSocket status stream for trusted local
@@ -299,6 +426,9 @@ processes.
 - `YOLO_CODEX_PREFIX`: managed Codex npm prefix. Defaults to
   `$XDG_DATA_HOME/yolo/codex-npm` or `~/.local/share/yolo/codex-npm`.
 - `YOLO_REMOTE`: override app-server endpoint for the client.
+- `YOLO_CLIENT_ID`: internal re-exec handoff for a managed client; normally
+  unset. The API exposes this logical identity as `yolo_id`, separately from
+  the process `id` and Codex `thread_id`.
 - `YOLO_RUNTIME_DIR`: runtime directory for sockets. Defaults to
   `$XDG_RUNTIME_DIR/yolo` or `/tmp/yolo`.
 - `YOLO_STATE_DIR`: persistent state directory for active session metadata.

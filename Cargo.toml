@@ -1,6 +1,6 @@
 [package]
 name = "yolo"
-version = "0.5.22"
+version = "0.5.43"
 edition = "2024"
 
 [dependencies]
@@ -10,3 +10,5 @@ base64 = "0.22"
 sha1 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
+socket2 = "0.6"
+libc = "0.2"
