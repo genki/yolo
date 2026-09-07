@@ -124,6 +124,9 @@ const APP_SERVER_WATCHDOG_RECOVERY_COOLDOWN: Duration = Duration::from_secs(120)
 // application error into a transport failure.
 const RESUME_POLICY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_SERVER_STATUS_SUBSCRIPTION_GRACE: Duration = Duration::from_secs(5);
+const APP_SERVER_THREAD_SUBSCRIPTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const APP_SERVER_THREAD_SUBSCRIPTION_MAX_RETRIES: u32 = 5;
+const APP_SERVER_THREAD_SUBSCRIPTION_MAX_BACKOFF: Duration = Duration::from_secs(30);
 // A resumed TUI can learn that a turn is active from thread/resume while its
 // dedicated app-server subscription misses the later completion event. Give
 // normal notification delivery time to settle before requesting a no-op
@@ -183,6 +186,11 @@ static NEXT_PROXY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static CLIENT_USER_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_API_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static APP_SERVER_RESTART_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+// Pending settings are replaced atomically by API requests while a client
+// relay or the background binding worker may be applying the previous value.
+// Serialize the final compare/remove with the writer so an older ACK cannot
+// delete a newer request between its read and unlink.
+static PENDING_SETTINGS_FILE_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct RuntimePaths {
@@ -3115,7 +3123,7 @@ struct ConfigureClientsRequest {
     server_instance_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingClientSettings {
     #[serde(default)]
     model: Option<String>,
@@ -3454,9 +3462,10 @@ fn merge_active_session_record(
     } else {
         incoming.started_at
     };
-    if record.thread_id.is_none() {
+    if record.thread_id.is_none() && active_session_thread_is_authoritative(current) {
         record.thread_id = current.thread_id.clone();
         record.thread_id_source = current.thread_id_source.clone();
+        record.thread_binding_state = current.thread_binding_state.clone();
     }
     if record.thread_binding_state.trim().is_empty() {
         record.thread_binding_state = current.thread_binding_state.clone();
@@ -3473,6 +3482,17 @@ fn active_session_record_from_client(client: &ClientInfo) -> ActiveSessionRecord
     let fast_known = client_fast_known(client);
     let settings_source = client_settings_source(client);
     let fast = known_fast_from_service_tier(client.service_tier.as_deref()).unwrap_or(client.fast);
+    let durable_thread_id = client_thread_id_is_authoritative(client)
+        .then(|| client.thread_id.clone())
+        .flatten();
+    let durable_thread_source = durable_thread_id
+        .as_ref()
+        .map(|_| client.thread_id_source.clone())
+        .unwrap_or_else(|| "unresolved".to_string());
+    let durable_binding_state = durable_thread_id
+        .as_ref()
+        .map(|_| client.thread_binding_state.clone())
+        .unwrap_or_else(|| "pending".to_string());
     ActiveSessionRecord {
         client_id: client.id.clone(),
         yolo_id: client_yolo_id(client).to_string(),
@@ -3491,9 +3511,9 @@ fn active_session_record_from_client(client: &ClientInfo) -> ActiveSessionRecord
         ),
         settings_source,
         settings_observed_at: client.settings_observed_at,
-        thread_id: client.thread_id.clone(),
-        thread_id_source: client.thread_id_source.clone(),
-        thread_binding_state: client.thread_binding_state.clone(),
+        thread_id: durable_thread_id,
+        thread_id_source: durable_thread_source,
+        thread_binding_state: durable_binding_state,
         started_at: client.started_at,
     }
 }
@@ -3975,6 +3995,7 @@ fn claim_upgrade_reexec_permit_result(
     Ok(UpgradeReexecClaimResult::Granted)
 }
 
+#[cfg(test)]
 fn claim_upgrade_reexec_permit(
     state: &Arc<Mutex<ServerState>>,
     client_id: &str,
@@ -4252,6 +4273,18 @@ fn load_active_sessions(path: &Path) -> BTreeMap<String, ActiveSessionRecord> {
         .into_iter()
         .filter(|session| !session.client_id.trim().is_empty() && !session.cwd.trim().is_empty())
         .map(|mut session| {
+            // Older yolo versions persisted cwd/time inferred bindings as
+            // `app_server_started` or `legacy_active_unique`. They were not
+            // correlated with this wrapper's proxy, so do not promote them
+            // into authoritative resume identities after a restart.
+            if matches!(
+                session.thread_id_source.as_str(),
+                "app_server_started" | "app_server_inferred" | "legacy_active_unique"
+            ) {
+                session.thread_id = None;
+                session.thread_id_source = "unresolved".to_string();
+                session.thread_binding_state = "pending".to_string();
+            }
             if session.yolo_id.trim().is_empty() {
                 session.yolo_id = session.client_id.clone();
             }
@@ -5257,6 +5290,8 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         blue_green_handoff_active: None,
     }));
     let app_server_pid = ensure_tracked_app_server(Arc::clone(&state), paths.clone())?;
+    let pending_settings_dispatcher =
+        spawn_pending_settings_worker(Arc::clone(&state), paths.clone());
     scan_existing_yolo_clients(&state, &paths);
     spawn_client_process_monitor(Arc::clone(&state), paths.clone());
     if blue_green_standby_enabled() {
@@ -5268,9 +5303,17 @@ fn run_server(args: Vec<OsString>) -> Result<(), String> {
         spawn_background_terminal_guard(Arc::clone(&state), paths.clone());
     }
     spawn_initial_app_server_thread_snapshot(Arc::clone(&state), paths.clone());
-    spawn_thread_status_monitor(Arc::clone(&state), paths.clone());
+    spawn_thread_status_monitor(
+        Arc::clone(&state),
+        paths.clone(),
+        pending_settings_dispatcher.clone(),
+    );
     spawn_app_server_progress_watchdog(Arc::clone(&state), paths.clone());
-    spawn_agent_telemetry_snapshot_monitor(Arc::clone(&state), paths.clone());
+    spawn_agent_telemetry_snapshot_monitor(
+        Arc::clone(&state),
+        paths.clone(),
+        pending_settings_dispatcher,
+    );
     if let Some(addr) = federation_listen_addr(&args) {
         spawn_federation_listener(Arc::clone(&state), paths.clone(), addr)?;
     }
@@ -7343,17 +7386,14 @@ fn resolve_resume_last_args_with_retry(
         return Ok(args.to_vec());
     }
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last_error = None;
     loop {
         match resolve_resume_last_args(args, cwd) {
             Ok(resolved) => return Ok(resolved),
             Err(error) if !resume_last_resolution_is_retryable(&error) => return Err(error),
             Err(error) => {
-                last_error = Some(error);
                 if Instant::now() >= deadline || client_user_interrupt_requested() {
                     return Err(format!(
-                        "resume --last could not be resolved after retrying: {}",
-                        last_error.unwrap_or_else(|| "server unavailable".to_string())
+                        "resume --last could not be resolved after retrying: {error}"
                     ));
                 }
                 thread::sleep(CLIENT_RECOVERY_RETRY_DELAY);
@@ -7969,6 +8009,7 @@ fn yolo_environment_context(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -7986,6 +8027,65 @@ mod tests {
             std::process::id(),
             now_millis()
         ))
+    }
+
+    struct TestWebsocketStream {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl TestWebsocketStream {
+        fn new(input: Vec<u8>) -> Self {
+            Self {
+                input: Cursor::new(input),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for TestWebsocketStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buffer)
+        }
+    }
+
+    impl Write for TestWebsocketStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PartialFrameTimeoutStream {
+        stage: u8,
+    }
+
+    impl Read for PartialFrameTimeoutStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            match self.stage {
+                0 => {
+                    self.stage = 1;
+                    buffer[0] = 0x81;
+                    Ok(1)
+                }
+                1 => Err(std::io::Error::new(ErrorKind::TimedOut, "injected timeout")),
+                _ => Ok(0),
+            }
+        }
+    }
+
+    impl Write for PartialFrameTimeoutStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn test_client(id: &str, args: &[&str], cwd: &str, thread_id: Option<&str>) -> ClientInfo {
@@ -8476,6 +8576,21 @@ mod tests {
     }
 
     #[test]
+    fn unknown_server_state_cannot_authorize_recovery() {
+        let state = Arc::new(Mutex::new(test_state(Vec::new())));
+        let poisoned = Arc::clone(&state);
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison state for recovery regression test");
+        })
+        .join();
+        assert!(!app_server_is_definitively_gone(
+            &state,
+            &runtime_paths().unwrap()
+        ));
+    }
+
+    #[test]
     fn fast_child_exit_crash_loop_is_bounded() {
         let started = Instant::now();
         let mut exits = VecDeque::new();
@@ -8584,10 +8699,38 @@ mod tests {
         let error = probe_app_server_progress(&socket_path, Duration::from_millis(100))
             .expect_err("stalled initialize must not pass the progress probe");
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(error.contains("timed out") || error.contains("failed to fill"));
+        assert!(is_app_server_read_timeout(&error));
         server.join().unwrap();
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn websocket_reader_reassembles_fragmented_text_and_answers_ping() {
+        let mut stream = TestWebsocketStream::new(vec![
+            0x01, 0x01, b'{', // non-final text fragment
+            0x89, 0x01, b'x', // interleaved ping
+            0x80, 0x01, b'}', // final continuation
+        ]);
+
+        assert_eq!(
+            websocket_read_text_with_timeout(&mut stream, Duration::from_secs(1)).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            stream.output,
+            vec![0x8A, 0x81, 0x70, 0x6F, 0x6E, 0x67, b'x' ^ 0x70]
+        );
+    }
+
+    #[test]
+    fn websocket_reader_does_not_reuse_a_partial_frame_after_timeout() {
+        let mut stream = PartialFrameTimeoutStream { stage: 0 };
+        let error = websocket_read_text_with_timeout(&mut stream, Duration::from_millis(5))
+            .expect_err("partial frame timeout must force reconnect");
+
+        assert!(error.contains("partial websocket frame timed out"));
+        assert!(!is_app_server_read_timeout(&error));
     }
 
     #[test]
@@ -10441,6 +10584,41 @@ mod tests {
     }
 
     #[test]
+    fn pending_settings_cleanup_keeps_a_newer_request() {
+        let path = env::temp_dir().join(format!(
+            "yolo-pending-settings-cleanup-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let applied = PendingClientSettings {
+            model: Some("gpt-5.6-sol".to_string()),
+            fast: Some(false),
+            reasoning_effort: Some("high".to_string()),
+        };
+        let newer = PendingClientSettings {
+            model: Some("gpt-5.6-luna".to_string()),
+            fast: Some(true),
+            reasoning_effort: Some("max".to_string()),
+        };
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
+
+        let (removed, retry) = remove_pending_client_settings_if_unchanged(&path, &applied);
+        assert!(!removed);
+        assert!(retry);
+        assert_eq!(
+            serde_json::from_slice::<PendingClientSettings>(&fs::read(&path).unwrap()).unwrap(),
+            newer
+        );
+
+        fs::write(&path, serde_json::to_vec(&applied).unwrap()).unwrap();
+        assert_eq!(
+            remove_pending_client_settings_if_unchanged(&path, &applied),
+            (true, false)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn client_id_configuration_does_not_select_other_unresolved_clients() {
         let state = Arc::new(Mutex::new(test_state(vec![
             test_client("selected", &[], "/home/vagrant/head", None),
@@ -11491,7 +11669,9 @@ mod tests {
 
     #[test]
     fn unique_active_thread_rebinds_one_legacy_client_without_a_resume_arg() {
-        let mut state = test_state(vec![test_client("legacy", &[], "/home/vagrant/head", None)]);
+        let mut legacy = test_client("legacy", &[], "/home/vagrant/head", None);
+        legacy.remote = "unix:///run/user/1000/yolo/client-proxies/legacy.sock".to_string();
+        let mut state = test_state(vec![legacy]);
         let snapshot = vec![AppThreadSnapshot {
             id: "thread-active".to_string(),
             cwd: "/home/vagrant/head".to_string(),
@@ -11510,8 +11690,35 @@ mod tests {
         );
         assert_eq!(
             state.clients["legacy"].thread_id_source,
-            "legacy_active_unique"
+            "app_server_inferred"
         );
+        assert_eq!(state.clients["legacy"].thread_binding_state, "tentative");
+    }
+
+    #[test]
+    fn tentative_thread_binding_does_not_accept_status_as_client_identity() {
+        let mut legacy = test_client("legacy", &[], "/home/vagrant/head", None);
+        legacy.remote = "unix:///run/user/1000/yolo/client-proxies/legacy.sock".to_string();
+        legacy.thread_id = Some("thread-inferred".to_string());
+        legacy.thread_id_source = "app_server_inferred".to_string();
+        legacy.thread_binding_state = "tentative".to_string();
+        let state = Arc::new(Mutex::new(test_state(vec![legacy])));
+
+        apply_thread_status_update(
+            &state,
+            &AppThreadStatusUpdate {
+                thread_id: "thread-inferred".to_string(),
+                status: "active".to_string(),
+                active_flags: vec!["turn".to_string()],
+            },
+        );
+
+        let state = state.lock().unwrap();
+        let client = &state.clients["legacy"];
+        assert_eq!(client.thread_id_source, "app_server_inferred");
+        assert_eq!(client.thread_binding_state, "tentative");
+        assert_eq!(client.codex_status, None);
+        assert!(client.codex_active_flags.is_empty());
     }
 
     #[test]
@@ -12358,7 +12565,8 @@ mod tests {
             None,
         )]);
         state.clients.get_mut("new-client").unwrap().remote =
-            "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+            "unix:///run/user/1000/yolo/client-proxies/new-client.sock".to_string();
+        state.clients.get_mut("new-client").unwrap().started_at = 1_785_961_700;
         let state = Arc::new(Mutex::new(state));
 
         bind_thread_started_to_unique_managed_client(
@@ -12366,7 +12574,11 @@ mod tests {
             &json!({
                 "method": "thread/started",
                 "params": {
-                    "thread": { "id": "thread-new", "cwd": "/home/vagrant/head" }
+                    "thread": {
+                        "id": "thread-new",
+                        "cwd": "/home/vagrant/head",
+                        "createdAt": 1_785_961_700
+                    }
                 }
             }),
         );
@@ -12378,16 +12590,20 @@ mod tests {
         );
         assert_eq!(
             state.clients["new-client"].thread_id_source,
-            "app_server_started"
+            "app_server_inferred"
+        );
+        assert_eq!(
+            state.clients["new-client"].thread_binding_state,
+            "tentative"
         );
     }
 
     #[test]
     fn thread_started_does_not_guess_between_managed_clients() {
         let mut first = test_client("first", &[], "/home/vagrant/head", None);
-        first.remote = "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+        first.remote = "unix:///run/user/1000/yolo/client-proxies/first.sock".to_string();
         let mut second = test_client("second", &[], "/home/vagrant/head", None);
-        second.remote = "unix:///run/user/1000/yolo/app-server/codex-app-server.sock".to_string();
+        second.remote = "unix:///run/user/1000/yolo/client-proxies/second.sock".to_string();
         let state = Arc::new(Mutex::new(test_state(vec![first, second])));
 
         bind_thread_started_to_unique_managed_client(
@@ -12407,6 +12623,178 @@ mod tests {
                 .values()
                 .all(|client| client.thread_id.is_none())
         );
+    }
+
+    #[test]
+    fn thread_started_does_not_bind_subagents_to_terminal_clients() {
+        for metadata in [
+            json!({"parentThreadId": "parent"}),
+            json!({"source": {"subAgent": {"thread_spawn": {"parent_thread_id": "parent"}}}}),
+        ] {
+            let state = binding_inventory(
+                vec![test_client("1-1785961700000", &[], "/test", None)],
+                &[],
+            );
+            let mut thread = json!({"id": "child", "cwd": "/test"});
+            thread
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            bind_thread_started_to_unique_managed_client(
+                &state,
+                &json!({"method": "thread/started", "params": {"thread": thread}}),
+            );
+            assert!(
+                state.lock().unwrap().clients["1-1785961700000"]
+                    .thread_id
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn thread_subscription_commits_only_after_successful_response() {
+        let mut tracker = ThreadSubscriptionTracker::default();
+        tracker.pending.insert(
+            7,
+            PendingThreadSubscription {
+                thread_id: "thread-ok".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        observe_thread_subscription_response(
+            &json!({"id": 7, "result": {"thread": {"id": "thread-ok"}}}),
+            &mut tracker,
+        );
+        assert!(tracker.subscribed.contains("thread-ok"));
+        assert!(tracker.pending.is_empty());
+        assert!(!tracker.blocked.contains("thread-ok"));
+
+        tracker.pending.insert(
+            12,
+            PendingThreadSubscription {
+                thread_id: "thread-null-result".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        observe_thread_subscription_response(&json!({"id": 12, "result": null}), &mut tracker);
+        assert!(tracker.subscribed.contains("thread-null-result"));
+    }
+
+    #[test]
+    fn thread_subscription_retries_transient_errors_with_backoff() {
+        let mut tracker = ThreadSubscriptionTracker::default();
+        tracker.pending.insert(
+            8,
+            PendingThreadSubscription {
+                thread_id: "thread-retry".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        observe_thread_subscription_response(
+            &json!({
+                "id": 8,
+                "error": {"code": -32000, "message": "connection reset"}
+            }),
+            &mut tracker,
+        );
+        assert!(!tracker.subscribed.contains("thread-retry"));
+        assert!(!tracker.blocked.contains("thread-retry"));
+        assert_eq!(tracker.attempts.get("thread-retry"), Some(&1));
+        assert!(tracker.retry_after["thread-retry"] > Instant::now());
+    }
+
+    #[test]
+    fn thread_subscription_retries_on_the_same_connection_after_error() {
+        let now = now_secs();
+        let mut client = test_client(
+            "client",
+            &["resume", "thread-retry"],
+            "/tmp/project",
+            Some("thread-retry"),
+        );
+        client.codex_status = Some("active".to_string());
+        client.codex_status_updated_at = Some(now.saturating_sub(10));
+        client.updated_at = now;
+        let state = Arc::new(Mutex::new(test_state(vec![client])));
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut rpc = AppServerRpcClient {
+            stream,
+            next_id: 1,
+            rpc_timeout: APP_SERVER_RPC_READ_RETRY_TIMEOUT,
+            read_timeout: APP_SERVER_RPC_READ_RETRY_TIMEOUT,
+        };
+        let mut tracker = ThreadSubscriptionTracker::default();
+
+        subscribe_running_client_threads(&state, &mut rpc, &mut tracker).unwrap();
+        let first_request: Value =
+            serde_json::from_slice(&read_websocket_frame(&mut peer).unwrap().payload).unwrap();
+        let first_id = first_request["id"].as_u64().unwrap();
+        observe_thread_subscription_response(
+            &json!({
+                "id": first_id,
+                "error": {"code": -32000, "message": "temporary failure"}
+            }),
+            &mut tracker,
+        );
+        tracker
+            .retry_after
+            .insert("thread-retry".to_string(), Instant::now());
+
+        subscribe_running_client_threads(&state, &mut rpc, &mut tracker).unwrap();
+        let second_request: Value =
+            serde_json::from_slice(&read_websocket_frame(&mut peer).unwrap().payload).unwrap();
+        let second_id = second_request["id"].as_u64().unwrap();
+        assert_ne!(first_id, second_id);
+        observe_thread_subscription_response(
+            &json!({"id": second_id, "result": null}),
+            &mut tracker,
+        );
+        assert!(tracker.subscribed.contains("thread-retry"));
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[test]
+    fn thread_subscription_does_not_repeat_permanent_errors() {
+        let mut tracker = ThreadSubscriptionTracker::default();
+        tracker.pending.insert(
+            9,
+            PendingThreadSubscription {
+                thread_id: "thread-missing".to_string(),
+                sent_at: Instant::now(),
+            },
+        );
+        observe_thread_subscription_response(
+            &json!({
+                "id": 9,
+                "error": {"code": -32602, "message": "thread not found"}
+            }),
+            &mut tracker,
+        );
+        assert!(tracker.blocked.contains("thread-missing"));
+        assert!(!tracker.retry_after.contains_key("thread-missing"));
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[test]
+    fn expired_thread_subscription_is_retried_without_reusing_request_id() {
+        let mut tracker = ThreadSubscriptionTracker::default();
+        tracker.pending.insert(
+            10,
+            PendingThreadSubscription {
+                thread_id: "thread-timeout".to_string(),
+                sent_at: Instant::now()
+                    .checked_sub(APP_SERVER_THREAD_SUBSCRIPTION_REQUEST_TIMEOUT)
+                    .unwrap()
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            },
+        );
+        expire_thread_subscription_requests(&mut tracker);
+        assert!(tracker.pending.is_empty());
+        assert_eq!(tracker.attempts.get("thread-timeout"), Some(&1));
+        assert!(!tracker.subscribed.contains("thread-timeout"));
     }
 
     #[test]
@@ -12432,6 +12820,112 @@ mod tests {
                 .thread_id
                 .as_deref(),
             Some("thread-created")
+        );
+    }
+
+    fn binding_inventory(
+        clients: Vec<ClientInfo>,
+        threads: &[(&str, u64)],
+    ) -> Arc<Mutex<ServerState>> {
+        let mut state = test_state(clients);
+        for client in state.clients.values_mut() {
+            client.remote = format!(
+                "unix:///run/user/1000/yolo/client-proxies/{}.sock",
+                client.id
+            );
+        }
+        for (id, created_at) in threads {
+            state.telemetry.record_thread_value(&json!({
+                "id": id, "cwd": "/test", "createdAt": created_at,
+                "status": { "type": "idle" }
+            }));
+        }
+        Arc::new(Mutex::new(state))
+    }
+
+    #[test]
+    fn recent_thread_inventory_preserves_existing_owner() {
+        let state = binding_inventory(
+            vec![
+                test_client("owner", &["resume", "owned"], "/test", Some("owned")),
+                test_client("2-1785961701000", &[], "/test", None),
+            ],
+            &[("owned", 1785961701)],
+        );
+        assert!(bind_unresolved_clients_to_recent_threads(&state).is_empty());
+        assert!(
+            state.lock().unwrap().clients["2-1785961701000"]
+                .thread_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recent_thread_inventory_retries_client_after_claimed_candidate() {
+        let state = binding_inventory(
+            vec![
+                test_client("1-1785961700000", &[], "/test", None),
+                test_client("2-1785961701000", &[], "/test", None),
+            ],
+            &[("first", 1785961700), ("second", 1785961705)],
+        );
+        assert_eq!(bind_unresolved_clients_to_recent_threads(&state).len(), 2);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.clients["1-1785961700000"].thread_id.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            state.clients["2-1785961701000"].thread_id.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn recent_thread_inventory_defers_equal_time_clients_without_fallback() {
+        let state = binding_inventory(
+            vec![
+                test_client("1-1785961700000", &[], "/test", None),
+                test_client("2-1785961700000", &[], "/test", None),
+            ],
+            &[("first", 1785961700), ("second", 1785961705)],
+        );
+        assert!(bind_unresolved_clients_to_recent_threads(&state).is_empty());
+    }
+
+    #[test]
+    fn recent_thread_inventory_defers_equal_time_threads_without_fallback() {
+        let state = binding_inventory(
+            vec![test_client("1-1785961700000", &[], "/test", None)],
+            &[
+                ("first", 1785961700),
+                ("second", 1785961700),
+                ("third", 1785961705),
+            ],
+        );
+        assert!(bind_unresolved_clients_to_recent_threads(&state).is_empty());
+    }
+
+    #[test]
+    fn recent_thread_inventory_ignores_distant_ties_after_unique_best_match() {
+        let state = binding_inventory(
+            vec![test_client("1-1785961700000", &[], "/test", None)],
+            &[
+                ("nearest", 1785961700),
+                ("distant-a", 1785961705),
+                ("distant-b", 1785961705),
+            ],
+        );
+
+        assert_eq!(
+            bind_unresolved_clients_to_recent_threads(&state),
+            vec!["1-1785961700000"]
+        );
+        assert_eq!(
+            state.lock().unwrap().clients["1-1785961700000"]
+                .thread_id
+                .as_deref(),
+            Some("nearest")
         );
     }
 
@@ -15421,7 +15915,7 @@ fn wait_for_app_server_progress(paths: &RuntimePaths, timeout: Duration) -> Resu
 fn probe_app_server_progress(socket: &Path, timeout: Duration) -> Result<u64, String> {
     let started = Instant::now();
     let mut client = AppServerRpcClient::connect_with_timeout(socket, timeout)?;
-    let mut remaining = timeout.saturating_sub(started.elapsed());
+    let remaining = timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return Err("app-server progress probe timed out before initialize".to_string());
     }
@@ -17028,9 +17522,15 @@ fn upgrade_thread_ids_for_clients(
         if !matches!(client.status.as_str(), "running" | "restarting") {
             continue;
         }
-        if let Some(thread_id) = client.thread_id.as_deref() {
+        if client_thread_id_is_authoritative(client) {
+            let Some(thread_id) = client.thread_id.as_deref() else {
+                has_unbound_client = true;
+                continue;
+            };
             if !thread_id.trim().is_empty() {
                 thread_ids.insert(thread_id.to_string());
+            } else {
+                has_unbound_client = true;
             }
         } else {
             has_unbound_client = true;
@@ -17047,16 +17547,11 @@ fn matching_app_thread<'a>(
     client: &ClientInfo,
     snapshot: &'a [AppThreadSnapshot],
 ) -> Option<&'a AppThreadSnapshot> {
-    if let Some(thread_id) = client.thread_id.as_deref() {
-        return snapshot.iter().find(|thread| thread.id == thread_id);
-    }
-
-    // An unbound legacy client may be matched by cwd only when that cwd has
-    // exactly one app-server thread. Ambiguous or missing ownership is
-    // deliberately treated as non-waiting by the callers below.
-    let mut matches = snapshot.iter().filter(|thread| thread.cwd == client.cwd);
-    let thread = matches.next()?;
-    matches.next().is_none().then_some(thread)
+    let thread_id = client
+        .thread_id
+        .as_deref()
+        .filter(|_| client_thread_id_is_authoritative(client))?;
+    snapshot.iter().find(|thread| thread.id == thread_id)
 }
 
 fn app_thread_is_waiting(thread: &AppThreadSnapshot) -> bool {
@@ -17207,6 +17702,9 @@ fn refresh_resume_clients(
     let mut repaired = Vec::new();
     let mut errors = Vec::new();
     for client in &clients {
+        if !client_thread_id_is_authoritative(client) {
+            continue;
+        }
         let Some(thread_id) = client.thread_id.as_deref() else {
             continue;
         };
@@ -17263,6 +17761,14 @@ fn refresh_resume_permissions_clients(
     let mut skipped = Vec::new();
     let mut errors = Vec::new();
     for client in &clients {
+        if !client_thread_id_is_authoritative(client) {
+            skipped.push(json!({
+                "client_id": client.id,
+                "cwd": client.cwd,
+                "reason": "client thread binding is tentative"
+            }));
+            continue;
+        }
         let Some(thread_id) = client.thread_id.as_deref() else {
             skipped.push(json!({
                 "client_id": client.id,
@@ -18387,7 +18893,11 @@ fn app_server_has_active_work(state: &Arc<Mutex<ServerState>>) -> bool {
 }
 
 fn app_server_is_definitively_gone(state: &Arc<Mutex<ServerState>>, paths: &RuntimePaths) -> bool {
-    let tracked_pid = state.lock().ok().and_then(|state| state.app_server_pid);
+    let tracked_pid = match state.lock() {
+        Ok(state) => state.app_server_pid,
+        // Unknown ownership cannot authorize bypassing the active-work gate.
+        Err(_) => return false,
+    };
     let existing_pids = find_app_server_pids(paths);
     let socket_stale = app_server_socket_definitely_stale(&paths.app_server_socket, &existing_pids);
     app_server_is_definitively_gone_from_processes(tracked_pid, &existing_pids, socket_stale)
@@ -18401,7 +18911,55 @@ fn app_server_is_definitively_gone_from_processes(
     !tracked_pid.is_some_and(pid_is_alive) && existing_pids.is_empty() && socket_stale
 }
 
-fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+#[derive(Clone)]
+struct PendingSettingsDispatcher {
+    sender: mpsc::SyncSender<()>,
+    scheduled: Arc<AtomicBool>,
+}
+
+fn spawn_pending_settings_worker(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+) -> PendingSettingsDispatcher {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let scheduled = Arc::new(AtomicBool::new(false));
+    let worker_scheduled = Arc::clone(&scheduled);
+    let dispatcher = PendingSettingsDispatcher {
+        sender: sender.clone(),
+        scheduled: Arc::clone(&scheduled),
+    };
+    let worker_dispatcher = dispatcher.clone();
+    thread::Builder::new()
+        .name("yolo-pending-settings".to_string())
+        .spawn(move || {
+            while receiver.recv().is_ok() {
+                // Clear the coalescing bit before scanning. A new request that
+                // arrives while the scan is in progress can then schedule a
+                // follow-up pass without growing an unbounded queue.
+                worker_scheduled.store(false, Ordering::Release);
+                if apply_pending_client_settings_for_bound_clients(&state, &paths) {
+                    request_pending_settings_apply(&worker_dispatcher);
+                }
+            }
+        })
+        .expect("spawn pending settings worker");
+    dispatcher
+}
+
+fn request_pending_settings_apply(dispatcher: &PendingSettingsDispatcher) {
+    if dispatcher.scheduled.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if dispatcher.sender.try_send(()).is_err() {
+        dispatcher.scheduled.store(false, Ordering::Release);
+    }
+}
+
+fn spawn_thread_status_monitor(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    pending_settings: PendingSettingsDispatcher,
+) {
     thread::spawn(move || {
         let mut heal_backoff = THREAD_MONITOR_INTERVAL;
         loop {
@@ -18410,7 +18968,7 @@ fn spawn_thread_status_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePat
                 .lock()
                 .map(|state| state.app_server_generation)
                 .unwrap_or_default();
-            if let Err(err) = run_thread_status_event_listener(&state, &paths) {
+            if let Err(err) = run_thread_status_event_listener(&state, &paths, &pending_settings) {
                 eprintln!("yolo server: Codex app-server status listener stopped: {err}");
                 if listener_started.elapsed() >= APP_SERVER_SELF_HEAL_STABLE_AFTER {
                     heal_backoff = THREAD_MONITOR_INTERVAL;
@@ -18733,16 +19291,20 @@ fn next_self_heal_backoff(current: Duration) -> Duration {
 fn run_thread_status_event_listener(
     state: &Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
+    pending_settings: &PendingSettingsDispatcher,
 ) -> Result<(), String> {
     let mut client = AppServerRpcClient::connect(&paths.app_server_socket)?;
     client.initialize()?;
 
-    let mut subscribed_thread_ids = BTreeSet::new();
+    let mut subscriptions = ThreadSubscriptionTracker::default();
     loop {
-        subscribe_running_client_threads(state, &mut client, &mut subscribed_thread_ids)?;
+        subscribe_running_client_threads(state, &mut client, &mut subscriptions)?;
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         match client.read_message_value() {
-            Ok(value) => observe_app_server_message(state, &value, paths),
+            Ok(value) => {
+                observe_thread_subscription_response(&value, &mut subscriptions);
+                observe_app_server_message(state, &value, paths, pending_settings);
+            }
             Err(err) if is_app_server_read_timeout(&err) => {}
             Err(err) => return Err(err),
         }
@@ -18753,21 +19315,25 @@ fn observe_app_server_message(
     state: &Arc<Mutex<ServerState>>,
     value: &Value,
     paths: &RuntimePaths,
+    pending_settings: &PendingSettingsDispatcher,
 ) {
-    bind_thread_started_to_unique_managed_client(state, value);
     if let Some(snapshot) = parse_app_server_thread_response(value) {
         apply_single_thread_snapshot(state, &snapshot);
     }
     if let Some(update) = parse_app_server_status_notification(value) {
         apply_thread_status_update(state, &update);
     }
+    // Apply authoritative responses first. A thread/started notification is
+    // only a tentative cwd/time hint, so it must not be cleared by the
+    // reconciliation pass that handles the same message.
+    bind_thread_started_to_unique_managed_client(state, value);
     let changed = if let Ok(mut state) = state.lock() {
         state.telemetry.record_app_server_event(value)
     } else {
         false
     };
     bind_unresolved_clients_to_recent_threads(state);
-    apply_pending_client_settings_for_bound_clients(state, paths);
+    request_pending_settings_apply(pending_settings);
     if changed {
         let archive = state.lock().ok().map(|state| state.telemetry.clone());
         if let Some(archive) = archive {
@@ -18795,6 +19361,9 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
     let Some(thread) = value.get("params").and_then(|params| params.get("thread")) else {
         return;
     };
+    if parse_agent_thread_record(thread).is_some_and(|record| record.parent_thread_id.is_some()) {
+        return;
+    }
     let Some(thread_id) = thread
         .get("id")
         .and_then(Value::as_str)
@@ -18809,10 +19378,13 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
     else {
         return;
     };
-    let thread_created_at = thread
+    let Some(thread_created_at) = thread
         .get("createdAt")
         .or_else(|| thread.get("created_at"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
     let Ok(mut state) = state.lock() else {
         return;
     };
@@ -18831,37 +19403,30 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
         .filter(|client| client_uses_managed_proxy(client) && client.cwd == cwd)
         .map(|client| (client.id.clone(), managed_client_start_secs(client)))
         .collect::<Vec<_>>();
-    let client_id = if candidates.len() == 1 {
-        candidates[0].0.clone()
-    } else {
-        let Some(thread_created_at) = thread_created_at else {
-            return;
-        };
-        let mut ranked = candidates
-            .into_iter()
-            .filter_map(|(client_id, started_at)| {
-                let started_at = started_at?;
-                let distance = started_at.abs_diff(thread_created_at);
-                (distance <= 120).then_some((distance, client_id))
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| left.cmp(right));
-        let Some((distance, client_id)) = ranked.first().cloned() else {
-            return;
-        };
-        if ranked
-            .get(1)
-            .is_some_and(|(other_distance, _)| *other_distance == distance)
-        {
-            return;
-        }
-        client_id
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|(client_id, started_at)| {
+            let started_at = started_at?;
+            let distance = started_at.abs_diff(thread_created_at);
+            (distance <= 120).then_some((distance, client_id))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort();
+    let Some((distance, client_id)) = ranked.first().cloned() else {
+        return;
     };
+    if ranked
+        .get(1)
+        .is_some_and(|(other_distance, _)| *other_distance == distance)
+    {
+        return;
+    }
     let Some(client) = state.clients.get_mut(&client_id) else {
         return;
     };
     client.thread_id = Some(thread_id.to_string());
-    client.thread_id_source = "app_server_started".to_string();
+    client.thread_id_source = "app_server_inferred".to_string();
+    client.thread_binding_state = "tentative".to_string();
     client.updated_at = now_secs();
     eprintln!(
         "yolo server: bound managed client {} to newly started thread {}",
@@ -18870,18 +19435,21 @@ fn bind_thread_started_to_unique_managed_client(state: &Arc<Mutex<ServerState>>,
 }
 
 fn client_uses_managed_proxy(client: &ClientInfo) -> bool {
-    if !client.remote.trim().is_empty() {
+    if client_id_from_managed_proxy_remote(&client.remote).as_deref() == Some(client.id.as_str()) {
         return true;
     }
     let Some(codex_pid) = client.codex_pid else {
         return false;
     };
-    read_proc_cmdline(PathBuf::from(format!("/proc/{codex_pid}/cmdline")))
-        .iter()
-        .any(|arg| arg.contains("/yolo/client-proxies/") || arg.contains("/yolo/client-proxies"))
+    let process_args = read_proc_cmdline(PathBuf::from(format!("/proc/{codex_pid}/cmdline")));
+    let process_remote = remote_from_codex_args(&process_args);
+    client_id_from_managed_proxy_remote(&process_remote).as_deref() == Some(client.id.as_str())
 }
 
 fn managed_client_start_secs(client: &ClientInfo) -> Option<u64> {
+    if client.started_at >= 1_000_000_000 {
+        return Some(client.started_at);
+    }
     let (_, millis) = client.id.rsplit_once('-')?;
     let millis = millis.parse::<u64>().ok()?;
     (millis >= 1_000_000_000_000).then_some(millis / 1000)
@@ -18905,11 +19473,18 @@ fn bind_unresolved_clients_to_recent_threads(state: &Arc<Mutex<ServerState>>) ->
             ))
         })
         .collect::<Vec<_>>();
+    let owned_threads: BTreeSet<_> = state
+        .clients
+        .values()
+        .filter(|client| client_thread_id_is_authoritative(client))
+        .filter_map(|client| client.thread_id.as_deref())
+        .collect();
     let threads = state
         .telemetry
         .threads
         .values()
         .filter(|thread| thread.parent_thread_id.is_none())
+        .filter(|thread| !owned_threads.contains(thread.thread_id.as_str()))
         .filter_map(|thread| {
             Some((
                 thread.thread_id.clone(),
@@ -18935,29 +19510,75 @@ fn bind_unresolved_clients_to_recent_threads(state: &Arc<Mutex<ServerState>>) ->
         .collect::<Vec<_>>();
     pairs.sort();
 
-    let mut assigned_clients = BTreeSet::new();
-    let mut assigned_threads = BTreeSet::new();
+    // Only equal-distance *best* candidates are ambiguous. A distant tie
+    // must not poison an otherwise unique nearest match: for example, a
+    // client at t=0 with threads at t=0, t=5, and t=5 has adequate evidence
+    // for the t=0 thread. Recompute nearest candidates after every accepted
+    // pair so a claimed thread can expose the next unambiguous candidate.
+    let mut remaining_pairs = pairs;
     let mut bound = Vec::new();
-    for (_, client_id, thread_id) in pairs {
-        if !assigned_clients.insert(client_id.clone())
-            || !assigned_threads.insert(thread_id.clone())
-        {
-            continue;
+    while !remaining_pairs.is_empty() {
+        let mut best_client_distance: BTreeMap<String, u64> = BTreeMap::new();
+        let mut best_thread_distance: BTreeMap<String, u64> = BTreeMap::new();
+        for (distance, client_id, thread_id) in &remaining_pairs {
+            best_client_distance
+                .entry(client_id.clone())
+                .and_modify(|best| *best = (*best).min(*distance))
+                .or_insert(*distance);
+            best_thread_distance
+                .entry(thread_id.clone())
+                .and_modify(|best| *best = (*best).min(*distance))
+                .or_insert(*distance);
         }
+        let mut client_best_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut thread_best_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (distance, client_id, thread_id) in &remaining_pairs {
+            if best_client_distance.get(client_id) == Some(distance)
+                && best_thread_distance.get(thread_id) == Some(distance)
+            {
+                *client_best_counts.entry(client_id.clone()).or_insert(0) += 1;
+                *thread_best_counts.entry(thread_id.clone()).or_insert(0) += 1;
+            }
+        }
+        let Some((_, client_id, thread_id)) = remaining_pairs
+            .iter()
+            .find(|(distance, client_id, thread_id)| {
+                best_client_distance.get(client_id) == Some(distance)
+                    && best_thread_distance.get(thread_id) == Some(distance)
+                    && client_best_counts.get(client_id) == Some(&1)
+                    && thread_best_counts.get(thread_id) == Some(&1)
+            })
+            .cloned()
+        else {
+            // Equal launch-time matches are not evidence of identity. Wait
+            // for the proxy's authoritative binding instead of choosing by
+            // ID order.
+            break;
+        };
+
         let Some(client) = state.clients.get_mut(&client_id) else {
+            remaining_pairs.retain(|(_, candidate_client, candidate_thread)| {
+                candidate_client != &client_id && candidate_thread != &thread_id
+            });
             continue;
         };
         if client_thread_id_is_authoritative(client) {
+            remaining_pairs.retain(|(_, candidate_client, candidate_thread)| {
+                candidate_client != &client_id && candidate_thread != &thread_id
+            });
             continue;
         }
         client.thread_id = Some(thread_id.clone());
-        client.thread_id_source = "app_server_started".to_string();
-        client.thread_binding_state = "bound".to_string();
+        client.thread_id_source = "app_server_inferred".to_string();
+        client.thread_binding_state = "tentative".to_string();
         client.updated_at = now_secs();
         eprintln!(
             "yolo server: bound managed client {} to recent thread {} by launch time",
             client.id, thread_id
         );
+        remaining_pairs.retain(|(_, candidate_client, candidate_thread)| {
+            candidate_client != &client_id && candidate_thread != &thread_id
+        });
         bound.push(client_id);
     }
     bound
@@ -18966,7 +19587,8 @@ fn bind_unresolved_clients_to_recent_threads(state: &Arc<Mutex<ServerState>>) ->
 fn apply_pending_client_settings_for_bound_clients(
     state: &Arc<Mutex<ServerState>>,
     paths: &RuntimePaths,
-) {
+) -> bool {
+    let mut reschedule = false;
     let client_ids = state
         .lock()
         .map(|state| {
@@ -18975,6 +19597,7 @@ fn apply_pending_client_settings_for_bound_clients(
                 .values()
                 .filter(|client| {
                     matches!(client.status.as_str(), "running" | "restarting")
+                        && client_thread_id_is_authoritative(client)
                         && client
                             .thread_id
                             .as_deref()
@@ -19013,10 +19636,22 @@ fn apply_pending_client_settings_for_bound_clients(
                     .and_then(Value::as_array)
                     .is_some_and(|updated| !updated.is_empty()) =>
             {
-                let _ = fs::remove_file(path);
-                eprintln!(
-                    "yolo server: applied pending settings immediately after binding client {client_id}"
-                );
+                let (removed, retry) =
+                    remove_pending_client_settings_if_unchanged(&path, &settings);
+                if removed {
+                    eprintln!(
+                        "yolo server: applied pending settings immediately after binding client {client_id}"
+                    );
+                } else if retry {
+                    // A newer widget action won the atomic file replace
+                    // while this RPC was in flight. Keep it for the next
+                    // worker pass instead of deleting the user's latest
+                    // request after an older ACK.
+                    reschedule = true;
+                    eprintln!(
+                        "yolo server: retained newer pending settings after applying stale request for {client_id}"
+                    );
+                }
             }
             Ok(_) => {}
             Err(err) => {
@@ -19024,12 +19659,13 @@ fn apply_pending_client_settings_for_bound_clients(
             }
         }
     }
+    reschedule
 }
 
 fn subscribe_running_client_threads(
     state: &Arc<Mutex<ServerState>>,
     client: &mut AppServerRpcClient,
-    subscribed_thread_ids: &mut BTreeSet<String>,
+    subscriptions: &mut ThreadSubscriptionTracker,
 ) -> Result<(), String> {
     // Do not make a fresh app-server load for every saved client at service
     // startup. The native client proxy already owns its resume connection;
@@ -19037,20 +19673,155 @@ fn subscribe_running_client_threads(
     // short bootstrap grace period has elapsed.
     let mut target_thread_ids = known_active_client_thread_ids(state);
     target_thread_ids.extend(known_running_agent_thread_ids(state));
+    subscriptions
+        .subscribed
+        .retain(|thread_id| target_thread_ids.contains(thread_id));
+    subscriptions
+        .retry_after
+        .retain(|thread_id, _| target_thread_ids.contains(thread_id));
+    subscriptions
+        .attempts
+        .retain(|thread_id, _| target_thread_ids.contains(thread_id));
+    subscriptions
+        .blocked
+        .retain(|thread_id| target_thread_ids.contains(thread_id));
+
+    expire_thread_subscription_requests(subscriptions);
+    let now = Instant::now();
     for thread_id in target_thread_ids {
-        if subscribed_thread_ids.contains(&thread_id) {
+        if subscriptions.subscribed.contains(&thread_id)
+            || subscriptions.blocked.contains(&thread_id)
+            || subscriptions
+                .pending
+                .values()
+                .any(|pending| pending.thread_id == thread_id)
+            || subscriptions
+                .retry_after
+                .get(&thread_id)
+                .is_some_and(|retry_after| *retry_after > now)
+        {
             continue;
         }
-        client.send_request(
+        let request_id = client.send_request(
             "thread/resume",
             json!({
                 "threadId": thread_id,
                 "excludeTurns": true
             }),
         )?;
-        subscribed_thread_ids.insert(thread_id);
+        subscriptions.pending.insert(
+            request_id,
+            PendingThreadSubscription {
+                thread_id,
+                sent_at: now,
+            },
+        );
     }
     Ok(())
+}
+
+fn expire_thread_subscription_requests(subscriptions: &mut ThreadSubscriptionTracker) {
+    let expired = subscriptions
+        .pending
+        .iter()
+        .filter(|(_, request)| {
+            request.sent_at.elapsed() >= APP_SERVER_THREAD_SUBSCRIPTION_REQUEST_TIMEOUT
+        })
+        .map(|(request_id, _)| *request_id)
+        .collect::<Vec<_>>();
+    for request_id in expired {
+        if let Some(request) = subscriptions.pending.remove(&request_id) {
+            schedule_thread_subscription_retry(
+                subscriptions,
+                request.thread_id,
+                "request timed out",
+            );
+        }
+    }
+}
+
+fn observe_thread_subscription_response(
+    value: &Value,
+    subscriptions: &mut ThreadSubscriptionTracker,
+) {
+    let Some(request_id) = value.get("id").and_then(Value::as_u64) else {
+        return;
+    };
+    let Some(request) = subscriptions.pending.remove(&request_id) else {
+        return;
+    };
+    // JSON-RPC permits a successful response with a null result. The
+    // correlated absence of `error` is the ACK; requiring an object here
+    // would turn a valid ACK into a permanent retry loop.
+    if value.get("error").is_none() {
+        subscriptions.subscribed.insert(request.thread_id.clone());
+        subscriptions.attempts.remove(&request.thread_id);
+        subscriptions.retry_after.remove(&request.thread_id);
+        return;
+    }
+    if thread_subscription_error_is_permanent(value) {
+        subscriptions.blocked.insert(request.thread_id.clone());
+        subscriptions.retry_after.remove(&request.thread_id);
+        eprintln!(
+            "yolo server: will not retry thread subscription for {} after permanent error: {}",
+            request.thread_id,
+            value.get("error").unwrap_or(&Value::Null)
+        );
+    } else {
+        schedule_thread_subscription_retry(
+            subscriptions,
+            request.thread_id,
+            "app-server returned a retryable error",
+        );
+    }
+}
+
+fn schedule_thread_subscription_retry(
+    subscriptions: &mut ThreadSubscriptionTracker,
+    thread_id: String,
+    reason: &str,
+) {
+    let attempts = subscriptions.attempts.entry(thread_id.clone()).or_insert(0);
+    if *attempts >= APP_SERVER_THREAD_SUBSCRIPTION_MAX_RETRIES {
+        subscriptions.blocked.insert(thread_id.clone());
+        subscriptions.retry_after.remove(&thread_id);
+        eprintln!(
+            "yolo server: stopping thread subscription retries for {thread_id} after {} attempts ({reason})",
+            *attempts
+        );
+        return;
+    }
+    *attempts = attempts.saturating_add(1);
+    let shift = attempts.saturating_sub(1).min(5);
+    let delay = Duration::from_secs(
+        (1_u64 << shift).min(APP_SERVER_THREAD_SUBSCRIPTION_MAX_BACKOFF.as_secs()),
+    );
+    subscriptions
+        .retry_after
+        .insert(thread_id.clone(), Instant::now() + delay);
+    if *attempts == 1 || *attempts == APP_SERVER_THREAD_SUBSCRIPTION_MAX_RETRIES {
+        eprintln!(
+            "yolo server: scheduling thread subscription retry {}/{} for {thread_id} in {delay:?} ({reason})",
+            *attempts, APP_SERVER_THREAD_SUBSCRIPTION_MAX_RETRIES
+        );
+    }
+}
+
+fn thread_subscription_error_is_permanent(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(&Value::Null);
+    let code = error.get("code").and_then(Value::as_i64);
+    if code == Some(-32602) {
+        return true;
+    }
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    message.contains("thread not found")
+        || message.contains("unknown thread")
+        || message.contains("invalid params")
+        || message.contains("invalid parameter")
 }
 
 fn known_active_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<String> {
@@ -19062,6 +19833,7 @@ fn known_active_client_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<S
         .clients
         .values()
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
+        .filter(|client| client_thread_id_is_authoritative(client))
         .filter(|client| {
             client
                 .codex_status
@@ -19125,10 +19897,10 @@ fn known_running_agent_thread_ids(state: &Arc<Mutex<ServerState>>) -> BTreeSet<S
 }
 
 fn is_app_server_read_timeout(err: &str) -> bool {
-    err.contains("WouldBlock")
-        || err.contains("TimedOut")
-        || err.contains("timed out")
-        || err.contains("Resource temporarily unavailable")
+    // This is the only recoverable read error. Any error carrying context
+    // from a partially consumed frame must tear down the connection; a broad
+    // substring check would risk treating such a transport failure as idle.
+    err == "app-server websocket idle timeout"
 }
 
 fn yolo_id_from_process_env(pid: u32) -> Option<String> {
@@ -19489,7 +20261,11 @@ fn spawn_initial_app_server_thread_snapshot(state: Arc<Mutex<ServerState>>, path
     sync_active_sessions_for_client_ids(&state, &paths, &client_ids);
 }
 
-fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths: RuntimePaths) {
+fn spawn_agent_telemetry_snapshot_monitor(
+    state: Arc<Mutex<ServerState>>,
+    paths: RuntimePaths,
+    pending_settings: PendingSettingsDispatcher,
+) {
     thread::spawn(move || {
         loop {
             // Let native client resumes complete before the first background
@@ -19510,7 +20286,7 @@ fn spawn_agent_telemetry_snapshot_monitor(state: Arc<Mutex<ServerState>>, paths:
                     if !bound_client_ids.is_empty() {
                         sync_active_sessions_for_client_ids(&state, &paths, &bound_client_ids);
                     }
-                    apply_pending_client_settings_for_bound_clients(&state, &paths);
+                    request_pending_settings_apply(&pending_settings);
                 }
                 Err(err) => eprintln!("yolo server: agent telemetry inventory failed: {err}"),
             }
@@ -19864,8 +20640,8 @@ fn apply_thread_snapshot(state: &Arc<Mutex<ServerState>>, snapshot: &[AppThreadS
     let Ok(mut state) = state.lock() else {
         return;
     };
-    bind_unique_active_legacy_clients(&mut state, snapshot);
     clear_conflicting_inferred_thread_ids(&mut state);
+    bind_unique_active_legacy_clients(&mut state, snapshot);
 
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
@@ -19989,14 +20765,24 @@ fn clear_conflicting_inferred_thread_ids(state: &mut ServerState) {
     }
 }
 
+fn thread_id_source_is_authoritative(source: &str) -> bool {
+    matches!(source, "resume_arg" | "proxy" | "persisted_state")
+}
+
+fn active_session_thread_is_authoritative(record: &ActiveSessionRecord) -> bool {
+    thread_id_source_is_authoritative(&record.thread_id_source)
+        && record
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread_id| !thread_id.trim().is_empty())
+}
+
 fn client_thread_id_is_authoritative(client: &ClientInfo) -> bool {
-    matches!(
-        client.thread_id_source.as_str(),
-        "resume_arg" | "proxy" | "app_server_started" | "legacy_active_unique" | "persisted_state"
-    ) && client
-        .thread_id
-        .as_deref()
-        .is_some_and(|thread_id| !thread_id.trim().is_empty())
+    thread_id_source_is_authoritative(&client.thread_id_source)
+        && client
+            .thread_id
+            .as_deref()
+            .is_some_and(|thread_id| !thread_id.trim().is_empty())
 }
 
 fn bind_unique_active_legacy_clients(state: &mut ServerState, snapshot: &[AppThreadSnapshot]) {
@@ -20013,6 +20799,7 @@ fn bind_unique_active_legacy_clients(state: &mut ServerState, snapshot: &[AppThr
         .values()
         .filter(|client| matches!(client.status.as_str(), "running" | "restarting"))
         .filter(|client| !client_thread_id_is_authoritative(client))
+        .filter(|client| client_uses_managed_proxy(client))
         .fold(
             BTreeMap::<String, Vec<String>>::new(),
             |mut groups, client| {
@@ -20040,10 +20827,9 @@ fn bind_unique_active_legacy_clients(state: &mut ServerState, snapshot: &[AppThr
             continue;
         };
         client.thread_id = Some(candidates[0].id.clone());
-        client.thread_id_source = "legacy_active_unique".to_string();
+        client.thread_id_source = "app_server_inferred".to_string();
         client.codex_status = Some(candidates[0].status.clone());
-        client.thread_binding_state =
-            thread_binding_state_for_status(&candidates[0].status).to_string();
+        client.thread_binding_state = "tentative".to_string();
         client.codex_active_flags = candidates[0].active_flags.clone();
         client.codex_status_updated_at = Some(now_secs());
         client.updated_at = now_secs();
@@ -20082,6 +20868,9 @@ fn apply_thread_status_update(state: &Arc<Mutex<ServerState>>, update: &AppThrea
     );
     for client in state.clients.values_mut() {
         if !matches!(client.status.as_str(), "running" | "restarting") {
+            continue;
+        }
+        if !client_thread_id_is_authoritative(client) {
             continue;
         }
         if client.thread_id.as_deref() != Some(update.thread_id.as_str()) {
@@ -20418,9 +21207,15 @@ fn upgrade_wait_thread_ids(
         if !upgrade_request_targets_client(client, request) {
             continue;
         }
-        if let Some(thread_id) = client.thread_id.as_deref() {
+        if client_thread_id_is_authoritative(client) {
+            let Some(thread_id) = client.thread_id.as_deref() else {
+                has_running_without_thread = true;
+                continue;
+            };
             if !thread_id.trim().is_empty() {
                 ids.insert(thread_id.to_string());
+            } else {
+                has_running_without_thread = true;
             }
         } else {
             has_running_without_thread = true;
@@ -20690,6 +21485,10 @@ fn persist_pending_client_settings(
     };
     let contents = serde_json::to_vec(&settings)
         .map_err(|err| format!("encode pending settings for {client_id}: {err}"))?;
+    let file_gate = PENDING_SETTINGS_FILE_GATE.get_or_init(|| Mutex::new(()));
+    let _file_guard = file_gate
+        .lock()
+        .map_err(|_| "pending settings file lock poisoned".to_string())?;
     let temporary =
         path.with_extension(format!("json.{}.{}.tmp", std::process::id(), now_millis()));
     fs::write(&temporary, contents)
@@ -20699,6 +21498,30 @@ fn persist_pending_client_settings(
         let _ = fs::remove_file(&temporary);
         format!("replace pending settings {}: {err}", path.display())
     })
+}
+
+fn remove_pending_client_settings_if_unchanged(
+    path: &Path,
+    expected: &PendingClientSettings,
+) -> (bool, bool) {
+    let file_gate = PENDING_SETTINGS_FILE_GATE.get_or_init(|| Mutex::new(()));
+    let Ok(_file_guard) = file_gate.lock() else {
+        return (false, false);
+    };
+    let Ok(contents) = fs::read(path) else {
+        return (false, false);
+    };
+    let Ok(current) = serde_json::from_slice::<PendingClientSettings>(&contents) else {
+        return (false, false);
+    };
+    if current != *expected {
+        return (false, true);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => (true, false),
+        Err(error) if error.kind() == ErrorKind::NotFound => (false, false),
+        Err(_) => (false, true),
+    }
 }
 
 fn apply_pending_settings_to_client_info(
@@ -20821,7 +21644,8 @@ fn configure_client_matches(client: &ClientInfo, request: &ConfigureClientsReque
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return client.thread_id.as_deref().map(str::trim) == Some(thread_id);
+        return client_thread_id_is_authoritative(client)
+            && client.thread_id.as_deref().map(str::trim) == Some(thread_id);
     }
     if let Some(client_id) = request
         .client_id
@@ -20853,10 +21677,11 @@ fn selected_clients_by_thread_state(
             .clients
             .get(id)
             .ok_or_else(|| format!("selected client disappeared: {id}"))?;
-        if let Some(thread_id) = client
-            .thread_id
-            .as_deref()
-            .filter(|thread_id| !thread_id.trim().is_empty())
+        if client_thread_id_is_authoritative(client)
+            && let Some(thread_id) = client
+                .thread_id
+                .as_deref()
+                .filter(|thread_id| !thread_id.trim().is_empty())
         {
             with_threads.push((id.clone(), thread_id.to_string()));
         } else if client_uses_managed_proxy(client) {
@@ -21483,6 +22308,7 @@ fn resume_policy_request_matches_current_client(
     };
     state.clients.get(&request.client_id).is_some_and(|client| {
         matches!(client.status.as_str(), "running" | "restarting")
+            && client_thread_id_is_authoritative(client)
             && client.thread_id.as_deref() == Some(request.thread_id.as_str())
     })
 }
@@ -21684,6 +22510,21 @@ struct AppServerRpcClient {
     stream: UnixStream,
     next_id: u64,
     rpc_timeout: Duration,
+    read_timeout: Duration,
+}
+
+struct PendingThreadSubscription {
+    thread_id: String,
+    sent_at: Instant,
+}
+
+#[derive(Default)]
+struct ThreadSubscriptionTracker {
+    subscribed: BTreeSet<String>,
+    pending: BTreeMap<u64, PendingThreadSubscription>,
+    retry_after: BTreeMap<String, Instant>,
+    attempts: BTreeMap<String, u32>,
+    blocked: BTreeSet<String>,
 }
 
 impl Drop for AppServerRpcClient {
@@ -21747,6 +22588,7 @@ impl AppServerRpcClient {
             stream,
             next_id: 1,
             rpc_timeout: APP_SERVER_RPC_READ_RETRY_TIMEOUT,
+            read_timeout: APP_SERVER_RPC_READ_RETRY_TIMEOUT,
         })
     }
 
@@ -21769,6 +22611,9 @@ impl AppServerRpcClient {
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), String> {
+        if let Some(timeout) = timeout {
+            self.read_timeout = timeout;
+        }
         self.stream
             .set_read_timeout(timeout)
             .map_err(|err| format!("set app-server read timeout: {err}"))
@@ -21780,6 +22625,7 @@ impl AppServerRpcClient {
 
     fn set_operation_timeout(&mut self, timeout: Duration) -> Result<(), String> {
         self.rpc_timeout = timeout;
+        self.read_timeout = timeout;
         self.stream
             .set_read_timeout(Some(timeout))
             .map_err(|err| format!("set app-server read timeout: {err}"))?;
@@ -21846,7 +22692,7 @@ impl AppServerRpcClient {
     }
 
     fn read_message_value(&mut self) -> Result<Value, String> {
-        let message = websocket_read_text_with_timeout(&mut self.stream, self.rpc_timeout)?;
+        let message = websocket_read_text_with_timeout(&mut self.stream, self.read_timeout)?;
         serde_json::from_str(&message)
             .map_err(|err| format!("decode app-server message: {err}: {message}"))
     }
@@ -22154,7 +23000,8 @@ fn relay_client_websocket_frames(
             // first turn has been forwarded, later in-TUI model changes must
             // remain authoritative instead of being overwritten by YOLO.
             if let Some(settings) = pending_settings {
-                let _ = fs::remove_file(pending_settings_path);
+                let _ =
+                    remove_pending_client_settings_if_unchanged(pending_settings_path, &settings);
                 if let Ok(tracker) = tracker.lock() {
                     let _ = tracker
                         .event_tx
@@ -22889,55 +23736,138 @@ fn websocket_read_text_with_timeout<S: Read + Write>(
     timeout: Duration,
 ) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
+    let mut message = Vec::new();
+    let mut fragmented_text = false;
     loop {
-        let mut header = [0u8; 2];
-        read_exact_retry(stream, &mut header, "read websocket frame header", deadline)?;
-        let opcode = header[0] & 0x0f;
-        let masked = (header[1] & 0x80) != 0;
-        let mut len = (header[1] & 0x7f) as u64;
-        if len == 126 {
-            let mut buf = [0u8; 2];
-            read_exact_retry(stream, &mut buf, "read websocket frame length", deadline)?;
-            len = u16::from_be_bytes(buf) as u64;
-        } else if len == 127 {
-            let mut buf = [0u8; 8];
-            read_exact_retry(stream, &mut buf, "read websocket frame length", deadline)?;
-            len = u64::from_be_bytes(buf);
-        }
-        if len > MAX_WEBSOCKET_FRAME_BYTES {
-            return Err("websocket frame too large".to_string());
-        }
-        let mask = if masked {
-            let mut mask = [0u8; 4];
-            read_exact_retry(stream, &mut mask, "read websocket frame mask", deadline)?;
-            Some(mask)
-        } else {
-            None
-        };
-        let mut payload = vec![0u8; len as usize];
-        read_exact_retry(
-            stream,
-            &mut payload,
-            "read websocket frame payload",
-            deadline,
-        )?;
-        if let Some(mask) = mask {
-            for (idx, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[idx % 4];
-            }
-        }
-
-        match opcode {
+        let frame = read_websocket_frame_with_timeout(stream, deadline)?;
+        match frame.opcode {
             0x1 => {
-                return String::from_utf8(payload)
-                    .map_err(|err| format!("decode websocket text: {err}"));
+                if fragmented_text {
+                    return Err(
+                        "websocket text message started before prior message finished".to_string(),
+                    );
+                }
+                message.clear();
+                append_websocket_message_payload(&mut message, frame.payload)?;
+                if frame.fin {
+                    return String::from_utf8(message)
+                        .map_err(|err| format!("decode websocket text: {err}"));
+                }
+                fragmented_text = true;
+            }
+            0x0 => {
+                if !fragmented_text {
+                    return Err("websocket continuation frame without text message".to_string());
+                }
+                append_websocket_message_payload(&mut message, frame.payload)?;
+                if frame.fin {
+                    return String::from_utf8(message)
+                        .map_err(|err| format!("decode websocket text: {err}"));
+                }
             }
             0x8 => return Err("app-server websocket closed".to_string()),
-            0x9 => websocket_send_pong(stream, &payload)?,
+            0x9 => websocket_send_pong(stream, &frame.payload)?,
             0xA => {}
-            _ => {}
+            _ => return Err(format!("unsupported websocket opcode 0x{:x}", frame.opcode)),
         }
     }
+}
+
+struct TimedWebsocketFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+fn read_websocket_frame_with_timeout<S: Read + Write>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Result<TimedWebsocketFrame, String> {
+    let mut frame_started = false;
+    let mut header = [0u8; 2];
+    read_exact_retry(
+        stream,
+        &mut header,
+        "read websocket frame header",
+        deadline,
+        &mut frame_started,
+    )?;
+    let fin = (header[0] & 0x80) != 0;
+    if header[0] & 0x70 != 0 {
+        return Err("websocket reserved bits are not supported".to_string());
+    }
+    let opcode = header[0] & 0x0f;
+    let masked = (header[1] & 0x80) != 0;
+    let mut len = (header[1] & 0x7f) as u64;
+    if len == 126 {
+        let mut buf = [0u8; 2];
+        read_exact_retry(
+            stream,
+            &mut buf,
+            "read websocket frame length",
+            deadline,
+            &mut frame_started,
+        )?;
+        len = u16::from_be_bytes(buf) as u64;
+    } else if len == 127 {
+        let mut buf = [0u8; 8];
+        read_exact_retry(
+            stream,
+            &mut buf,
+            "read websocket frame length",
+            deadline,
+            &mut frame_started,
+        )?;
+        if buf[0] & 0x80 != 0 {
+            return Err("websocket frame length has its reserved high bit set".to_string());
+        }
+        len = u64::from_be_bytes(buf);
+    }
+    if len > MAX_WEBSOCKET_FRAME_BYTES {
+        return Err("websocket frame too large".to_string());
+    }
+    if matches!(opcode, 0x8..=0xA) && (!fin || len > 125) {
+        return Err("invalid websocket control frame".to_string());
+    }
+    let mask = if masked {
+        let mut mask = [0u8; 4];
+        read_exact_retry(
+            stream,
+            &mut mask,
+            "read websocket frame mask",
+            deadline,
+            &mut frame_started,
+        )?;
+        Some(mask)
+    } else {
+        None
+    };
+    let mut payload = vec![0u8; len as usize];
+    read_exact_retry(
+        stream,
+        &mut payload,
+        "read websocket frame payload",
+        deadline,
+        &mut frame_started,
+    )?;
+    if let Some(mask) = mask {
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[idx % 4];
+        }
+    }
+    Ok(TimedWebsocketFrame {
+        fin,
+        opcode,
+        payload,
+    })
+}
+
+fn append_websocket_message_payload(message: &mut Vec<u8>, payload: Vec<u8>) -> Result<(), String> {
+    if message.len().saturating_add(payload.len()) > MAX_WEBSOCKET_FRAME_BYTES as usize {
+        return Err("websocket message too large".to_string());
+    }
+    message.extend_from_slice(&payload);
+    Ok(())
 }
 
 fn read_exact_retry<R: Read>(
@@ -22945,11 +23875,13 @@ fn read_exact_retry<R: Read>(
     mut buf: &mut [u8],
     context: &str,
     deadline: Instant,
+    frame_started: &mut bool,
 ) -> Result<(), String> {
     while !buf.is_empty() {
         match stream.read(buf) {
             Ok(0) => return Err(format!("{context}: failed to fill whole buffer")),
             Ok(nread) => {
+                *frame_started = true;
                 let tmp = buf;
                 buf = &mut tmp[nread..];
             }
@@ -22960,7 +23892,12 @@ fn read_exact_retry<R: Read>(
                 ) =>
             {
                 if Instant::now() >= deadline {
-                    return Err(format!("{context}: timed out waiting for app-server"));
+                    if *frame_started {
+                        return Err(format!(
+                            "{context}: partial websocket frame timed out; reconnect required"
+                        ));
+                    }
+                    return Err("app-server websocket idle timeout".to_string());
                 }
                 thread::sleep(APP_SERVER_RPC_READ_RETRY_INTERVAL);
             }
